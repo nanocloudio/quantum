@@ -1,0 +1,35 @@
+{
+  "frames": [
+    {
+      "name": "MQTT_STREAM",
+      "fields": [
+        {"name": "alpn", "type": "string"},
+        {"name": "payload", "type": "bytes"}
+      ]
+    },
+    {
+      "name": "RETRY_TOKEN",
+      "fields": [
+        {"name": "issued_at", "type": "timestamp"},
+        {"name": "client_ip", "type": "string"}
+      ]
+    },
+    {
+      "name": "PATH_MIGRATION_GUARD",
+      "fields": [
+        {"name": "routing_epoch", "type": "u64"},
+        {"name": "rebalance_grace_active", "type": "bool"},
+        {"name": "disconnect_reason", "type": "string"}
+      ]
+    },
+    {
+      "name": "TRANSPORT_PARAMS",
+      "fields": [
+        {"name": "max_idle_timeout_seconds", "type": "u32"},
+        {"name": "max_ack_delay_ms", "type": "u32"},
+        {"name": "retry_token_lifetime_seconds", "type": "u32"},
+        {"name": "allow_0rtt", "type": "bool"}
+      ]
+    }
+  ]
+}

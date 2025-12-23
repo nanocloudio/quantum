@@ -1,0 +1,68 @@
+# Sample configuration for Quantum in embedded control-plane mode (single-binary).
+
+[control_plane]
+mode = "embedded"
+# Endpoints are ignored in embedded mode; leave empty for clarity.
+endpoints = []
+cache_ttl_seconds = 5
+peer_versions = {}
+embedded_http_bind = "127.0.0.1:19000"
+embedded_raft_bind = "127.0.0.1:19001"
+# embedded_tls.tls_chain_path = "certs/cp-server.pem"
+# embedded_tls.tls_key_path = "certs/cp-server.key"
+# embedded_tls.client_ca_path = "certs/ca.pem"
+# bootstrap_tenants = [{ tenant_id = "local", tenant_prg_count = 1 }]
+# bootstrap_placements = [{ tenant_id = "local", partition = 0, replicas = ["node-0"] }]
+
+[listeners.tcp]
+bind = "0.0.0.0:8883"
+tls_chain_path = "certs/server.pem"
+tls_key_path = "certs/server.key"
+client_ca_path = "certs/ca.pem"
+alpn = ["mqtt"]
+require_sni = false 
+default_tenant = "local"
+require_alpn = false
+
+# Example embedded dev override (leave commented for external clusters):
+# mode = "embedded"
+# embedded_http_bind = "127.0.0.1:19000"
+# embedded_raft_bind = "127.0.0.1:19001"
+
+# QUIC is optional; disable or adjust as needed.
+[listeners.quic]
+bind = "0.0.0.0:1884"
+tls_chain_path = "certs/server.pem"
+tls_key_path = "certs/server.key"
+client_ca_path = "certs/ca.pem"
+alpn = ["mqtt-quic"]
+max_idle_timeout_seconds = 60
+max_ack_delay_ms = 10
+
+[durability]
+durability_mode = "strict"
+commit_visibility = "durable_only"
+quorum_size = 1
+replica_id = "local"
+peer_replicas = []
+initial_term = 1
+
+[telemetry]
+metrics_bind = "0.0.0.0:9090"
+log_level = "info"
+
+[tenants]
+tenant_prg_count = 1
+
+[paths]
+storage_dir = "data"
+# Optional: control-plane trust bundle and telemetry catalog.
+# cp_certs = "certs/cp-ca.pem"
+# telemetry_catalog = "telemetry/catalog.json"
+
+[forward_plane]
+enabled = false
+scheme = "http"
+port = 21000
+path = "/v1/workloads/forward"
+timeout_ms = 5000

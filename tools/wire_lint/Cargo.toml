@@ -1,0 +1,10 @@
+[package]
+name = "wire_lint"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Compares Quantum wire catalogs against Clustor artifacts"
+
+[dependencies]
+anyhow = "1.0.95"
+sha2 = "0.10.9"

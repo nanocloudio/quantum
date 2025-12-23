@@ -1,0 +1,67 @@
+[package]
+name = "quantum"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Quantum Authors <eng@nanocloud.local>"]
+description = "Quantum – distributed Raft-based multi-tenant MQTT broker built atop Clustor"
+default-run = "quantum"
+
+[lib]
+name = "quantum"
+path = "src/lib.rs"
+
+[[bin]]
+name = "quantum"
+path = "src/main.rs"
+
+[features]
+default = ["tcp-tls", "telemetry"]
+tcp-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+quic = ["dep:quinn", "dep:h3", "dep:futures-util"]
+admin-http = ["clustor/admin-http"]
+snapshot-crypto = ["clustor/snapshot-crypto"]
+net = ["clustor/net"]
+telemetry = ["dep:tracing", "dep:tracing-subscriber"]
+interop = []
+
+[dependencies]
+anyhow = "1.0.95"
+chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
+rumqttc = { version = "0.23.0", default-features = false, features = ["use-rustls"] }
+thiserror = "2.0.17"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+bincode = "1.3.3"
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "time", "net", "macros", "signal", "sync", "io-util", "fs"] }
+clustor = { path = "../clustor", features = ["admin-http", "snapshot-crypto", "net", "async-net"] }
+tracing = { version = "0.1.40", optional = true }
+tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter", "json", "time"], optional = true }
+bytes = "1.8.0"
+bitflags = "2.6.0"
+clap = { version = "4.5.20", features = ["derive"] }
+uuid = { version = "1.10.0", features = ["v4"] }
+rustls = { version = "0.21.12", optional = true, default-features = false, features = [
+    "dangerous_configuration",
+    "tls12",
+] }
+tokio-rustls = { version = "0.24.1", optional = true }
+quinn = { version = "0.11.9", optional = true }
+h3 = { version = "0.0.6", optional = true }
+toml = "0.8.19"
+twox-hash = "1.6.3"
+rustls-pemfile = { version = "1.0.4", optional = true }
+futures-util = { version = "0.3.31", optional = true }
+futures = "0.3.31"
+parking_lot = "0.12"
+base64 = "0.22.1"
+reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+
+[dev-dependencies]
+pretty_assertions = "1.4.0"
+tempfile = "3.23.0"
+futures = "0.3.31"
+futures-util = "0.3.31"
+which = "6.0.3"
+rcgen = { version = "0.13", features = ["pem"] }

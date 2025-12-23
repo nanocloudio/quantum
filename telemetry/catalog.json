@@ -1,0 +1,30 @@
+{
+  "metrics": [
+    {"name": "quantum_sessions", "type": "gauge", "unit": "count", "description": "Current active sessions"},
+    {"name": "quantum_controlplane_fresh", "type": "gauge", "unit": "bool", "description": "Control-plane cache freshness"},
+    {"name": "quantum_prg_ready", "type": "gauge", "unit": "bool", "description": "PRG manager readiness"},
+    {"name": "quantum_strict_fallback", "type": "gauge", "unit": "bool", "description": "Strict fallback mode gate"},
+    {"name": "quantum_wal_durability_fence", "type": "gauge", "unit": "bool", "description": "Durability fence active"},
+    {"name": "quantum_dr_lag_seconds", "type": "gauge", "unit": "seconds", "description": "DR shipping lag"},
+    {"name": "quantum_dr_promoted", "type": "counter", "unit": "count", "description": "Controlled promotion occurrences"},
+    {"name": "quantum_dr_uncontrolled", "type": "counter", "unit": "count", "description": "Uncontrolled promotion occurrences"},
+    {"name": "queue_depth", "type": "gauge", "unit": "count", "labels": ["type"], "description": "Queue depths per stage"},
+    {"name": "apply_lag_seconds", "type": "gauge", "unit": "seconds", "description": "Apply lag"},
+    {"name": "replication_lag_seconds", "type": "gauge", "unit": "seconds", "description": "Replication lag"},
+    {"name": "reject_overload_total", "type": "counter", "unit": "count", "description": "Overload rejects"},
+    {"name": "tenant_throttle_events_total", "type": "counter", "unit": "count", "description": "Tenant throttle events"},
+    {"name": "leader_credit_hint", "type": "gauge", "unit": "count", "description": "Receive Maximum hint"},
+    {"name": "forward_backpressure_seconds", "type": "counter", "unit": "seconds", "description": "Cross-PRG backpressure duration"},
+    {"name": "audit_events_total", "type": "counter", "unit": "count", "description": "Audit events recorded"}
+  ],
+  "traces": [
+    {"name": "mqtt_connect", "description": "MQTT CONNECT handling path"},
+    {"name": "mqtt_publish", "description": "MQTT PUBLISH handling path"},
+    {"name": "mqtt_subscribe", "description": "MQTT SUBSCRIBE handling path"}
+  ],
+  "logs": [
+    {"name": "audit", "description": "Immutable audit log stream"},
+    {"name": "edge", "description": "Listener and routing logs"},
+    {"name": "prg", "description": "PRG lifecycle logs"}
+  ]
+}

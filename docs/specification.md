@@ -1,4 +1,4 @@
-# QuantuMQTT – Distributed Raft-Based Multi-Tenant MQTT Broker
+# Quantum – Distributed Raft-Based Multi-Tenant MQTT Broker
 Version: Draft 1.0  
 Language: Rust (no GC runtime)  
 Deployment: Single-binary, self-arranging, StatefulSet-style cluster  
@@ -7,7 +7,7 @@ Deployment: Single-binary, self-arranging, StatefulSet-style cluster
 
 ## Abstract
 
-QuantuMQTT is a cloud-grade, fault-tolerant, Raft-replicated MQTT broker engineered for one hundred million concurrent persistent connections with MQTT QoS 2 exactly-once semantics (within the broker) and deterministic recovery.  
+Quantum is a cloud-grade, fault-tolerant, Raft-replicated MQTT broker engineered for one hundred million concurrent persistent connections with MQTT QoS 2 exactly-once semantics (within the broker) and deterministic recovery.  
 It supports MQTT v3.1, v3.1.1, and v5.0 over both TLS/TCP and QUIC/HTTP-3 transports.  
 The design ensures 99.999 % availability, zero-loss durability for Strict partitions (the default), and multi-tenant isolation with dynamic scaling, zero-downtime upgrades, and cross-region disaster recovery.
 
@@ -60,7 +60,7 @@ MQTT version support: 3.1, 3.1.1, and 5.0; MQTT 5-only features (reason codes, E
 ---
 
 # 0  Specification Provenance and Normative Scope
-[Normative] QuantuMQTT is an overlay on Clustor and inherits Clustor’s normative hierarchy and tagging model. Clustor remains the sole authority for consensus, durability, compaction, strict-fallback, cache freshness, integrity, and DR semantics; any MQTT statement is subordinate to Clustor §§0, 3, 6, 8, 9, and 11.
+[Normative] Quantum is an overlay on Clustor and inherits Clustor’s normative hierarchy and tagging model. Clustor remains the sole authority for consensus, durability, compaction, strict-fallback, cache freshness, integrity, and DR semantics; any MQTT statement is subordinate to Clustor §§0, 3, 6, 8, 9, and 11.
 [Operational] Paragraph tags follow Clustor conventions: **[Normative]** (must implement), **[Operational]** (runbook/operational policy), **[Informative]** (descriptive background).
 [Normative] All MQTT-layer guarantees must cite the controlling Clustor clause (e.g., “per Clustor §3.4/§6.5”) where applicable; no “silent semantics” are implied by descriptive text.
 [Normative] Determinism and replay are governed by Clustor WAL/snapshot ordering; MQTT must not introduce alternate durable channels, ordering sources, or speculative state outside Clustor WAL entries and manifests.
@@ -80,12 +80,12 @@ MQTT version support: 3.1, 3.1.1, and 5.0; MQTT 5-only features (reason codes, E
 
 # 1  Overview
 
-QuantuMQTT unifies a horizontally-scalable MQTT message fabric with a strongly-consistent Raft replication core.  
+Quantum unifies a horizontally-scalable MQTT message fabric with a strongly-consistent Raft replication core.  
 It aims to deliver industrial-scale connectivity for IoT, telemetry, financial, and mission-critical workloads while preserving sub-10 ms latency and strict message ordering within each topic shard. Exactly-once QoS 2 semantics hold within an in-region healthy quorum and during controlled DR promotions; uncontrolled regional failover deliberately relaxes to at-least-once within the replication-lag window.
 This overview describes product intent; all durability/consistency semantics remain those of Clustor.
 
 ### 1.0 Normative Scope (per Clustor §0)
-[Normative] QuantuMQTT is purely an overlay on Clustor; all consensus, durability, read-gate, compaction, strict-fallback, cache, and DR semantics come directly from Clustor §§0, 3, 6, 8, 9, and 11. MQTT text may tighten but never relax those guardrails.
+[Normative] Quantum is purely an overlay on Clustor; all consensus, durability, read-gate, compaction, strict-fallback, cache, and DR semantics come directly from Clustor §§0, 3, 6, 8, 9, and 11. MQTT text may tighten but never relax those guardrails.
 
 ### 1.1 Goals
 * Deterministic persistence/replay for all QoS; exactly-once with RPO 0 when fenced.  
@@ -117,9 +117,9 @@ MQTT 3.1.1 is the baseline wire behaviour; MQTT 3.1 is supported for legacy inte
 Terminology: **PRG** (3-voter Raft partition), **SP** (per-partition MQTT state machine), **CP** (control-plane Raft cluster), **Tenant** (isolated namespace), **ClientID** (session ID bound to mTLS identity), **QoS** (0/1/2), **WAL** (write-ahead log), **Checkpoint** (persistent snapshot).
 
 ### 1.8 Dependence on Clustor Consensus Core
-[Normative] PRGs are Clustor partitions; CP-Raft is ControlPlaneRaft. All WAL/snapshot/ledger/scrub/backpressure/strict-fallback/observer behaviour applies unmodified (Clustor §§0, 3, 5–9, 11). If wording here seems to differ, treat QuantuMQTT as “Clustor + MQTT overlays” and defer to Clustor. QuantuMQTT configures profiles and APIs only.
+[Normative] PRGs are Clustor partitions; CP-Raft is ControlPlaneRaft. All WAL/snapshot/ledger/scrub/backpressure/strict-fallback/observer behaviour applies unmodified (Clustor §§0, 3, 5–9, 11). If wording here seems to differ, treat Quantum as “Clustor + MQTT overlays” and defer to Clustor. Quantum configures profiles and APIs only.
 
-| QuantuMQTT term | Clustor term / section |
+| Quantum term | Clustor term / section |
 |-----------------|------------------------|
 | Partition Raft Group (PRG) | Raft partition (§§0.2, 3, 4) |
 | CP-Raft | ControlPlaneRaft (§11) with MQTT objects |
@@ -148,7 +148,7 @@ Tenant policy or feature tiers may tighten limits but can never relax Clustor gu
 # 2  Partitioning and Routing
 
 ## 2.1  Sharding Model
-QuantuMQTT partitions each tenant’s MQTT state into independent Raft groups called **Partition Raft Groups (PRGs)**.  
+Quantum partitions each tenant’s MQTT state into independent Raft groups called **Partition Raft Groups (PRGs)**.  
 PRGs are **single-tenant**: a PRG’s WAL/snapshots only contain one tenant’s data; `tenant_id` is tracked in CP metadata, not inside the PRG keyspace, so keys stored on disk omit tenant identifiers.
 Sharding and routing described here are MQTT overlay policies; they do not alter Clustor partition semantics, routing epochs, or placement guarantees.
 
@@ -260,7 +260,7 @@ MQTT publish/ack flows ride the Clustor ACK contract (§3.4/§6.5): append, quor
 --- 
 
 ## 3.3  Snapshotting and Compaction
-Snapshot manifests, delta snapshots, compaction floors, nonce reservation handling, startup scrub, background scrub, and Quarantine behaviour are governed by Clustor §§8–9 and §6.3/§6.4; values stated here are policy overlays only. QuantuMQTT sets operational targets (5 min effective full snapshot cadence, ~60 s delta) via ControlPlaneRaft profile knobs but does not change Clustor safety gates. Checkpoints carry MQTT session/dedupe/retained payloads encoded in the Clustor snapshot format.
+Snapshot manifests, delta snapshots, compaction floors, nonce reservation handling, startup scrub, background scrub, and Quarantine behaviour are governed by Clustor §§8–9 and §6.3/§6.4; values stated here are policy overlays only. Quantum sets operational targets (5 min effective full snapshot cadence, ~60 s delta) via ControlPlaneRaft profile knobs but does not change Clustor safety gates. Checkpoints carry MQTT session/dedupe/retained payloads encoded in the Clustor snapshot format.
 
 ---
 
@@ -282,7 +282,7 @@ MQTT acknowledgements use the Clustor ACK contract (§3.4/§6.5) with `durabilit
 ---
 
 ## 4.2  Exactly-Once Semantics (QoS 2)
-Guarantee scope: MQTT QoS 2 exactly-once delivery **within broker state** across reconnects, Raft failover, and fenced DR promotion. Once messages leave QuantuMQTT via bridges/sinks, downstream semantics depend on the adapter.
+Guarantee scope: MQTT QoS 2 exactly-once delivery **within broker state** across reconnects, Raft failover, and fenced DR promotion. Once messages leave Quantum via bridges/sinks, downstream semantics depend on the adapter.
 
 - Exactly-once within the broker is synonymous with a successful Clustor commit plus durability-ledger proof under the ACK contract; there is no alternate MQTT-only definition.  
 - QoS 2 correctness anchors to Clustor `raft_commit_index`/`wal_committed_index` with `commit_visibility=DurableOnly`; strict-fallback downgrades per Clustor §0.5 and reason-code mapping in §10.5.
@@ -308,7 +308,7 @@ Guarantee scope: MQTT QoS 2 exactly-once delivery **within broker state** across
 ---
 
 ## 4.3  Fsync and Flush Policy
-Fsync semantics, io_writer_mode downgrades, and durability gating follow Clustor §6.1 and §6.2 (including device-latency and io_uring fallback rules) without alteration. QuantuMQTT does not introduce alternative flush cadences; any fsync failures, latency violations, or scrub issues rely on Clustor strict-fallback and Quarantine handling, surfaced to MQTT clients via the reason-code mapping in §10.5.
+Fsync semantics, io_writer_mode downgrades, and durability gating follow Clustor §6.1 and §6.2 (including device-latency and io_uring fallback rules) without alteration. Quantum does not introduce alternative flush cadences; any fsync failures, latency violations, or scrub issues rely on Clustor strict-fallback and Quarantine handling, surfaced to MQTT clients via the reason-code mapping in §10.5.
 
 ---
 
@@ -355,10 +355,24 @@ ForwardPublish and PublishAcked are regular Clustor log entries; each PRG commit
 ## 4.7  Bridge and Sink Semantics
 Exactly-once is scoped to broker state. Bridges/sinks (Kafka, S3, HTTP, etc.) deliver **at-least-once** downstream; adapters should expose idempotence keys `(tenant_id, part_id, session_epoch, message_id, forward_seq)`. Retries continue until adapter TTL, then audit. [Normative] Sinks MUST NOT claim guarantees beyond the broker; downstream idempotence is adapter-defined.
 
+---
+
+## 4.8  Clustor Wiring (Implementation)
+- ACK contracts are the Clustor client: replicas register from CP placements; `commit_visibility` mirrors to CP and the apply stream publishes durability proofs into the CP cache. The clustor floor/read-gate state feeds listener admission; any read-gate or strict-fallback failure maps to `PERMANENT_DURABILITY` (no cache fallback).
+- PRG hosts hydrate from ClustorStorage snapshots/WAL with durability proofs; replay updates `effective_product_floor` before serving. Placement/epoch validation is enforced on all PRG mutations (`persist_session_state`, `commit_publish`, `forward_topic_publish`) and during CONNECT; stale epochs surface `PERMANENT_EPOCH` without mutating session state.
+- Routing/watchers: CP watcher refreshes placements and `routing_epoch`; rebalance epochs start a 10-minute grace window (audited) and are reflected in telemetry (`quantum_rebalance_*`). Forward paths tolerate a one-epoch grace only; otherwise, stale forwards are rejected as duplicates.
+
+---
+
+## 4.9  Disaster Recovery Wiring
+- DR shipping uses ClustorStorage manifests: checkpoints and WAL exports carry ledger proofs/effective floors and stream to pluggable mirrors (filesystem/object store). Telemetry surfaces `quantum_dr_last_shipped_*` and lag/ship age; audit captures shipping/promotion state.
+- Controlled promotion fences durability, waits for a ledger proof and CP observer catch-up, then flips `promoted` with `dr_promotion` audit; uncontrolled promotion raises a durability fence, toggles `uncontrolled`, and is auditable/visible via metrics. Rollback/restore clear the fence and emit `dr_state`/`dr_restore`.
+- Region certificates gate DR restore/promotion; mismatches fence durability and emit `dr_region_certificate_mismatch`.
+
 # 5  Storage Layout
 
 ## 5.1  Overview
-PRG storage uses the Clustor WAL/snapshot layout under `/var/lib/quantumqtt/partitions/<part_id>/...`; MQTT state is encoded inside Clustor log entries and snapshots. NVMe (ext4/xfs) remains the baseline; filesystem acceptability follows Clustor.
+PRG storage uses the Clustor WAL/snapshot layout under `/var/lib/quantum/partitions/<part_id>/...`; MQTT state is encoded inside Clustor log entries and snapshots. NVMe (ext4/xfs) remains the baseline; filesystem acceptability follows Clustor.
 
 ---
 
@@ -381,7 +395,7 @@ Snapshot/manifest/compaction behaviour is per Clustor §8/§9.1/§9.2. CP target
 ---
 
 ## 5.5  Integrity and Encryption
-Integrity, AEAD, MAC epochs, nonce handling, and ledger proofs follow Clustor §§6.5, 9.2, and 12; QuantuMQTT does not introduce alternate crypto or integrity mechanisms. ControlPlaneRaft issues key epochs and validates manifests per Clustor; tenant-scoped KEKs/DEKs are minted through the same mechanism with weekly rotation aligned to Clustor defaults and dual-read support. Any integrity or AEAD failure triggers Clustor scrub/quarantine, surfaced to MQTT clients via §10.5 reason-code mapping.
+Integrity, AEAD, MAC epochs, nonce handling, and ledger proofs follow Clustor §§6.5, 9.2, and 12; Quantum does not introduce alternate crypto or integrity mechanisms. ControlPlaneRaft issues key epochs and validates manifests per Clustor; tenant-scoped KEKs/DEKs are minted through the same mechanism with weekly rotation aligned to Clustor defaults and dual-read support. Any integrity or AEAD failure triggers Clustor scrub/quarantine, surfaced to MQTT clients via §10.5 reason-code mapping.
 
 ---
 
@@ -433,7 +447,7 @@ Subscriber disconnects before delivery → queue persisted; Will published if ap
 # 8  Control Plane (ControlPlaneRaft)
 
 ## 8.1  Purpose
-The control plane is a ControlPlaneRaft deployment per Clustor §11 (CP-Raft is an alias; ControlPlaneRaft is the canonical term). It carries tenant descriptors, placements, durability proofs, feature gates, DR fences, override ledger entries, and key epochs. Cache freshness, strict-fallback interaction, system log entry semantics, and `/readyz` exposure follow Clustor; QuantuMQTT adds MQTT-specific object schemas and API endpoints but does not alter ControlPlaneRaft behaviour.
+The control plane is a ControlPlaneRaft deployment per Clustor §11 (CP-Raft is an alias; ControlPlaneRaft is the canonical term). It carries tenant descriptors, placements, durability proofs, feature gates, DR fences, override ledger entries, and key epochs. Cache freshness, strict-fallback interaction, system log entry semantics, and `/readyz` exposure follow Clustor; Quantum adds MQTT-specific object schemas and API endpoints but does not alter ControlPlaneRaft behaviour.
 
 ## 8.2  Durable Objects
 ControlPlaneRaft objects: `ClusterConfig` (nodes/placement/durability profile), `TenantSpec` (quotas/trust/ACLs), `RoutingMap` (tenant→PRG, `routing_epoch`), `QuotaPolicy`, `CertificateBundle`, `AuditIndex`, mirrored `DurabilityLedger` (Clustor §11.1), `DRFence/FenceCommit` (Clustor §11.2), `FeatureManifest` (lease/snapshot/observer/PID gates). All obey Clustor wire/catalog rules and cache semantics; RPO intra-region remains 0.
@@ -481,7 +495,7 @@ Clustor `controlplane.cache_state` and strict-fallback apply unchanged (Clustor 
 # 9  Security Model
 
 ## 9.1  Design Principles
-Security is woven into every layer of QuantuMQTT.  
+Security is woven into every layer of Quantum.  
 The platform assumes hostile multitenancy and untrusted networks.  
 Core invariants:
 
@@ -520,7 +534,7 @@ Core invariants:
 - `seccomp` filters allow minimal syscalls.  
 - Drop all capabilities except `NET_BIND_SERVICE`.  
 - No core dumps.  
-- Run as non-root; secrets under `/etc/quantumqtt/secure` mode 0700.  
+- Run as non-root; secrets under `/etc/quantum/secure` mode 0700.  
 - Signed binaries; signature verified at startup.
 
 ---
@@ -553,7 +567,7 @@ Device classes that cannot present mTLS credentials use MQTT 5 Enhanced Auth wit
 4. Upon success, the control agent stamps the session with `auth_epoch` so replays or stolen tokens cannot attach to different ClientIDs.  
 5. Token expiry shorter than session expiry forces proactive re-auth via MQTT AUTH exchange; failure closes the session and suppresses Will.
 
-Tokens must include `aud=quantumqtt`, `scope=mqtt.connect`, and a monotone `cnf` thumbprint tying them to the TLS exporter secret.  Connections missing any bind are rejected with reason `0x87` (Not Authorized) and audited as `TOKEN_BINDING_MISMATCH`.
+Tokens must include `aud=quantum`, `scope=mqtt.connect`, and a monotone `cnf` thumbprint tying them to the TLS exporter secret.  Connections missing any bind are rejected with reason `0x87` (Not Authorized) and audited as `TOKEN_BINDING_MISMATCH`.
 Token-only flows inherit the same QoS 2/dedupe semantics as mTLS. CP-dependent auth/re-auth/token introspection obey §8.7 and the read-gate rule (§3.1.1); failures under CP expiry or strict-fallback surface `PERMANENT_DURABILITY` (not `Not Authorized`). Inter-node traffic remains mTLS-only; tokens are never accepted on Raft/CP links.
 
 ## 10.5  Error / Reason-Code Mapping
@@ -657,7 +671,7 @@ MQTT over QUIC/HTTP/3.
 ## 13.1  Goals
 Maintain bounded memory and latency at full concurrency while ensuring fairness among tenants.
 
-Flow control and backpressure are implemented by Clustor’s PID/throttle controller (§10) and exposed via Clustor `ThrottleEnvelope`/credit hints; QuantuMQTT maps those signals to MQTT `Receive Maximum`, tenant throttles, and MQTT reason codes. Partition-level credits, disk/CPU backpressure, and structural lag handling therefore follow Clustor semantics; the MQTT behaviour below is an overlay for client experience.
+Flow control and backpressure are implemented by Clustor’s PID/throttle controller (§10) and exposed via Clustor `ThrottleEnvelope`/credit hints; Quantum maps those signals to MQTT `Receive Maximum`, tenant throttles, and MQTT reason codes. Partition-level credits, disk/CPU backpressure, and structural lag handling therefore follow Clustor semantics; the MQTT behaviour below is an overlay for client experience.
 MQTT version note: dynamic `Receive Maximum`/reason-code surfacing applies to MQTT 5; MQTT 3.1/3.1.1 clients follow the same internal credit logic but see throttling/disconnect per §10.7.
 
 ## 13.2  Control Boundaries
@@ -829,12 +843,12 @@ Nightly export to object store; quarterly full-restore test.
 ---
 
 # 18  Compliance and Auditability
-QuantuMQTT aligns with common cloud controls: full signed audit trail, deterministic replay, 12-month log retention, encryption in transit/at rest, and tenant isolation suitable for SOC2/ISO27001 equivalence.
+Quantum aligns with common cloud controls: full signed audit trail, deterministic replay, 12-month log retention, encryption in transit/at rest, and tenant isolation suitable for SOC2/ISO27001 equivalence.
 
 ---
 
 # 19  Configuration and Operational Controls
-Operational controls below are policy overlays for QuantuMQTT; they do not alter Clustor semantics.
+Operational controls below are policy overlays for Quantum; they do not alter Clustor semantics.
 
 ## 19.1  Hierarchy
 Cluster → Node → Partition → Tenant → Definition  
@@ -868,7 +882,7 @@ Configurations stored in CP-Raft as versioned JSON.
 # 21  Testing and Verification
 
 ## 21.1  Deterministic Replay
-Given identical WAL and checkpoints, replay yields byte-identical state; unit tests verify this. Clustor provides deterministic Raft/WAL/ledger/snapshot proofs (Clustor §§0, 3, 6.5, 8, App.C); QuantuMQTT adds MQTT-specific fixtures (WAL→MQTT events, QoS 2 dedupe, cross-PRG `forward_seq` continuity).  
+Given identical WAL and checkpoints, replay yields byte-identical state; unit tests verify this. Clustor provides deterministic Raft/WAL/ledger/snapshot proofs (Clustor §§0, 3, 6.5, 8, App.C); Quantum adds MQTT-specific fixtures (WAL→MQTT events, QoS 2 dedupe, cross-PRG `forward_seq` continuity).  
 [Normative] **MQTT-DET-01:** MQTT deterministic replay MUST depend solely on Clustor WAL ordering and CP snapshot ordering; no wall-clock or transport-derived source may influence SP apply, routing, or ACKs.
 - Tick/RNG facade wraps Clustor deterministic sources; `Instant::now()`/`rand::thread_rng()` forbidden in SP/Raft paths.
 - Snapshot encoding is deterministic (subscriptions lexicographic; offline queues by `(client_id, enqueue_index)`; dedupe by `(tenant_id, client_id, session_epoch, message_id, direction)`; retained trie order; manifests canonical JSON).

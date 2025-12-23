@@ -1,0 +1,31 @@
+{
+  "packets": [
+    {
+      "name": "CONNECT",
+      "fields": [
+        {"name": "protocol_name", "type": "string"},
+        {"name": "protocol_level", "type": "u8"},
+        {"name": "connect_flags", "type": "u8"},
+        {"name": "keep_alive", "type": "u16"},
+        {"name": "properties", "type": "bytes", "optional": true},
+        {"name": "client_id", "type": "string"}
+      ]
+    },
+    {
+      "name": "PUBLISH",
+      "fields": [
+        {"name": "topic", "type": "string"},
+        {"name": "qos", "type": "enum"},
+        {"name": "message_id", "type": "u16", "optional": true},
+        {"name": "payload", "type": "bytes"}
+      ]
+    },
+    {
+      "name": "SUBSCRIBE",
+      "fields": [
+        {"name": "packet_id", "type": "u16"},
+        {"name": "filters", "type": "array"}
+      ]
+    }
+  ]
+}

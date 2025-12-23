@@ -1,0 +1,14 @@
+{
+  "artifacts": [
+    {
+      "name": "mqtt_control_packets",
+      "path": "wire/mqtt.json",
+      "type": "schema"
+    },
+    {
+      "name": "quic_transport",
+      "path": "wire/quic.json",
+      "type": "schema"
+    }
+  ]
+}

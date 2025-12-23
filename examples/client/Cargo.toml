@@ -1,0 +1,14 @@
+[package]
+name = "quantum-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4.5.20", features = ["derive"] }
+libc = "0.2"
+rumqttc = { version = "0.23.0", default-features = false, features = ["use-rustls"] }
+tokio = { version = "1.40.0", features = ["rt-multi-thread", "macros", "io-util", "signal", "time", "net"] }
+rustls = { version = "0.21.12", default-features = false, features = ["dangerous_configuration", "tls12"] }
+rustls-pemfile = "1.0.4"
