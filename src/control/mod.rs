@@ -1,3 +1,13 @@
+//! Control plane client and cache coordination.
+//!
+//! This module provides the primary `ControlPlaneClient` which caches
+//! routing epochs, tenant metadata, and placement information from
+//! the embedded CP-Raft. The file is large (~1450 lines) because it
+//! consolidates all CP interaction logic, cache refresh, proof
+//! coordination, and telemetry export in one cohesive unit. Submodules
+//! handle specialized concerns (api, capabilities, cli, embedded,
+//! migration, placement, routing_cache, telemetry).
+
 use anyhow::{anyhow, Result};
 use clustor::control_plane::capabilities::FeatureManifest;
 use clustor::control_plane::core::client::{
@@ -137,7 +147,6 @@ pub struct ControlPlaneState {
 /// Control-plane client facade. Actual client wiring to clustor will be added as the project evolves.
 #[derive(Clone)]
 pub struct ControlPlaneClient<C: Clock> {
-    #[allow(dead_code)]
     cfg: ControlPlaneConfig,
     clock: C,
     state: Arc<Mutex<ControlPlaneState>>,
@@ -353,7 +362,6 @@ impl<C: Clock> ControlPlaneClient<C> {
                     if attempt + 1 < attempts {
                         let backoff = Duration::from_millis(50 * (attempt as u64 + 1));
                         sleep(backoff);
-                        continue;
                     }
                 }
             }

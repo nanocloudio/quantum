@@ -155,10 +155,32 @@ storage_dir = "data"
 
 ---
 
+## Repository Layout
+
+| Directory | Type | Description |
+|-----------|------|-------------|
+| `src/` | Rust crate | Main library and binary source. Contains the `quantum` crate with modules for control plane, networking, PRG management, MQTT workloads, replication, storage, and CLI. |
+| `tests/` | Integration tests | Rust integration tests executed via `cargo test`. Tests exercise the public API and broker behavior. |
+| `examples/` | Examples | Example client code and quickstart documentation. The `client/` subdirectory contains a standalone Cargo project. |
+| `config/` | Assets | Example configuration files. `quantum.toml` is the reference single-node profile. |
+| `docs/` | Documentation | Markdown documentation including specification, runbooks, CLI reference, and operational guides. |
+| `tools/` | Utilities | Development and CI utilities: |
+| | | - `telemetry_guard/` – Rust crate that validates telemetry catalog JSON structure |
+| | | - `wire_lint/` – Rust crate that compares wire catalogs against Clustor artifacts |
+| | | - `seed_workload_data/` – Standalone Rust binary for hydrating fixture data |
+| `telemetry/` | Assets | Telemetry catalog (`catalog.json`) defining metrics, traces, and logs emitted by the broker. Not a Rust crate. |
+| `wire/` | Assets | Wire protocol definitions (`mqtt.json`, `quic.json`) for protocol validation. Not a Rust crate. |
+| `certs/` | Assets | TLS certificates and keys for development. Not committed to version control in production. |
+| `data/` | Runtime | Runtime data directory containing WAL segments, snapshots, and fixtures. Ignored by git except for fixture seeds. |
+
+The repository is a Cargo workspace. The main `quantum` crate produces the broker binary, while `tools/telemetry_guard/` and `tools/wire_lint/` are workspace members used for CI validation.
+
+---
+
 ## Runbooks & Documentation
 - **Specification** – `docs/specification.md` is the normative authority for partitioning, QoS guarantees, routing epochs, and MQTT/Clustor invariants. Treat it as law; README text only summarizes intent.
 - **Deployment & HA** – `docs/deployment.md` and `docs/high_availability.md` document front-door patterns, readiness expectations, drain orchestration, and rolling restart guidance.
 - **Scaling & Performance** – `docs/runbook_scaling.md` and `docs/performance.md` map tenant PRG counts, rebalance workflows, and throughput targets to metrics/alerts.
 - **Interop & Operations** – `docs/interop.md` captures compatibility matrices with MQTT client stacks, while `docs/cli.md` and `docs/dev_seeding.md` keep developer flows deterministic.
 
-Quantum inherits Clustor’s guardrails for consensus, durability, telemetry, and manifest management. Keep spec and manifest hashes in lockstep, wire readiness into your load balancers, and lean on the documented tooling so CI, dev, and production environments all exercise the same deterministic surfaces.
+Quantum inherits Clustor's guardrails for consensus, durability, telemetry, and manifest management. Keep spec and manifest hashes in lockstep, wire readiness into your load balancers, and lean on the documented tooling so CI, dev, and production environments all exercise the same deterministic surfaces.

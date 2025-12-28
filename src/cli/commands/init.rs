@@ -363,8 +363,8 @@ fn compute_capability_digest(registry: &CapabilityRegistry) -> u64 {
 struct FixtureManifest {
     #[serde(default)]
     _schema_version: u32,
-    #[allow(dead_code)]
-    fixture_version: Option<String>,
+    #[serde(rename = "fixture_version")]
+    _fixture_version: Option<String>,
     workload: String,
     tenants: Vec<TenantFixture>,
 }

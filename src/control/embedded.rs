@@ -1,3 +1,10 @@
+//! Embedded control plane server and state persistence.
+//!
+//! This module intentionally uses blocking I/O (`std::net::TcpListener`,
+//! `std::fs`, `std::thread::sleep`) because the embedded CP runs in a
+//! dedicated thread, not within the Tokio runtime. This avoids runtime
+//! nesting complexity while keeping the CP lightweight.
+
 use crate::config::{BootstrapPlacementConfig, ControlPlaneBootstrap};
 use anyhow::Result;
 use clustor::control_plane::capabilities::FeatureManifest;
@@ -198,7 +205,6 @@ fn run_embedded_server(
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                continue;
             }
             Err(err) => {
                 tracing::warn!("embedded cp listener error: {err:?}");

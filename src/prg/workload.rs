@@ -260,8 +260,7 @@ pub struct ApplyContext {
     meta: ApplyMeta,
     forward_intents: Vec<ForwardIntent>,
     offline_entries: Vec<OfflineEntry>,
-    #[allow(dead_code)]
-    span: Span,
+    _span: Span,
     forwarding: ForwardingEngine,
 }
 
@@ -286,7 +285,7 @@ impl ApplyContext {
             meta,
             forward_intents: Vec::new(),
             offline_entries: Vec::new(),
-            span,
+            _span: span,
             forwarding,
         }
     }
@@ -358,8 +357,7 @@ pub struct ReadyContext {
     prg_id: PrgId,
     metrics: WorkloadMetrics,
     leadership: LeadershipSignal,
-    #[allow(dead_code)]
-    span: Span,
+    _span: Span,
 }
 
 impl ReadyContext {
@@ -373,7 +371,7 @@ impl ReadyContext {
             prg_id,
             metrics,
             leadership,
-            span,
+            _span: span,
         }
     }
 

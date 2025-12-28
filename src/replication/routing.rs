@@ -157,7 +157,7 @@ pub fn jump_consistent_hash(key: u64, buckets: u64) -> u64 {
     let mut k = key;
     while j < buckets as i64 {
         b = j;
-        k = k.wrapping_mul(2862933555777941757).wrapping_add(1);
+        k = k.wrapping_mul(2_862_933_555_777_941_757).wrapping_add(1);
         j = (((b + 1) as f64) * (1u64 << 31) as f64 / (((k >> 33) + 1) as f64)).floor() as i64;
     }
     b as u64

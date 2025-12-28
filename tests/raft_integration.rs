@@ -1,14 +1,14 @@
 //! End-to-end Raft wiring across three replicas using the built-in network stack.
+
+mod common;
+
 use anyhow::Result;
+use common::{ephemeral_port, write_tls_materials};
 use quantum::config::{CommitVisibility, DurabilityConfig, DurabilityMode};
 use quantum::prg::PersistedPrgState;
 use quantum::raft::{AckContract, PersistSnapshotOp, RaftOp};
 use quantum::raft_replica::{RaftReplica, RaftReplicaConfig, RaftReplicaPaths};
 use quantum::routing::{PrgId, PrgPlacement};
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
-use std::convert::TryInto;
-use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -17,12 +17,12 @@ use tempfile::TempDir;
 async fn three_node_raft_cluster_end_to_end() -> Result<()> {
     let trust_domain = "test.local";
     let temp = TempDir::new()?;
-    let (chain, key, ca) = write_tls_materials(&temp, trust_domain)?;
+    let tls = write_tls_materials(temp.path(), trust_domain);
     let prg = PrgId {
         tenant_id: "tenant-a".into(),
         partition_index: 0,
     };
-    let binds: Vec<SocketAddr> = (0..3).map(|_| next_loopback()).collect();
+    let binds: Vec<_> = (0..3).map(|_| ephemeral_port()).collect();
     let placement = PrgPlacement {
         node_id: binds[0].to_string(),
         replicas: vec![binds[1].to_string(), binds[2].to_string()],
@@ -38,9 +38,9 @@ async fn three_node_raft_cluster_end_to_end() -> Result<()> {
         durability.replica_id = bind.to_string();
         let ack = Arc::new(AckContract::new(&durability));
         let paths = RaftReplicaPaths {
-            tls_chain: chain.clone(),
-            tls_key: key.clone(),
-            trust_bundle: ca.clone(),
+            tls_chain: tls.chain.clone(),
+            tls_key: tls.key.clone(),
+            trust_bundle: tls.ca.clone(),
             trust_domain: trust_domain.to_string(),
             log_root: temp.path().join(format!("node_{idx}")),
             bind_override: None,
@@ -119,42 +119,4 @@ async fn three_node_raft_cluster_end_to_end() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn next_loopback() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("ephemeral addr")
-}
-
-fn write_tls_materials(temp: &TempDir, trust_domain: &str) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let ca_key = KeyPair::generate()?;
-    let mut ca_params = CertificateParams::default();
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "test-ca");
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    let ca_pem = ca_cert.pem();
-    let ca_path = temp.path().join("ca.pem");
-    std::fs::write(&ca_path, &ca_pem)?;
-
-    let leaf_key = KeyPair::generate()?;
-    let mut leaf_params = CertificateParams::new(vec!["localhost".to_string()])?;
-    leaf_params
-        .distinguished_name
-        .push(DnType::CommonName, "localhost");
-    leaf_params.subject_alt_names.push(SanType::URI(
-        format!("spiffe://{trust_domain}/node").try_into()?,
-    ));
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key)?;
-    let mut chain = leaf_cert.pem();
-    chain.push_str(&ca_pem);
-    let chain_path = temp.path().join("chain.pem");
-    let key_path = temp.path().join("leaf.key");
-    std::fs::write(&chain_path, &chain)?;
-    std::fs::write(&key_path, leaf_key.serialize_pem())?;
-
-    Ok((chain_path, key_path, ca_path))
 }

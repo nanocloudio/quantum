@@ -77,10 +77,8 @@ pub struct InflightRecord {
 
 /// Session processor hook; actual MQTT handling will live here.
 pub struct SessionProcessor<C: Clock> {
-    #[allow(dead_code)]
     pub(crate) clock: C,
-    #[allow(dead_code)]
-    ack_contract: AckContract,
+    _ack_contract: AckContract,
     dedupe: DedupeTable,
     forward_seq: ForwardSeqTracker,
     credit_params: CreditParams,
@@ -93,7 +91,7 @@ impl<C: Clock> SessionProcessor<C> {
         let horizon = Duration::from_secs(72 * 60 * 60);
         Self {
             clock,
-            ack_contract,
+            _ack_contract: ack_contract,
             dedupe: DedupeTable::new(4_096, 64_000_000, horizon),
             forward_seq: ForwardSeqTracker::default(),
             credit_params: CreditParams::default(),

@@ -1,3 +1,101 @@
+#![deny(unused, dead_code)]
+#![deny(clippy::all, clippy::pedantic)]
+// Module naming: common pattern in domain-driven code
+#![allow(clippy::module_name_repetitions)]
+// Function complexity: some functions are inherently complex
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::too_many_arguments)]
+// Variable naming: domain terms often similar
+#![allow(clippy::similar_names)]
+// Documentation style: many terms don't need backticks
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+// API ergonomics: prefer simplicity over must_use annotations
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::return_self_not_must_use)]
+// Format strings: allow non-inlined for readability
+#![allow(clippy::uninlined_format_args)]
+// Import style
+#![allow(clippy::wildcard_imports)]
+// Struct field patterns
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::struct_field_names)]
+// Numeric casts: intentional in protocol code
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_lossless)]
+// Control flow style
+#![allow(clippy::if_not_else)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::single_match_else)]
+#![allow(clippy::match_wildcard_for_single_variants)]
+#![allow(clippy::manual_let_else)]
+// Passing style
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+// Self usage
+#![allow(clippy::unused_self)]
+#![allow(clippy::used_underscore_binding)]
+// Clone/assign patterns
+#![allow(clippy::assigning_clones)]
+// Option/Result patterns
+#![allow(clippy::unnecessary_wraps)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::map_unwrap_or)]
+// Type defaults
+#![allow(clippy::default_trait_access)]
+#![allow(clippy::implicit_hasher)]
+// Inlining
+#![allow(clippy::inline_always)]
+// Iterator patterns
+#![allow(clippy::iter_without_into_iter)]
+// Reference patterns
+#![allow(clippy::ref_option)]
+// Closure style
+#![allow(clippy::redundant_closure_for_method_calls)]
+// Unit patterns
+#![allow(clippy::ignored_unit_patterns)]
+// Large types
+#![allow(clippy::large_futures)]
+#![allow(clippy::large_enum_variant)]
+// Explicit type bounds
+#![allow(clippy::significant_drop_tightening)]
+// Copy vs clone style
+#![allow(clippy::cloned_instead_of_copied)]
+// String conversion efficiency
+#![allow(clippy::inefficient_to_string)]
+// Sort stability
+#![allow(clippy::stable_sort_primitive)]
+// Debug impl completeness
+#![allow(clippy::missing_fields_in_debug)]
+// Error handling style
+#![allow(clippy::result_large_err)]
+#![allow(clippy::unnecessary_box_returns)]
+// Boolean ops
+#![allow(clippy::nonminimal_bool)]
+// Explicit returns
+#![allow(clippy::needless_return)]
+#![allow(clippy::semicolon_if_nothing_returned)]
+// Cast wrapping
+#![allow(clippy::cast_possible_wrap)]
+// Iteration style
+#![allow(clippy::explicit_iter_loop)]
+#![allow(clippy::explicit_into_iter_loop)]
+// Bool conversion
+#![allow(clippy::bool_to_int_with_if)]
+// String allocation efficiency
+#![allow(clippy::format_push_string)]
+// File extension comparison
+#![allow(clippy::case_sensitive_file_extension_comparisons)]
+// Pointer casts
+#![allow(clippy::ptr_as_ptr)]
+#![allow(clippy::ptr_cast_constness)]
+// Async functions that may not await yet
+#![allow(clippy::unused_async)]
+
 //! Quantum - Multi-protocol message broker with Raft-based replication.
 //!
 //! # Module Organization

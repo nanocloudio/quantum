@@ -7,11 +7,8 @@ use std::path::PathBuf;
 /// Minimal structure check: top-level object with optional metrics/traces/logs arrays.
 #[derive(Deserialize)]
 struct TelemetryCatalog {
-    #[allow(dead_code)]
     metrics: Option<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
     traces: Option<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
     logs: Option<Vec<serde_json::Value>>,
 }
 

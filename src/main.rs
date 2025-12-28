@@ -1,3 +1,15 @@
+#![deny(unused, dead_code)]
+#![deny(clippy::all, clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::wildcard_imports)]
+
 //! Quantum - unified CLI entrypoint.
 //!
 //! Usage:

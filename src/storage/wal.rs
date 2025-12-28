@@ -615,6 +615,6 @@ fn replay_inline() -> bool {
             .as_deref()
             .map(str::to_lowercase)
             .as_deref(),
-        Some("1") | Some("true") | Some("yes")
+        Some("1" | "true" | "yes")
     )
 }

@@ -51,10 +51,10 @@ impl SnapshotReport {
 
 #[derive(Debug, Deserialize)]
 struct SnapshotManifest {
-    #[allow(dead_code)]
-    term: u64,
-    #[allow(dead_code)]
-    index: u64,
+    #[serde(rename = "term")]
+    _term: u64,
+    #[serde(rename = "index")]
+    _index: u64,
     state: PersistedPrgState,
     #[serde(default)]
     effective_floor: u64,
@@ -218,7 +218,7 @@ fn resolve_latest_manifest_for_prg(prg_dir: &Path) -> Result<PathBuf> {
             continue;
         }
         match &best {
-            Some((best_index, _)) if *best_index >= index => continue,
+            Some((best_index, _)) if *best_index >= index => {}
             _ => best = Some((index, manifest)),
         }
     }

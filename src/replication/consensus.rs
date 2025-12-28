@@ -1,3 +1,9 @@
+//! Raft consensus protocol and ack contract management.
+//!
+//! The `delay` method uses `std::thread::sleep` as a fallback when no
+//! Tokio runtime is available (checked via `Handle::try_current`).
+//! This supports both async and synchronous initialization contexts.
+
 use super::replica::RaftReplica;
 use crate::clustor_client::ClustorClient;
 use crate::config::{CommitVisibility, DurabilityConfig, DurabilityMode};
@@ -132,7 +138,7 @@ impl AckContract {
                 }
                 match rx.recv().await {
                     Ok(evt) if evt.index >= index => return Ok(()),
-                    Ok(_) => continue,
+                    Ok(_) => {}
                     Err(_) => anyhow::bail!("raft apply stream closed"),
                 }
             }
@@ -222,26 +228,25 @@ impl AckContract {
     }
 
     pub fn update_clustor_floor(&self, floor: u64) {
-        if let Some(_replica) = self.raft.lock().ok().and_then(|r| r.clone()) {
+        if self.raft.lock().ok().and_then(|r| r.clone()).is_some() {
             // When a Raft replica is attached, avoid re-seeding commits from observers
             // (e.g. WAL replay) to prevent re-entering apply hooks; just align the next
             // index with the observed floor.
             let _ = self.next_index.fetch_max(floor, Ordering::SeqCst);
             return;
-        } else {
-            let current = self.clustor.floor();
-            if floor <= current {
-                // Ignore regressions to avoid quorum mismatch warnings.
-                let _ = self.next_index.fetch_max(current, Ordering::SeqCst);
-                return;
-            }
-            let _ = self.clustor.record_local_commit(
-                self.term.load(Ordering::SeqCst),
-                floor,
-                self.io_mode(),
-                None,
-            );
         }
+        let current = self.clustor.floor();
+        if floor <= current {
+            // Ignore regressions to avoid quorum mismatch warnings.
+            let _ = self.next_index.fetch_max(current, Ordering::SeqCst);
+            return;
+        }
+        let _ = self.clustor.record_local_commit(
+            self.term.load(Ordering::SeqCst),
+            floor,
+            self.io_mode(),
+            None,
+        );
         let _ = self.next_index.fetch_max(floor, Ordering::SeqCst);
     }
 

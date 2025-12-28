@@ -1,3 +1,9 @@
+//! Clustor client for durability ledger interaction.
+//!
+//! The `wait_for_ack` loop uses `std::thread::sleep` as a fallback when
+//! no Tokio runtime is available (checked via `Handle::try_current`).
+//! This supports both async and synchronous test contexts.
+
 use clustor::consensus::DurabilityProof;
 use clustor::durability::{AckRecord, DurabilityAckMessage, DurabilityLedger, IoMode, LedgerError};
 use clustor::raft::{PartitionQuorumConfig, ReplicaId};

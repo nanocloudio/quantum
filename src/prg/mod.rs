@@ -4,6 +4,12 @@
 //! - Core PRG state machine and manager
 //! - `workload` - Workload trait and helpers
 //! - `workload_rpc` - Remote workload RPC client
+//!
+//! The file is large (~2400 lines) because PRG management is the
+//! central coordination point for all replica group operations:
+//! host registration, apply loops, forwarding, snapshotting, and
+//! state machine transitions. Splitting would require threading
+//! complex state across many boundaries.
 
 pub mod workload;
 pub mod workload_rpc;
@@ -238,7 +244,7 @@ impl<C: Clock> PrgManager<C> {
                         this.on_apply(evt).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
         });
@@ -609,7 +615,7 @@ impl<C: Clock> PrgManager<C> {
                             .await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
         };
@@ -1210,11 +1216,6 @@ impl<C: Clock> PrgManager<C> {
 
     pub async fn active_hosts_len(&self) -> usize {
         self.active_hosts.lock().await.len()
-    }
-
-    #[allow(dead_code)]
-    async fn snapshot_state(&self, prg: &PrgId) -> PersistedPrgState {
-        self.ensure_state_handle(prg).await.lock().await.clone()
     }
 
     async fn persist_snapshot_with_commit(&self, prg: &PrgId, mut snapshot: PersistedPrgState) {

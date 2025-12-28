@@ -1,3 +1,11 @@
+//! Network listener orchestration for TLS/TCP and QUIC entry points.
+//!
+//! This module coordinates all listener accept loops, protocol negotiation,
+//! session lifecycle, and packet handling. The file is large (~2400 lines)
+//! because it centralizes the entire connection-to-session-to-packet flow
+//! rather than fragmenting it across multiple modules, which would require
+//! threading many context objects. The cohesion benefits outweigh the size.
+
 mod edge;
 pub mod protocol;
 
@@ -2250,7 +2258,6 @@ fn internal_from_security(err: &SecurityError) -> InternalCode {
     }
 }
 
-#[allow(dead_code)]
 fn internal_from_routing(err: &RoutingError) -> InternalCode {
     InternalCode::from(err)
 }

@@ -1,9 +1,16 @@
+//! Raft replica management and networking.
+//!
+//! The `RaftReplica::start` function uses blocking `std::fs` calls for
+//! directory creation and log initialization. This is intentional as it
+//! runs during synchronous startup before the async runtime processes
+//! network traffic.
+
 use crate::clustor_client::{AckEvent, ApplyEvent};
 use crate::config::{CommitVisibility, DurabilityMode};
 use crate::routing::{PrgId, PrgPlacement};
 use anyhow::{anyhow, Context, Result};
 use clustor::consensus::{ConsensusCore, ConsensusCoreConfig, DurabilityProof};
-use clustor::durability::{AckRecord, DurabilityAckMessage, DurabilityLedger, IoMode, LedgerError};
+use clustor::durability::{AckRecord, DurabilityLedger, IoMode, LedgerError};
 use clustor::net::tls::{load_identity_from_pem, load_trust_store_from_pem};
 use clustor::net::{
     AsyncRaftNetworkClient, AsyncRaftNetworkServer, AsyncRaftNetworkServerHandle,
@@ -216,17 +223,6 @@ impl ReplicaShared {
             io_mode: self.io_mode,
         };
         self.record_ack(record)
-    }
-
-    #[allow(dead_code)]
-    fn ingest(&self, ack: DurabilityAckMessage) -> Result<u64, LedgerError> {
-        self.record_ack(AckRecord {
-            replica: ack.replica,
-            term: ack.term,
-            index: ack.last_fsynced_index,
-            segment_seq: ack.segment_seq,
-            io_mode: ack.io_mode,
-        })
     }
 
     fn record_ack(&self, record: AckRecord) -> Result<u64, LedgerError> {
@@ -542,7 +538,7 @@ impl RaftReplica {
             }
             match rx.recv().await {
                 Ok(evt) if evt.index >= target => return Ok(()),
-                Ok(_) => continue,
+                Ok(_) => {}
                 Err(_) => anyhow::bail!("apply stream closed"),
             }
         }

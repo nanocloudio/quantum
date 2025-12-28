@@ -83,7 +83,7 @@ fn rand_u64() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
-        .wrapping_mul(6364136223846793005)
+        .wrapping_mul(6_364_136_223_846_793_005)
         .wrapping_add(1)
 }
 
@@ -467,8 +467,7 @@ async fn publish_multi_stdin(
                         }
                         eprintln!("connected to {}:{}", tls.host, tls.port);
                     }
-                    Ok(Event::Incoming(Incoming::PubAck(_))) |
-                    Ok(Event::Incoming(Incoming::PubComp(_))) => {
+                    Ok(Event::Incoming(Incoming::PubAck(_) | Incoming::PubComp(_))) => {
                         pending_acks = pending_acks.saturating_sub(1);
                         published_count += 1;
                         if (eof_reached || disconnecting) && pending_acks == 0 {
