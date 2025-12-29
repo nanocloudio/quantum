@@ -9,10 +9,22 @@
 //! - Retained message plugin
 //! - Offline queue management
 //! - Backpressure policies and flow control
+//! - Topic alias management (MQTT 5.0)
+//! - Message expiry interval handling (MQTT 5.0)
+//! - MQTT 5.0 properties (request/response, subscription identifiers)
+//! - Flow control (receive maximum)
+//! - Session lifecycle (disconnect, client ID assignment)
+//! - Protocol metrics and monitoring
 
+pub mod alias;
 pub mod backpressure;
 pub mod dedupe;
+pub mod expiry;
+pub mod flow_control;
+pub mod lifecycle;
+pub mod metrics;
 pub mod offline;
+pub mod properties;
 pub mod protocol;
 pub mod retained;
 pub mod session;
