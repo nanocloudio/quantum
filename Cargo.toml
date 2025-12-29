@@ -23,7 +23,7 @@ name = "quantum"
 path = "src/main.rs"
 
 [features]
-default = ["tcp-tls", "telemetry"]
+default = ["tcp-tls", "telemetry", "mqtt"]
 tcp-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 quic = ["dep:quinn", "dep:h3", "dep:futures-util"]
 admin-http = ["clustor/admin-http"]
@@ -31,6 +31,12 @@ snapshot-crypto = ["clustor/snapshot-crypto"]
 net = ["clustor/net"]
 telemetry = ["dep:tracing", "dep:tracing-subscriber"]
 interop = []
+
+# Protocol features
+mqtt = []
+kafka = []
+amqp = []
+all-protocols = ["mqtt", "kafka", "amqp"]
 
 [dependencies]
 # Error handling: anyhow for top-level, thiserror for internal enums
