@@ -1,106 +1,52 @@
+# Quantum workspace — the operational surface is the modules/ tree, loaded
+# at runtime by fluxor. This Cargo workspace exists to carry the lint
+# baseline (per ~/Development/nanocloudio/standards/lints.md) and the
+# host-side toolchain crates under tools/.
+
 [workspace]
-members = [
-    ".",
+resolver = "2"
+members  = [
+    "crates/quantum-common",
     "tools/telemetry_guard",
     "tools/wire_lint",
+    "tools/quantum-bench",
 ]
 
-[package]
-name = "quantum"
-version = "0.1.0"
-edition = "2021"
-license = "Apache-2.0"
-authors = ["Quantum Authors <eng@nanocloud.local>"]
-description = "Quantum – distributed Raft-based multi-tenant MQTT broker built atop Clustor"
-default-run = "quantum"
+[workspace.package]
+edition      = "2021"
+rust-version = "1.81"            # reason = "..." attribute + #[expect]; see standards/lints.md
+license      = "MIT OR Apache-2.0"
 
-[lib]
-name = "quantum"
-path = "src/lib.rs"
+# Workspace lint baseline. Per standards/lints.md §1. Every member opts in
+# with `[lints] workspace = true` in its own Cargo.toml.
+[workspace.lints.rust]
+unsafe_code               = "deny"     # no-unsafe crates escalate locally to "forbid" (lints.md §5)
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
 
-[[bin]]
-name = "quantum"
-path = "src/main.rs"
+[workspace.lints.clippy]
+# priority = -1 makes the group enables apply before per-lint overrides.
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "warn",  priority = -1 }
 
-[features]
-default = ["tcp-tls", "telemetry", "mqtt"]
-tcp-tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
-quic = ["dep:quinn", "dep:h3", "dep:futures-util"]
-admin-http = ["clustor/admin-http"]
-snapshot-crypto = ["clustor/snapshot-crypto"]
-net = ["clustor/net"]
-telemetry = ["dep:tracing", "dep:tracing-subscriber"]
-interop = []
+# #[allow] discipline — bans bare #[allow] and requires reason = "...".
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
 
-# Protocol features
-mqtt = []
-kafka = []
-amqp = []
-all-protocols = ["mqtt", "kafka", "amqp"]
+# Hardened defaults beyond clippy::all
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+unwrap_used   = "deny"
+expect_used   = "warn"
+panic         = "warn"
+print_stdout  = "deny"
+print_stderr  = "deny"
 
-[dependencies]
-# Error handling: anyhow for top-level, thiserror for internal enums
-anyhow = "1.0.95"
-thiserror = "2.0.17"
-
-# Serialization: serde for derive, serde_json for config/API, bincode for binary formats
-serde = { version = "1.0.228", features = ["derive"] }
-# preserve_order needed for stable JSON output in diagnostics
-serde_json = { version = "1.0.145", features = ["preserve_order"] }
-bincode = "1.3.3"
-
-# Time: chrono only for RFC3339 timestamps in CLI output; disable heavy defaults
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-
-# Async runtime: Tokio is the sole runtime
-tokio = { version = "1.40.0", features = ["rt-multi-thread", "time", "net", "macros", "signal", "sync", "io-util", "fs"] }
-
-# Core framework: Clustor provides Raft, durability, control-plane, and networking
-clustor = { path = "../clustor", features = ["admin-http", "snapshot-crypto", "net", "async-net"] }
-
-# Telemetry (optional): tracing for structured logging
-tracing = { version = "0.1.40", optional = true }
-tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter", "json", "time"], optional = true }
-
-# MQTT client: rumqttc for CLI publish/subscribe tooling
-rumqttc = { version = "0.23.0", default-features = false, features = ["use-rustls"] }
-
-# TLS (optional): rustls for TCP/TLS listeners
-rustls = { version = "0.21.12", optional = true, default-features = false, features = [
-    "dangerous_configuration",
-    "tls12",
-] }
-tokio-rustls = { version = "0.24.1", optional = true }
-rustls-pemfile = { version = "1.0.4", optional = true }
-
-# QUIC (optional): quinn for QUIC listeners
-quinn = { version = "0.11.9", optional = true }
-h3 = { version = "0.0.6", optional = true }
-futures-util = { version = "0.3.31", optional = true }
-
-# HTTP client: reqwest for forward-plane and telemetry fetching
-reqwest = { version = "0.12.5", default-features = false, features = ["json", "rustls-tls", "blocking"] }
-
-# CLI: clap for argument parsing
-clap = { version = "4.5.20", features = ["derive"] }
-
-# Config: toml for configuration file parsing
-toml = "0.8.19"
-
-# Utilities
-bytes = "1.8.0"
-bitflags = "2.6.0"
-uuid = { version = "1.10.0", features = ["v4"] }
-twox-hash = "1.6.3"
-futures = "0.3.31"
-parking_lot = "0.12"
-base64 = "0.22.1"
-libc = "0.2"
-
-[dev-dependencies]
-pretty_assertions = "1.4.0"
-tempfile = "3.23.0"
-futures = "0.3.31"
-futures-util = "0.3.31"
-which = "6.0.3"
-rcgen = { version = "0.13", features = ["pem"] }
+# Pedantic carve-outs (universally noisy lints).
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+missing_const_for_fn    = "allow"
+too_many_lines          = "allow"

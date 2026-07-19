@@ -1,0 +1,392 @@
+# Quantum: Single-node Linux test (no TLS)
+#
+# Full 42-module pipeline: 23 Clustor substrate modules + 19 Quantum
+# application modules. Composes a multi-protocol broker (MQTT/Kafka/AMQP)
+# on top of the Raft consensus substrate.
+#
+# Clients connect on port 9090 (linux_net TCP). Protocol selected by ALPN
+# tag (or first-byte sniffing for non-TLS). Management surface on 9100.
+
+target: linux
+tick_us: 1000
+
+# Substrate (raft, wal, peer_router, partition_router, etc.) lives in
+# clustor/modules/ — quantum/modules/ is reserved for quantum-specific
+# modules (mqtt_codec, session_processor, …). The fluxor tool searches
+# these paths in order when resolving manifests; see
+# `clustor/docs/substrate_sharing.md`.
+module_search_paths:
+  - ../../clustor/modules/app
+
+platform:
+  net: {}
+
+modules:
+  # ── Clustor substrate (23 modules, stock) ────────────────
+  - name: peer_router
+  - name: client_codec
+  - name: throttle_gate
+  - name: raft_engine
+  - name: replicator
+  - name: commit_tracker
+  - name: apply_pipeline
+  - name: wal
+  # Group-fsync batching is configured by wal's `fsync_mode`,
+  # `group_window_ms`, and `group_max_pending` params.
+  - name: durability_ledger
+  - name: cp_bridge
+  - name: cp_proof_cache
+  - name: read_gate
+  - name: flow_controller
+  - name: key_manager
+  - name: telemetry_agg
+  - name: client_surface
+  - name: rbac
+  - name: admin_handler
+  - name: snapshot_engine
+  - name: placement_router
+
+  # ── Quantum: protocol routing & codecs (4 modules) ──────
+  - name: protocol_router
+  - name: mqtt_codec
+  - name: kafka_codec
+  - name: amqp_codec
+
+  # ── Quantum: session core (1 module) ────────────────────
+  - name: session_processor
+
+  # ── Quantum: flow/ack (3 modules) ───────────────────────
+  - name: ack_tracker
+  - name: backpressure_propagator
+  - name: prefetch_controller
+
+  # ── Quantum: topic & messaging (4 modules) ──────────────
+  - name: topic_engine
+  - name: dedup_engine
+  - name: offline_queue
+  - name: retained_store
+
+  # ── Quantum: forwarding & coordination (3 modules) ──────
+  - name: forward_coordinator
+  - name: consumer_group_coordinator
+  - name: transaction_coordinator
+
+  # ── Quantum: control plane + ops (4 modules) ────────────
+  - name: tenant_manager
+  - name: dr_manager
+  - name: audit_logger
+  - name: metrics_aggregator
+
+wiring:
+  # ── Transport: linux_net ↔ peer_router ──────────────────
+  - from: linux_net.net_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: linux_net.net_in
+
+  # ── peer_router fan-out ─────────────────────────────────
+  # Client cleartext fans to client_surface (admin/raft HTTP) and to
+  # protocol_router (ALPN demux for the app protocols); peer traffic
+  # goes to replicator.
+  - from: peer_router.cleartext
+    to: client_surface.requests
+  - from: peer_router.cleartext
+    to: protocol_router.raw_in
+  - from: peer_router.peer_rx
+    to: replicator.ack
+
+  # ── Protocol router → codecs ────────────────────────────
+  - from: protocol_router.mqtt_out
+    to: mqtt_codec.raw_in
+  - from: protocol_router.kafka_out
+    to: kafka_codec.raw_in
+  - from: protocol_router.amqp_out
+    to: amqp_codec.raw_in
+
+  # ── Codec response frames → peer_router
+  - from: mqtt_codec.frames_out
+    to: peer_router.client_resp
+  - from: kafka_codec.frames_out
+    to: peer_router.client_resp
+  - from: amqp_codec.frames_out
+    to: peer_router.client_resp
+
+  # ── Codecs → session_processor ──────────────────────────
+  - from: mqtt_codec.proposals_out
+    to: session_processor.codec_in
+  - from: kafka_codec.proposals_out
+    to: session_processor.codec_in
+  - from: amqp_codec.proposals_out
+    to: session_processor.codec_in
+
+  # ── session_processor response path ─────────────────────
+  - from: session_processor.codec_out
+    to: mqtt_codec.responses_in
+  - from: session_processor.codec_out
+    to: kafka_codec.responses_in
+  - from: session_processor.codec_out
+    to: amqp_codec.responses_in
+
+  # ── session_processor → Raft proposals ──────────────────
+  - from: session_processor.proposals
+    to: raft_engine.proposals
+
+  # Tagged path for QoS 1+ PUBLISH — raft_engine echoes
+  # MSG_PROPOSAL_ASSIGNED so session_processor can bind correlation_id
+  # → wal_index and register the inflight with ack_tracker.
+  - from: session_processor.proposals_tagged
+    to: raft_engine.proposals_tagged
+  - from: raft_engine.proposal_assigned
+    to: session_processor.assigned_in
+
+  # ── HTTP surface (admin + raft RPC via stock path) ──────
+  - from: client_surface.raft_rpc
+    to: raft_engine.rpc
+  - from: client_surface.client_req
+    to: client_codec.raw
+  - from: client_surface.admin_req
+    to: rbac.request
+  - from: client_surface.responses
+    to: peer_router.client_resp
+
+  # ── Client pipeline (HTTP admin clients) ─────────────────
+  - from: client_codec.parsed
+    to: throttle_gate.requests
+  - from: throttle_gate.admitted
+    to: raft_engine.proposals
+  - from: throttle_gate.rejected
+    to: backpressure_propagator.rejected_in
+
+  # ── Flow control ────────────────────────────────────────
+  - from: flow_controller.credits
+    to: throttle_gate.credit_supply
+  - from: flow_controller.credits
+    to: session_processor.flow_in
+  - from: flow_controller.envelope
+    to: backpressure_propagator.envelope_in
+  - from: replicator.lag_signal
+    to: flow_controller.lag
+
+  # ── Backpressure propagator → session_processor + http ──
+  - from: backpressure_propagator.protocol_signals
+    to: session_processor.flow_in
+  - from: backpressure_propagator.status
+    to: client_surface.throttle_status
+
+  # ── Prefetch controller (consumer flow) ─────────────────
+  - from: session_processor.forward_out
+    to: prefetch_controller.lag_in
+  - from: prefetch_controller.credits_out
+    to: session_processor.flow_in
+
+  # ── ACK tracker ─────────────────────────────────────────
+  - from: durability_ledger.quorum_durable
+    to: ack_tracker.durability_in
+  - from: session_processor.forward_out
+    to: ack_tracker.register_in
+  - from: ack_tracker.ack_out
+    to: session_processor.ack_in
+  - from: ack_tracker.redeliver_out
+    to: session_processor.ack_in
+
+  # ── Topic engine (single op_in port, demuxed by msg_type) ──
+  - from: session_processor.topic_out
+    to: topic_engine.op_in
+  - from: topic_engine.deliver_out
+    to: session_processor.deliver_in
+  - from: topic_engine.forward_out
+    to: forward_coordinator.forward_in
+
+  # ── Messaging infrastructure ────────────────────────────
+  - from: session_processor.messaging_out
+    to: dedup_engine.check_in
+  - from: dedup_engine.result_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: offline_queue.enqueue_in
+  - from: session_processor.messaging_out
+    to: offline_queue.reconnect_in
+  - from: offline_queue.drain_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: retained_store.write_in
+  - from: session_processor.messaging_out
+    to: retained_store.read_in
+  - from: retained_store.read_out
+    to: session_processor.messaging_in
+
+  # ── Consumer groups & transactions ──────────────────────
+  - from: session_processor.messaging_out
+    to: consumer_group_coordinator.op_in
+  - from: consumer_group_coordinator.assignment_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: transaction_coordinator.op_in
+  - from: transaction_coordinator.result_out
+    to: session_processor.messaging_in
+
+  # ── Cross-PRG forwarding ────────────────────────────────
+  - from: forward_coordinator.local_out
+    to: raft_engine.proposals
+  - from: forward_coordinator.remote_out
+    to: peer_router.peer_tx
+
+  # ── Raft replication ────────────────────────────────────
+  - from: raft_engine.append_entries
+    to: replicator.entries
+  - from: replicator.net_out
+    to: peer_router.peer_tx
+  - from: replicator.match_indices
+    to: commit_tracker.match
+  - from: raft_engine.rpc_out
+    to: peer_router.peer_tx
+
+  # ── Persistence ─────────────────────────────────────────
+  - from: raft_engine.log_append
+    to: wal.entries
+  - from: wal.flushed
+    to: durability_ledger.ack
+  - from: durability_ledger.quorum_durable
+    to: commit_tracker.durable
+
+  # ── Commit → apply → session_processor ──────────────────
+  - from: commit_tracker.committed
+    to: apply_pipeline.entries
+  # Commit feedback to raft (clustor reference): without it
+  # raft_engine.commit_index never advances and raft throttles all
+  # proposals at MAX_UNCOMMITTED_INFLIGHT (24) — a hard ~24-entry cap.
+  - from: commit_tracker.committed
+    to: raft_engine.commit
+  - from: raft_engine.commit_advanced
+    to: apply_pipeline.entries
+  # log_observe → log_entries is required for the per-entry
+  # committed_entries stream that drives Quantum's apply-side state
+  # machine (PUBACK gating, dedup_check, retained_write, fan-out).
+  - from: raft_engine.log_observe
+    to: apply_pipeline.log_entries
+  - from: apply_pipeline.applied
+    to: session_processor.committed_in
+  - from: apply_pipeline.committed_entries
+    to: session_processor.committed_in
+  - from: apply_pipeline.applied
+    to: client_surface.client_responses
+
+  # ── Snapshots ───────────────────────────────────────────
+  - from: snapshot_engine.export_chunks
+    to: replicator.snapshot_rx
+  - from: replicator.snapshot_import
+    to: snapshot_engine.import_chunks
+  - from: snapshot_engine.manifest_auth
+    to: peer_router.peer_tx
+  - from: wal.compaction_signal
+    to: snapshot_engine.trigger
+  - from: wal.compaction_signal
+    to: dr_manager.wal_signal_in
+  - from: snapshot_engine.export_chunks
+    to: dr_manager.snapshot_resp_in
+
+  # ── Keys ────────────────────────────────────────────────
+  - from: key_manager.dek_epoch
+    to: wal.key_update
+  - from: key_manager.dek_epoch
+    to: snapshot_engine.key_update
+
+  # ── Control plane ───────────────────────────────────────
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: read_gate.cache
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker.cp_state
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine.fallback_signal
+  - from: read_gate.permits
+    to: apply_pipeline.read_permits
+  - from: placement_router.routing
+    to: client_codec.placement
+
+  # ── Tenant manager (Quantum enforcement) ────────────────
+  # NOTE: cp_bridge.tenant_records port requires the enhanced cp_bridge.
+  # Until that lands, tenant_manager operates from bootstrap config only.
+  # - from: cp_bridge.tenant_records
+  #   to: tenant_manager.records_in
+  - from: tenant_manager.quota_signals
+    to: throttle_gate.credit_supply
+  - from: tenant_manager.disconnect_events
+    to: session_processor.cp_in
+
+  # ── Admin ───────────────────────────────────────────────
+  - from: rbac.authorized
+    to: admin_handler.requests
+  - from: rbac.denied
+    to: client_surface.admin_responses
+  - from: admin_handler.raft_commands
+    to: raft_engine.admin_proposals
+  - from: admin_handler.responses
+    to: client_surface.admin_responses
+  - from: dr_manager.promotion
+    to: admin_handler.requests
+
+  # ── Audit fan-in ────────────────────────────────────────
+  - from: rbac.audit_events
+    to: audit_logger.event_in
+  - from: session_processor.audit_out
+    to: audit_logger.event_in
+  - from: tenant_manager.audit_events
+    to: audit_logger.event_in
+  - from: dr_manager.audit_events
+    to: audit_logger.event_in
+  - from: audit_logger.signed_events
+    to: client_surface.admin_responses
+
+  # ── Metrics aggregator (Quantum dimensional) ────────────
+  - from: session_processor.metrics_out
+    to: metrics_aggregator.ingest
+  - from: dedup_engine.metrics
+    to: metrics_aggregator.ingest
+  - from: offline_queue.metrics
+    to: metrics_aggregator.ingest
+  - from: forward_coordinator.metrics
+    to: metrics_aggregator.ingest
+  - from: consumer_group_coordinator.metrics
+    to: metrics_aggregator.ingest
+  - from: transaction_coordinator.metrics
+    to: metrics_aggregator.ingest
+  - from: ack_tracker.metrics
+    to: metrics_aggregator.ingest
+  - from: backpressure_propagator.metrics
+    to: metrics_aggregator.ingest
+  - from: prefetch_controller.metrics
+    to: metrics_aggregator.ingest
+  - from: tenant_manager.metrics
+    to: metrics_aggregator.ingest
+  - from: dr_manager.metrics
+    to: metrics_aggregator.ingest
+  - from: topic_engine.metrics
+    to: metrics_aggregator.ingest
+  - from: retained_store.metrics
+    to: metrics_aggregator.ingest
+  - from: metrics_aggregator.rollups
+    to: telemetry_agg.ingest
+
+  # ── Substrate metrics fan-in (stock Clustor path) ───────
+  - from: raft_engine.metrics
+    to: telemetry_agg.ingest
+  - from: replicator.metrics
+    to: telemetry_agg.ingest
+  - from: wal.metrics
+    to: telemetry_agg.ingest
+  - from: flow_controller.metrics
+    to: telemetry_agg.ingest
+  - from: cp_proof_cache.metrics
+    to: telemetry_agg.ingest
+  - from: snapshot_engine.metrics
+    to: telemetry_agg.ingest
+
+  # ── Telemetry → HTTP ────────────────────────────────────
+  - from: telemetry_agg.readyz
+    to: client_surface.readyz_data
+  - from: telemetry_agg.why
+    to: client_surface.why_data
+  - from: telemetry_agg.export
+    to: client_surface.metrics_data

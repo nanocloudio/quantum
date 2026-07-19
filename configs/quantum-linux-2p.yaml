@@ -1,0 +1,344 @@
+# Quantum: 2-partition variant of quantum-linux-minimal.yaml.
+#
+# Demonstrates per-partition state isolation under the multi-Raft
+# substrate (clustor/docs/rfc_partition_groups.md): each partition gets
+# its own Raft pipeline instances, wired as:
+#
+#   partition_router (num_partitions=2)
+#     ├─ proposals_out_p<i> → raft_engine_p<i> → replicator_p<i>
+#     │                                       → wal_p<i>
+#     │                                       → durability_ledger_p<i>
+#     │                                       → commit_tracker_p<i>
+#     │                                       → apply_pipeline_p<i>
+#     │                                       → session_processor
+#
+# QoS 1 PUBLISH flows on the tagged direct path
+# (`session_processor.proposals_tagged → partition_router.proposals_tagged
+# → raft_engine_p<i>.proposals_partitioned_tagged`); the untagged path
+# carries CONNECT/DISCONNECT.
+#
+# Single-node config has no peers, so neither replicator emits net traffic.
+# What this validates is module instantiation under per-partition naming,
+# correct match_indices fan-in to the right commit_tracker, and that the
+# 8-port budget stays under cap.
+#
+# After running the regression and producing a few CONNECTs, both the
+# flat `wal/seg_*` path (partition 0, default location) and
+# `wal/p0001/seg_*` should accumulate — the per-partition WAL paths
+# evidence state isolation.
+
+target: linux
+tick_us: 1000
+
+# Substrate manifests live in clustor/modules/ (single source of truth);
+# quantum/modules/ holds only quantum-specific modules. See
+# `clustor/docs/substrate_sharing.md`.
+module_search_paths:
+  - ../../clustor/modules/app
+
+platform:
+  net: {}
+
+modules:
+  # ── Clustor substrate ──────────────────────────────────────
+  - name: peer_router
+  - name: partition_router
+    params:
+      num_partitions: 2
+
+  # Partition 0 — full pipeline (QoS 1 tagged path also lands here)
+  - name: raft_engine_p0
+    type: raft_engine
+    params:
+      partition_id: 0
+  - name: wal_p0
+    type: wal
+    params:
+      partition_id: 0
+
+  # Partition 1 — full per-partition pipeline:
+  #   raft_engine_p1 → wal_p1 → durability_ledger_p1
+  #                 → commit_tracker_p1 → apply_pipeline_p1 → session_processor
+  # Plus its own `replicator_p1`. On a single-node cluster neither
+  # replicator has peers, so the loop is quiescent here.
+  - name: raft_engine_p1
+    type: raft_engine
+    params:
+      partition_id: 1
+  - name: wal_p1
+    type: wal
+    params:
+      partition_id: 1
+  - name: durability_ledger_p1
+    type: durability_ledger
+    params:
+      partition_id: 1
+  - name: commit_tracker_p1
+    type: commit_tracker
+  - name: apply_pipeline_p1
+    type: apply_pipeline
+
+  # Partition 0 — per-partition pipeline (mirror of partition 1).
+  - name: durability_ledger_p0
+    type: durability_ledger
+    params:
+      partition_id: 0
+  - name: commit_tracker_p0
+    type: commit_tracker
+  - name: apply_pipeline_p0
+    type: apply_pipeline
+
+  # Per-partition replicators. Each pipelines AppendEntries to
+  # followers for exactly one partition. Single-node config has no
+  # peers so the replicators are quiescent here; what this validates
+  # is module instantiation, the per-partition match_indices wire to
+  # the right commit_tracker, and the fan-in of net_out to
+  # peer_router.repl_tx.
+  - name: replicator_p0
+    type: replicator
+    params:
+      partition_id: 0
+  - name: replicator_p1
+    type: replicator
+    params:
+      partition_id: 1
+
+  # Shared substrate (one instance regardless of partition count).
+  - name: cp_bridge
+  - name: cp_proof_cache
+  - name: flow_controller
+  - name: throttle_gate
+  - name: telemetry_agg
+  - name: client_surface
+
+  # ── Quantum MQTT stack ─────────────────────────────────────
+  - name: protocol_router
+  - name: mqtt_codec
+  - name: session_processor
+  - name: ack_tracker
+  - name: backpressure_propagator
+  - name: topic_engine
+  - name: dedup_engine
+  - name: offline_queue
+  - name: retained_store
+  - name: response_mux
+
+wiring:
+  # ── Transport: linux_net ↔ peer_router ─────────────────────
+  - from: linux_net.net_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: linux_net.net_in
+
+  # ── peer_router → protocol_router ──────────────────────────
+  - from: peer_router.cleartext
+    to: protocol_router.raw_in
+  # peer_router parses the 5-byte partitioned wire envelope and emits
+  # MSG_APPEND_ENTRIES_RESP frames on `peer_rx` and other Raft RPCs
+  # (votes, AE, heartbeats, snapshot chunks) on `raft_rpc`. Both ports
+  # are fanned out to every per-partition consumer; each instance
+  # filters by its own `partition_id` so cross-partition frames are
+  # dropped.
+  - from: peer_router.peer_rx
+    to: replicator_p0.ack
+  - from: peer_router.peer_rx
+    to: replicator_p1.ack
+  - from: peer_router.raft_rpc
+    to: raft_engine_p0.rpc
+  - from: peer_router.raft_rpc
+    to: raft_engine_p1.rpc
+
+  # ── Codecs / client_surface ──────────────────────────────────
+  - from: protocol_router.mqtt_out
+    to: mqtt_codec.raw_in
+  - from: protocol_router.http_out
+    to: client_surface.requests
+  - from: mqtt_codec.frames_out
+    to: response_mux.mqtt_in
+  - from: client_surface.responses
+    to: response_mux.http_in
+  - from: response_mux.mux_out
+    to: peer_router.client_resp
+  - from: mqtt_codec.proposals_out
+    to: session_processor.codec_in
+  - from: session_processor.codec_out
+    to: mqtt_codec.responses_in
+
+  # ── session_processor → partition_router → per-partition Raft ──
+  # Untagged path (CONNECT/DISCONNECT) — body hashed → partition.
+  - from: session_processor.proposals
+    to: partition_router.proposals
+  - from: partition_router.proposals_p0
+    to: raft_engine_p0.proposals_partitioned
+  - from: partition_router.proposals_p1
+    to: raft_engine_p1.proposals_partitioned
+
+  # Tagged path (QoS 1 PUBLISH) — body hashed → partition; correlation
+  # id round-trips back via raft.proposal_assigned → session_processor
+  # → ack_tracker.
+  - from: session_processor.proposals_tagged
+    to: partition_router.proposals_tagged
+  - from: partition_router.proposals_tagged_p0
+    to: raft_engine_p0.proposals_partitioned_tagged
+  - from: partition_router.proposals_tagged_p1
+    to: raft_engine_p1.proposals_partitioned_tagged
+
+  # Both partitions emit MSG_PROPOSAL_ASSIGNED with their own
+  # partition_id stamped in; session_processor.assigned_in fans them
+  # in and forwards (partition_id, wal_index) to ack_tracker so cross-
+  # partition durability proofs don't alias.
+  - from: raft_engine_p0.proposal_assigned
+    to: session_processor.assigned_in
+  - from: raft_engine_p1.proposal_assigned
+    to: session_processor.assigned_in
+
+  # ── Partition 0: full Raft + commit pipeline ───────────────
+  - from: raft_engine_p0.append_entries
+    to: replicator_p0.entries
+  - from: replicator_p0.net_out
+    to: peer_router.repl_tx
+  - from: replicator_p0.match_indices
+    to: commit_tracker_p0.match
+  - from: raft_engine_p0.rpc_out
+    to: peer_router.peer_tx
+  - from: raft_engine_p0.log_append
+    to: wal_p0.entries
+  - from: wal_p0.flushed
+    to: durability_ledger_p0.ack
+  - from: durability_ledger_p0.quorum_durable
+    to: commit_tracker_p0.durable
+  - from: commit_tracker_p0.committed
+    to: apply_pipeline_p0.entries
+  # Commit feedback to raft (per-partition): clears MAX_UNCOMMITTED_INFLIGHT throttle.
+  - from: commit_tracker_p0.committed
+    to: raft_engine_p0.commit
+  - from: raft_engine_p0.commit_advanced
+    to: apply_pipeline_p0.entries
+  - from: apply_pipeline_p0.applied
+    to: session_processor.committed_in
+  - from: apply_pipeline_p0.committed_entries
+    to: session_processor.committed_in
+
+  # ── Partition 1: full Raft + commit pipeline ───────────────
+  # The per-partition replicator_p1 consumes raft_engine_p1.append_entries.
+  # raft_engine_p1.rpc_out is left unwired here: peer_router.peer_tx
+  # already fans in raft_engine_p0.rpc_out, and the on-wire vote /
+  # heartbeat envelope does not yet carry a partition_id discriminator —
+  # mixing both partitions onto the same wire would prevent followers
+  # from routing to the right raft_engine instance. Partition 1's
+  # votes stay node-local until the envelope gains the discriminator.
+  - from: raft_engine_p1.append_entries
+    to: replicator_p1.entries
+  - from: replicator_p1.net_out
+    to: peer_router.repl_tx
+  - from: replicator_p1.match_indices
+    to: commit_tracker_p1.match
+  - from: raft_engine_p1.log_append
+    to: wal_p1.entries
+  - from: wal_p1.flushed
+    to: durability_ledger_p1.ack
+  - from: durability_ledger_p1.quorum_durable
+    to: commit_tracker_p1.durable
+  - from: commit_tracker_p1.committed
+    to: apply_pipeline_p1.entries
+  # Commit feedback to raft (per-partition): clears MAX_UNCOMMITTED_INFLIGHT throttle.
+  - from: commit_tracker_p1.committed
+    to: raft_engine_p1.commit
+  - from: raft_engine_p1.commit_advanced
+    to: apply_pipeline_p1.entries
+  - from: apply_pipeline_p1.applied
+    to: session_processor.committed_in
+  - from: apply_pipeline_p1.committed_entries
+    to: session_processor.committed_in
+
+  # ── ACK tracker (cross-partition fan-in) ───────────────────
+  # Every partition's durability_ledger streams MSG_DURABILITY_PROOF
+  # (19 bytes, partition_id-stamped) into ack_tracker; ack_tracker
+  # keys inflight by `(partition_id, wal_index)` so a proof for p1
+  # never satisfies an inflight registered against p0.
+  - from: durability_ledger_p0.quorum_durable
+    to: ack_tracker.durability_in
+  - from: durability_ledger_p1.quorum_durable
+    to: ack_tracker.durability_in
+  - from: session_processor.forward_out
+    to: ack_tracker.register_in
+  - from: ack_tracker.ack_out
+    to: session_processor.ack_in
+  - from: ack_tracker.redeliver_out
+    to: session_processor.ack_in
+
+  # ── Flow + backpressure ────────────────────────────────────
+  - from: flow_controller.credits
+    to: throttle_gate.credit_supply
+  - from: flow_controller.credits
+    to: session_processor.flow_in
+  - from: flow_controller.envelope
+    to: backpressure_propagator.envelope_in
+  - from: replicator_p0.lag_signal
+    to: flow_controller.lag
+  - from: replicator_p1.lag_signal
+    to: flow_controller.lag
+  - from: throttle_gate.rejected
+    to: backpressure_propagator.rejected_in
+  - from: backpressure_propagator.protocol_signals
+    to: session_processor.flow_in
+
+  # ── Topic engine ───────────────────────────────────────────
+  - from: session_processor.topic_out
+    to: topic_engine.op_in
+  - from: topic_engine.deliver_out
+    to: session_processor.deliver_in
+
+  # ── Messaging infrastructure ───────────────────────────────
+  - from: session_processor.messaging_out
+    to: dedup_engine.check_in
+  - from: dedup_engine.result_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: offline_queue.enqueue_in
+  - from: session_processor.messaging_out
+    to: offline_queue.reconnect_in
+  - from: offline_queue.drain_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: retained_store.write_in
+  - from: session_processor.messaging_out
+    to: retained_store.read_in
+  - from: retained_store.read_out
+    to: session_processor.messaging_in
+
+  # ── Control plane ──────────────────────────────────────────
+  # CP proofs are cluster-wide; fan out to every per-partition
+  # commit_tracker.
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker_p0.cp_state
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker_p1.cp_state
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine_p0.fallback_signal
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine_p1.fallback_signal
+
+  # ── HTTP admin / Raft surface ──────────────────────────────
+  - from: client_surface.raft_rpc
+    to: raft_engine_p0.rpc
+
+  # ── Metrics fan-in ─────────────────────────────────────────
+  - from: raft_engine_p0.metrics
+    to: telemetry_agg.ingest
+  - from: raft_engine_p1.metrics
+    to: telemetry_agg.ingest
+  - from: wal_p0.metrics
+    to: telemetry_agg.ingest
+  - from: wal_p1.metrics
+    to: telemetry_agg.ingest
+  - from: flow_controller.metrics
+    to: telemetry_agg.ingest
+  - from: session_processor.metrics_out
+    to: telemetry_agg.ingest
+  - from: telemetry_agg.readyz
+    to: client_surface.readyz_data
+  - from: telemetry_agg.export
+    to: client_surface.metrics_data

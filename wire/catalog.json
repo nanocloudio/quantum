@@ -9,6 +9,16 @@
       "name": "quic_transport",
       "path": "wire/quic.json",
       "type": "schema"
+    },
+    {
+      "name": "kafka_protocol",
+      "path": "wire/kafka.json",
+      "type": "schema"
+    },
+    {
+      "name": "amqp_protocol",
+      "path": "wire/amqp.json",
+      "type": "schema"
     }
   ]
 }

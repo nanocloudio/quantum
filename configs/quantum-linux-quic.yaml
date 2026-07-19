@@ -1,0 +1,257 @@
+# Quantum: MQTT-over-QUIC single-node graph.
+#
+# Mirrors quantum-linux-minimal.yaml's substrate but swaps the TCP
+# ingress (linux_net + peer_router → protocol_router → mqtt_codec)
+# for a UDP/QUIC ingress (linux_net UDP slot ↔ quic ↔ mqtt_quic_adapter
+# → mqtt_codec). Inbound stream bytes land on mqtt_codec.raw_in with
+# the same `[conn_id][mqtt bytes]` envelope the TCP path uses; outbound
+# frames take response_mux.mux_out → mqtt_quic_adapter.frames_in and
+# get re-emitted as MSG_QUIC_STREAM_WRITE envelopes on quic.app_in.
+#
+# Topology:
+#
+#   linux_net (UDP) ↔ quic ↔ mqtt_quic_adapter → mqtt_codec → session_processor
+#                                  │                ↑                │
+#                                  └─ frames_in ←──┴── response_mux ←┘
+#                                                       (mux_out)
+#
+# QUIC server listens on UDP 4443 with ALPN `mqtt`. Clients use any
+# RFC 9000 + RFC 9001 stack (e.g. aioquic). The quic module's x509
+# parser consumes DER and the CLI passes cert/key bytes through
+# verbatim, so the server uses the DER conversions `certs/server.der` +
+# `certs/server.key.der` (regenerated as a fresh EC P-256 leaf with
+# SAN DNS:localhost,IP:127.0.0.1 signed by `certs/ca.pem`, which the
+# aioquic client verifies against).
+#
+# Out of scope for this graph (parity with quantum-linux-minimal):
+#   - HTTP admin surface (no http_adapter)
+#   - tenant_manager / dr_manager / audit_logger / metrics_aggregator
+#
+# Both of those can be wired in by lifting blocks from
+# quantum-linux.yaml without changing the QUIC ingress.
+
+target: linux
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+module_search_paths:
+  - ../../clustor/modules/app
+
+platform:
+  net: {}
+
+modules:
+  # ── Clustor substrate (15 modules) ──────────────────────
+  - name: peer_router
+  - name: partition_router
+  - name: raft_engine
+  - name: replicator
+  - name: commit_tracker
+  - name: apply_pipeline
+  - name: wal
+  - name: durability_ledger
+  - name: cp_bridge
+  - name: cp_proof_cache
+  - name: flow_controller
+  - name: throttle_gate
+  - name: telemetry_agg
+  - name: http_adapter
+
+  # ── Fluxor foundation (1 module) ────────────────────────
+  # QUIC server. ALPN `mqtt` selects the raw bidi-stream surface;
+  # mode=0 = server; disable_migration=0 = allow client 4-tuple
+  # changes via PATH_CHALLENGE / PATH_RESPONSE. enable_h3=0 keeps
+  # h3.rs out of the picture so MSG_QUIC_STREAM_DATA fires.
+  - name: quic
+    port: 4443
+    mode: 1
+    disable_migration: 0
+    enable_h3: 0
+    # The quic module's x509 parser (fluxor tls/x509.rs) consumes DER,
+    # and the fluxor CLI passes cert_file/key_file through as raw bytes
+    # (no PEM decode). PEM here reaches the parser as base64 text and
+    # fails, so the TLS handshake never completes. Use the DER conversions
+    # (openssl x509 -outform DER / openssl ec -outform DER).
+    cert_file: certs/server.der
+    key_file: certs/server.key.der
+    # ALPN `mqtt` (RFC 7301): the server offers this token and the
+    # aioquic client requests it, so the handshake negotiates a shared
+    # protocol instead of aborting with no_application_protocol. The
+    # `fluxor` CLI now carries `alpn` in NON_PARAM_KEYS and emits it as
+    # extended TLV tag 14, which the quic module parses into alpn_cfg.
+    alpn: mqtt
+
+  # ── Quantum protocol stack (12 modules) ─────────────────
+  - name: mqtt_quic_adapter
+  - name: mqtt_codec
+  - name: session_processor
+  - name: ack_tracker
+  - name: backpressure_propagator
+  - name: topic_engine
+  - name: dedup_engine
+  - name: offline_queue
+  - name: retained_store
+  - name: response_mux
+  - name: capability_registry
+
+wiring:
+  # ── Transport: linux_net (UDP) ↔ quic ──────────────────
+  # The quic module issues DG_CMD_BIND on first step; linux_net
+  # answers MSG_DG_BOUND and routes UDP datagrams to / from the
+  # same channel.
+  - from: linux_net.net_out
+    to: quic.net_in
+    buffer_bytes: 65536
+  - from: quic.net_out
+    to: linux_net.net_in
+    buffer_bytes: 65536
+
+  # ── quic ↔ mqtt_quic_adapter ────────────────────────────
+  # quic.app_out emits MSG_QUIC_STREAM_DATA / OPEN / PEER_IDENTITY /
+  # DATAGRAM_RX envelopes; adapter forwards stream bytes to
+  # mqtt_codec.raw_in as `[cid][mqtt bytes]`.
+  - from: quic.app_out
+    to: mqtt_quic_adapter.quic_in
+    buffer_bytes: 65536
+  - from: mqtt_quic_adapter.quic_out
+    to: quic.app_in
+    buffer_bytes: 65536
+  - from: mqtt_quic_adapter.mqtt_out
+    to: mqtt_codec.raw_in
+    buffer_bytes: 65536
+
+  # ── Codec response path → response_mux → adapter ────────
+  - from: mqtt_codec.frames_out
+    to: response_mux.mqtt_in
+    buffer_bytes: 65536
+  - from: response_mux.mux_out
+    to: mqtt_quic_adapter.frames_in
+    buffer_bytes: 65536
+
+  # ── Codec ↔ session_processor ──────────────────────────
+  - from: mqtt_codec.proposals_out
+    to: session_processor.codec_in
+    buffer_bytes: 65536
+  - from: session_processor.codec_out
+    to: mqtt_codec.responses_in
+    buffer_bytes: 65536
+
+  # ── session_processor → Raft ────────────────────────────
+  - from: session_processor.proposals
+    to: partition_router.proposals
+  - from: partition_router.proposals_p0
+    to: raft_engine.proposals_partitioned
+
+  - from: session_processor.proposals_tagged
+    to: raft_engine.proposals_tagged
+  - from: raft_engine.proposal_assigned
+    to: session_processor.assigned_in
+
+  # ── Raft pipeline ───────────────────────────────────────
+  - from: raft_engine.append_entries
+    to: replicator.entries
+  - from: replicator.net_out
+    to: peer_router.peer_tx
+  - from: replicator.match_indices
+    to: commit_tracker.match
+  - from: raft_engine.rpc_out
+    to: peer_router.peer_tx
+
+  # ── Persistence ─────────────────────────────────────────
+  - from: raft_engine.log_append
+    to: wal.entries
+  - from: wal.flushed
+    to: durability_ledger.ack
+  - from: durability_ledger.quorum_durable
+    to: commit_tracker.durable
+
+  # ── Commit → apply → session_processor ──────────────────
+  - from: commit_tracker.committed
+    to: apply_pipeline.entries
+  # Commit feedback to raft (clustor reference): without it
+  # raft_engine.commit_index never advances and raft throttles all
+  # proposals at MAX_UNCOMMITTED_INFLIGHT (24) — a hard ~24-entry cap.
+  - from: commit_tracker.committed
+    to: raft_engine.commit
+  - from: raft_engine.commit_advanced
+    to: apply_pipeline.entries
+  - from: raft_engine.log_observe
+    to: apply_pipeline.log_entries
+  - from: apply_pipeline.applied
+    to: session_processor.committed_in
+  - from: apply_pipeline.committed_entries
+    to: session_processor.committed_in
+
+  # ── ACK tracker ─────────────────────────────────────────
+  - from: durability_ledger.quorum_durable
+    to: ack_tracker.durability_in
+  - from: session_processor.forward_out
+    to: ack_tracker.register_in
+  - from: ack_tracker.ack_out
+    to: session_processor.ack_in
+  - from: ack_tracker.redeliver_out
+    to: session_processor.ack_in
+
+  # ── Flow + backpressure ─────────────────────────────────
+  - from: flow_controller.credits
+    to: throttle_gate.credit_supply
+  - from: flow_controller.credits
+    to: session_processor.flow_in
+  - from: flow_controller.envelope
+    to: backpressure_propagator.envelope_in
+  - from: replicator.lag_signal
+    to: flow_controller.lag
+  - from: throttle_gate.rejected
+    to: backpressure_propagator.rejected_in
+  - from: backpressure_propagator.protocol_signals
+    to: session_processor.flow_in
+
+  # ── Topic engine ────────────────────────────────────────
+  - from: session_processor.topic_out
+    to: topic_engine.op_in
+  - from: topic_engine.deliver_out
+    to: session_processor.deliver_in
+
+  # ── Messaging infrastructure ────────────────────────────
+  - from: session_processor.messaging_out
+    to: dedup_engine.check_in
+  - from: dedup_engine.result_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: offline_queue.enqueue_in
+  - from: session_processor.messaging_out
+    to: offline_queue.reconnect_in
+  - from: offline_queue.drain_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: retained_store.write_in
+  - from: session_processor.messaging_out
+    to: retained_store.read_in
+  - from: retained_store.read_out
+    to: session_processor.messaging_in
+
+  # ── Control plane ───────────────────────────────────────
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker.cp_state
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine.fallback_signal
+
+  # ── Metrics fan-in ──────────────────────────────────────
+  - from: raft_engine.metrics
+    to: telemetry_agg.ingest
+  - from: wal.metrics
+    to: telemetry_agg.ingest
+  - from: flow_controller.metrics
+    to: telemetry_agg.ingest
+  - from: session_processor.metrics_out
+    to: telemetry_agg.ingest
+  - from: telemetry_agg.readyz
+    to: http_adapter.readyz
+  - from: telemetry_agg.export
+    to: http_adapter.metrics
+  - from: capability_registry.metrics
+    to: telemetry_agg.ingest

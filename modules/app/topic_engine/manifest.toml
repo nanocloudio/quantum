@@ -1,0 +1,31 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "op_in"
+direction = "input"
+content_type = "OctetStream"
+[[ports]]
+name = "deliver_out"
+direction = "output"
+content_type = "OctetStream"
+[[ports]]
+name = "forward_out"
+direction = "output"
+content_type = "OctetStream"
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = [
+    "bytes_in",
+    "bytes_out",
+    "subscriptions",
+    "publishes_routed",
+    "forwards_emitted",
+    "wildcard_matches",
+]

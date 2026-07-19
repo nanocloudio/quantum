@@ -2,8 +2,14 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+#[expect(
+    clippy::print_stderr,
+    clippy::print_stdout,
+    clippy::disallowed_macros,
+    reason = "wire_lint is a CLI binary; its surface is stdout/stderr"
+)]
 fn main() -> Result<()> {
     let mut expected = None;
     let mut candidate = None;
@@ -39,7 +45,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn compare_catalogs(expected: &PathBuf, candidate: &PathBuf) -> Result<()> {
+fn compare_catalogs(expected: &Path, candidate: &Path) -> Result<()> {
     ensure_file(expected)?;
     ensure_file(candidate)?;
     let expected_sha = sha256_file(expected)?;
@@ -56,7 +62,7 @@ fn compare_catalogs(expected: &PathBuf, candidate: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn ensure_file(path: &PathBuf) -> Result<()> {
+fn ensure_file(path: &Path) -> Result<()> {
     if path.is_file() {
         Ok(())
     } else {
@@ -64,7 +70,7 @@ fn ensure_file(path: &PathBuf) -> Result<()> {
     }
 }
 
-fn sha256_file(path: &PathBuf) -> Result<String> {
+fn sha256_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     let data = fs::read(path).with_context(|| format!("unable to read {}", path.display()))?;
     hasher.update(&data);

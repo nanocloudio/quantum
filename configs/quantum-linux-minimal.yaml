@@ -1,0 +1,280 @@
+# Quantum: MQTT-only single-node graph (24 modules).
+#
+# Topology (no-compromise design):
+#
+#   linux_net → peer_router → protocol_router → mqtt_codec → session_processor
+#                              │               ↑                │
+#                              │               │                └─→ raft_engine
+#                              │               └── responses_in ←──┘
+#                              │
+#                              └─→ http_adapter  (HTTP admin / Raft RPC)
+#
+#   mqtt_codec.frames_out   ─→ peer_router.client_resp
+#   http_adapter.response ─→ peer_router.client_resp
+#
+# Envelope convention for all client-facing ports:
+#   [conn_id: u8][tcp bytes...]   — raw, no fluxor wire envelope
+#   (matches peer_router's native format end-to-end)
+#
+# Envelope convention for inter-Quantum modules:
+#   wire envelope `[msg_type:u8][len:u16 LE][payload]` on every port
+#   including codec_in/codec_out. On codec_in/codec_out the payload
+#   carries `[conn_id:u8][proto:u8][pkt_type:u8][flags:u8][body]`
+#   (or the codec-specific equivalent) — the leading length prefix
+#   from the wire envelope is what lets the consumer demarcate
+#   messages when codecs fan in or one writer bursts multiple
+#   packets within a tick.
+
+target: linux
+tick_us: 1000
+
+# Request/response edges + flow-control feedback make this graph
+# inherently cyclic. v1 fluxor accepts cycles when explicitly opted in.
+scheduler:
+  accept_cycles: true
+
+# Substrate (raft, wal, peer_router, partition_router, etc.) lives in
+# clustor/modules/ — quantum/modules/ is reserved for quantum-specific
+# modules (mqtt_codec, session_processor, …). The fluxor tool searches
+# these paths in order when resolving manifests; see
+# `clustor/docs/substrate_sharing.md`.
+module_search_paths:
+  - ../../clustor/modules/app
+
+platform:
+  net: {}
+
+modules:
+  # ── Clustor substrate (15 modules) ──────────────────────
+  - name: peer_router
+  - name: partition_router
+  - name: raft_engine
+  - name: replicator
+  - name: commit_tracker
+  - name: apply_pipeline
+  - name: wal
+  - name: durability_ledger
+  - name: cp_bridge
+  - name: cp_proof_cache
+  - name: flow_controller
+  - name: throttle_gate
+  - name: telemetry_agg
+  - name: http_adapter
+
+  # ── Quantum protocol stack (13 modules) ─────────────────
+  - name: protocol_router
+  - name: mqtt_codec
+  - name: amqp_codec
+  - name: kafka_codec
+  - name: session_processor
+  - name: ack_tracker
+  - name: backpressure_propagator
+  - name: topic_engine
+  - name: dedup_engine
+  - name: offline_queue
+  - name: retained_store
+  - name: response_mux
+  - name: capability_registry
+
+wiring:
+  # Client-path channels enlarged from the 8 KiB default to 64 KiB so
+  # bursts of simultaneous CONNECTs / PUBLISHes don't drop frames at
+  # the linux_net → peer_router → … → response_mux hops. The default
+  # is sized for a single steady client; we want concurrent ones.
+  # ── Transport: linux_net ↔ peer_router ──────────────────
+  - from: linux_net.net_out
+    to: peer_router.net_in
+    buffer_bytes: 65536
+  - from: peer_router.net_out
+    to: linux_net.net_in
+    buffer_bytes: 65536
+
+  # ── peer_router → protocol_router (sole client path) ────
+  - from: peer_router.cleartext
+    to: protocol_router.raw_in
+    buffer_bytes: 65536
+  - from: peer_router.peer_rx
+    to: replicator.ack
+
+  # ── protocol_router classification → codecs / http ──────
+  - from: protocol_router.mqtt_out
+    to: mqtt_codec.raw_in
+    buffer_bytes: 65536
+  - from: protocol_router.amqp_out
+    to: amqp_codec.raw_in
+  - from: protocol_router.kafka_out
+    to: kafka_codec.raw_in
+  - from: protocol_router.http_out
+    to: http_adapter.request
+
+  # ── Client response mux: codec + http fan-in → peer_router ──
+  - from: mqtt_codec.frames_out
+    to: response_mux.mqtt_in
+    buffer_bytes: 65536
+  - from: amqp_codec.frames_out
+    to: response_mux.amqp_in
+  - from: kafka_codec.frames_out
+    to: response_mux.kafka_in
+  - from: http_adapter.response
+    to: response_mux.http_in
+  - from: response_mux.mux_out
+    to: peer_router.client_resp
+    buffer_bytes: 65536
+
+  # ── Codec ↔ session_processor (shared codec_in/codec_out) ──
+  - from: mqtt_codec.proposals_out
+    to: session_processor.codec_in
+    buffer_bytes: 65536
+  - from: amqp_codec.proposals_out
+    to: session_processor.codec_in
+  - from: kafka_codec.proposals_out
+    to: session_processor.codec_in
+  - from: session_processor.codec_out
+    to: mqtt_codec.responses_in
+    buffer_bytes: 65536
+  - from: session_processor.codec_out
+    to: amqp_codec.responses_in
+  - from: session_processor.codec_out
+    to: kafka_codec.responses_in
+
+  # ── session_processor → Raft ────────────────────────────
+  # Untagged path (CONNECT / DISCONNECT) flows through partition_router
+  # so the 5-byte partitioned envelope sees runtime exercise even in
+  # single-partition deployments (num_partitions=1 → partition_id=0).
+  # raft_engine accepts both the 3-byte (untagged) and 5-byte
+  # (partitioned) wire forms.
+  - from: session_processor.proposals
+    to: partition_router.proposals
+  - from: partition_router.proposals_p0
+    to: raft_engine.proposals_partitioned
+
+  # Tagged path for QoS 1+ PUBLISH — raft_engine echoes
+  # MSG_PROPOSAL_ASSIGNED so session_processor can bind correlation_id
+  # → wal_index and register the inflight with ack_tracker. Bypasses
+  # partition_router because the tagged envelope already carries the
+  # partition id end-to-end.
+  - from: session_processor.proposals_tagged
+    to: raft_engine.proposals_tagged
+  - from: raft_engine.proposal_assigned
+    to: session_processor.assigned_in
+
+  # ── Raft pipeline ───────────────────────────────────────
+  - from: raft_engine.append_entries
+    to: replicator.entries
+  - from: replicator.net_out
+    to: peer_router.peer_tx
+  - from: replicator.match_indices
+    to: commit_tracker.match
+  - from: raft_engine.rpc_out
+    to: peer_router.peer_tx
+
+  # ── Persistence ─────────────────────────────────────────
+  - from: raft_engine.log_append
+    to: wal.entries
+  - from: wal.flushed
+    to: durability_ledger.ack
+  - from: durability_ledger.quorum_durable
+    to: commit_tracker.durable
+
+  # ── Commit → apply → session_processor ──────────────────
+  - from: commit_tracker.committed
+    to: apply_pipeline.entries
+  # Commit feedback to raft: without it raft_engine.commit_index never
+  # advances, the log runs MAX_UNCOMMITTED_INFLIGHT (24) entries ahead,
+  # and raft throttles ALL further proposals — a hard ~24-entry / ~120
+  # msg/s ceiling. Mirrors the clustor reference graph (consensus-bench).
+  - from: commit_tracker.committed
+    to: raft_engine.commit
+  # Apply catch-up path (RFC §5.13): commit_advanced lets apply_pipeline
+  # advance its horizon even when the committed stream is gated.
+  - from: raft_engine.commit_advanced
+    to: apply_pipeline.entries
+  # apply_pipeline's per-entry committed_entries stream is built from
+  # log_observe (raw appended entries) gated by commit horizon
+  # advances. Without this edge, apply_pipeline.committed_entries
+  # stays silent and Quantum's apply-side state machine never runs.
+  - from: raft_engine.log_observe
+    to: apply_pipeline.log_entries
+  - from: apply_pipeline.applied
+    to: session_processor.committed_in
+  - from: apply_pipeline.committed_entries
+    to: session_processor.committed_in
+
+  # ── ACK tracker ─────────────────────────────────────────
+  - from: durability_ledger.quorum_durable
+    to: ack_tracker.durability_in
+  - from: session_processor.forward_out
+    to: ack_tracker.register_in
+  - from: ack_tracker.ack_out
+    to: session_processor.ack_in
+  - from: ack_tracker.redeliver_out
+    to: session_processor.ack_in
+
+  # ── Flow + backpressure ─────────────────────────────────
+  - from: flow_controller.credits
+    to: throttle_gate.credit_supply
+  - from: flow_controller.credits
+    to: session_processor.flow_in
+  - from: flow_controller.envelope
+    to: backpressure_propagator.envelope_in
+  - from: replicator.lag_signal
+    to: flow_controller.lag
+  - from: throttle_gate.rejected
+    to: backpressure_propagator.rejected_in
+  - from: backpressure_propagator.protocol_signals
+    to: session_processor.flow_in
+
+  # ── Topic engine (single op_in port, demuxed by msg_type) ──
+  - from: session_processor.topic_out
+    to: topic_engine.op_in
+  - from: topic_engine.deliver_out
+    to: session_processor.deliver_in
+
+  # ── Messaging infrastructure ────────────────────────────
+  - from: session_processor.messaging_out
+    to: dedup_engine.check_in
+  - from: dedup_engine.result_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: offline_queue.enqueue_in
+  - from: session_processor.messaging_out
+    to: offline_queue.reconnect_in
+  - from: offline_queue.drain_out
+    to: session_processor.messaging_in
+  - from: session_processor.messaging_out
+    to: retained_store.write_in
+  - from: session_processor.messaging_out
+    to: retained_store.read_in
+  - from: retained_store.read_out
+    to: session_processor.messaging_in
+
+  # ── Control plane ───────────────────────────────────────
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker.cp_state
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine.fallback_signal
+
+
+  # ── Metrics fan-in ──────────────────────────────────────
+  - from: raft_engine.metrics
+    to: telemetry_agg.ingest
+  - from: wal.metrics
+    to: telemetry_agg.ingest
+  - from: flow_controller.metrics
+    to: telemetry_agg.ingest
+  - from: session_processor.metrics_out
+    to: telemetry_agg.ingest
+  - from: telemetry_agg.readyz
+    to: http_adapter.readyz
+  - from: telemetry_agg.export
+    to: http_adapter.metrics
+
+  # ── Capability registry — advertises storage surfaces +
+  # fence kinds. local_ad would fan out to peer nodes in a
+  # multi-node graph; here it stays unwired (loaded for
+  # init-tick + log visibility). Metrics drain into the same
+  # aggregator pool.
+  - from: capability_registry.metrics
+    to: telemetry_agg.ingest

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Minimal structure check: top-level object with optional metrics/traces/logs arrays.
 #[derive(Deserialize)]
@@ -12,6 +12,11 @@ struct TelemetryCatalog {
     logs: Option<Vec<serde_json::Value>>,
 }
 
+#[expect(
+    clippy::print_stderr,
+    clippy::disallowed_macros,
+    reason = "telemetry_guard is a CLI binary; its surface is stdout/stderr"
+)]
 fn main() -> Result<()> {
     let mut catalogs = Vec::new();
     let mut args = env::args().skip(1);
@@ -53,16 +58,21 @@ fn repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
         .parent()
-        .and_then(|p| p.parent())
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| anyhow!("unable to determine repo root from {manifest_dir:?}"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow!(
+                "unable to determine repo root from {}",
+                manifest_dir.display()
+            )
+        })
         .and_then(|path| {
             path.canonicalize()
                 .context("failed to canonicalize repository root")
         })
 }
 
-fn validate_catalog(path: &PathBuf) -> Result<()> {
+fn validate_catalog(path: &Path) -> Result<()> {
     let data = fs::read_to_string(path)?;
     let catalog: TelemetryCatalog = serde_json::from_str(&data)?;
     if catalog.metrics.is_none() && catalog.traces.is_none() && catalog.logs.is_none() {

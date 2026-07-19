@@ -1,0 +1,66 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# capability_registry — Fluxor-native storage capability advertisement.
+#
+# Mirrors the typed surface+fence vocabulary from Fluxor's
+# `contracts::fence::Fence` and `docs/architecture/capability_surface.md`,
+# but lives as a graph module so quantum nodes can advertise what
+# storage surfaces they implement and the maximum fence kind they can
+# produce per surface.
+#
+# Schema (matches src/control/capabilities.rs from the legacy crate):
+#   StorageSurface = Block | FileData | Namespace | Object
+#   FenceKind      = Volatile | ViewConsistent | LocalDurable
+#                  | RevisionMonotone | ContentHashed | ReplicatedDurable
+#
+# Wire form (all little-endian within fields):
+#   MSG_CAP_ADVERTISE payload:
+#     [node_id_len:u8][node_id:N]
+#     [n_entries:u8]
+#     N × { [surface:u8][max_fence:u8] }
+#
+# Surface byte values match the rank() order from Quantum's legacy
+# FenceKind so a `kind_rank` byte comparison is the only thing the
+# deployment-time matcher needs.
+#
+# This module advertises every `tick_emit_period` ticks (default ~500ms
+# at 1ms tick) on `local_ad`. Peers wire their `local_ad` into our
+# `peer_ad` to populate the cluster view; queries on `query_in` return
+# the merged set on `query_out`.
+
+[[ports]]
+name = "query_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "peer_ad"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "local_ad"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "query_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = [
+    "bytes_in",
+    "bytes_out",
+    "capabilities_advertised",
+    "lookups",
+    "cache_invalidations",
+]

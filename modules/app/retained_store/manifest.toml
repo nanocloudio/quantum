@@ -1,0 +1,24 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "write_in"
+direction = "input"
+content_type = "OctetStream"
+[[ports]]
+name = "read_in"
+direction = "input"
+content_type = "OctetStream"
+[[ports]]
+name = "read_out"
+direction = "output"
+content_type = "OctetStream"
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["bytes_in", "bytes_out", "retained_stored", "retained_matched", "retained_evicted"]

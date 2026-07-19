@@ -1,0 +1,508 @@
+# Quantum: CM5 multi-domain production graph (42 modules, 6 logical domains).
+#
+# Maps the doc's 6-domain layout onto a 4-core CM5: ingest co-locates with
+# apply on Core 3, messaging co-locates with ops on Core 0.
+#
+# Domain placement:
+#   Core 0 (Tier 0, 1ms): ops      — client_surface, cp_*, admin, rbac,
+#                                     snapshot, telemetry_agg, key_manager,
+#                                     placement_router, tenant_manager,
+#                                     dr_manager, audit_logger,
+#                                     metrics_aggregator
+#   Core 0 (Tier 1, 250µs, shared): messaging — dedup_engine, offline_queue,
+#                                     retained_store,
+#                                     consumer_group_coordinator,
+#                                     transaction_coordinator
+#   Core 1 (Tier 3, poll-mode): consensus — raft_engine, wal,
+#                                     durability_ledger,
+#                                     commit_tracker
+#   Core 2 (Tier 3, poll-mode): network — tls, peer_router, replicator
+#   Core 3 (Tier 1, 250µs): apply  — apply_pipeline, client_codec,
+#                                     throttle_gate, flow_controller,
+#                                     read_gate, session_processor,
+#                                     ack_tracker, backpressure_propagator,
+#                                     prefetch_controller, forward_coordinator
+#   Core 3 (Tier 2, 500µs, shared): ingest — protocol_router, mqtt_codec,
+#                                     kafka_codec, amqp_codec, topic_engine
+#
+# 4 declared execution domains (kernel currently models 4); the 6-domain
+# logical view maps as: ingest co-runs on apply core, messaging on ops core.
+# Production CM5 with 6 cores can split these into dedicated domains.
+
+target: cm5
+tick_us: 1000
+
+# Substrate (raft, wal, peer_router, partition_router, etc.) lives in
+# clustor/modules/ — quantum/modules/ is reserved for quantum-specific
+# modules (mqtt_codec, session_processor, …). The fluxor tool searches
+# these paths in order when resolving manifests; see
+# `clustor/docs/substrate_sharing.md`.
+module_search_paths:
+  - ../../clustor/modules/app
+
+platform:
+  net: {}
+
+execution:
+  domains:
+    - name: ops
+      exec_mode: cooperative
+    - name: consensus
+      exec_mode: poll
+    - name: network
+      exec_mode: poll
+    - name: apply
+      tick_us: 250
+      exec_mode: high_rate
+
+modules:
+  # ── Network (Core 2: poll-mode) ─────────────────────────
+  - name: tls
+    domain: network
+    mode: 1
+    verify_peer: 1
+  - name: peer_router
+    domain: network
+  - name: replicator
+    domain: network
+
+  # ── Consensus + persistence (Core 1: poll-mode) ─────────
+  - name: raft_engine
+    domain: consensus
+  - name: wal
+    domain: consensus
+  # Group-fsync batching is configured by wal's `fsync_mode`,
+  # `group_window_ms`, and `group_max_pending` params.
+  - name: durability_ledger
+    domain: consensus
+  - name: commit_tracker
+    domain: consensus
+
+  # ── Apply + ingest (Core 3: 250µs / 500µs) ──────────────
+  - name: apply_pipeline
+    domain: apply
+  - name: client_codec
+    domain: apply
+  - name: throttle_gate
+    domain: apply
+  - name: flow_controller
+    domain: apply
+  - name: read_gate
+    domain: apply
+  - name: session_processor
+    domain: apply
+  - name: ack_tracker
+    domain: apply
+  - name: backpressure_propagator
+    domain: apply
+  - name: prefetch_controller
+    domain: apply
+  - name: forward_coordinator
+    domain: apply
+  - name: protocol_router
+    domain: apply
+  - name: mqtt_codec
+    domain: apply
+  - name: kafka_codec
+    domain: apply
+  - name: amqp_codec
+    domain: apply
+  - name: topic_engine
+    domain: apply
+
+  # ── Ops + messaging (Core 0: 1ms / 250µs) ───────────────
+  - name: client_surface
+    domain: ops
+  - name: cp_bridge
+    domain: ops
+  - name: cp_proof_cache
+    domain: ops
+  - name: placement_router
+    domain: ops
+  - name: key_manager
+    domain: ops
+  - name: rbac
+    domain: ops
+  - name: admin_handler
+    domain: ops
+  - name: snapshot_engine
+    domain: ops
+  - name: telemetry_agg
+    domain: ops
+  - name: dedup_engine
+    domain: ops
+  - name: offline_queue
+    domain: ops
+  - name: retained_store
+    domain: ops
+  - name: consumer_group_coordinator
+    domain: ops
+  - name: transaction_coordinator
+    domain: ops
+  - name: tenant_manager
+    domain: ops
+  - name: dr_manager
+    domain: ops
+  - name: audit_logger
+    domain: ops
+  - name: metrics_aggregator
+    domain: ops
+
+wiring:
+  # ── Network transport: tls cleartext side ───────────────
+  - from: tls.clear_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: tls.clear_in
+
+  # ── peer_router fan-out ─────────────────────────────────
+  - from: peer_router.cleartext
+    to: protocol_router.raw_in
+    edge_class: cross_core
+  - from: peer_router.cleartext
+    to: client_surface.requests
+    edge_class: cross_core
+  - from: peer_router.peer_rx
+    to: replicator.ack
+
+  # ── Protocol routing ────────────────────────────────────
+  - from: protocol_router.mqtt_out
+    to: mqtt_codec.raw_in
+  - from: protocol_router.kafka_out
+    to: kafka_codec.raw_in
+  - from: protocol_router.amqp_out
+    to: amqp_codec.raw_in
+  - from: mqtt_codec.frames_out
+    to: peer_router.client_resp
+  - from: kafka_codec.frames_out
+    to: peer_router.client_resp
+  - from: amqp_codec.frames_out
+    to: peer_router.client_resp
+    edge_class: cross_core
+
+  # ── Codecs ↔ session_processor (intra-domain) ───────────
+  - from: mqtt_codec.proposals_out
+    to: session_processor.codec_in
+  - from: kafka_codec.proposals_out
+    to: session_processor.codec_in
+  - from: amqp_codec.proposals_out
+    to: session_processor.codec_in
+  - from: session_processor.codec_out
+    to: mqtt_codec.responses_in
+  - from: session_processor.codec_out
+    to: kafka_codec.responses_in
+  - from: session_processor.codec_out
+    to: amqp_codec.responses_in
+
+  # ── session_processor → Raft (cross-core: apply→consensus)
+  - from: session_processor.proposals
+    to: raft_engine.proposals
+    edge_class: cross_core
+
+  # Tagged path for QoS 1+ PUBLISH — raft_engine echoes
+  # MSG_PROPOSAL_ASSIGNED so session_processor can bind correlation_id
+  # → wal_index and register the inflight with ack_tracker.
+  - from: session_processor.proposals_tagged
+    to: raft_engine.proposals_tagged
+    edge_class: cross_core
+  - from: raft_engine.proposal_assigned
+    to: session_processor.assigned_in
+    edge_class: cross_core
+
+  # ── HTTP/admin path ─────────────────────────────────────
+  - from: client_surface.raft_rpc
+    to: raft_engine.rpc
+    edge_class: cross_core
+  - from: client_surface.client_req
+    to: client_codec.raw
+    edge_class: cross_core
+  - from: client_surface.admin_req
+    to: rbac.request
+  - from: client_surface.responses
+    to: peer_router.client_resp
+    edge_class: cross_core
+  - from: client_codec.parsed
+    to: throttle_gate.requests
+  - from: throttle_gate.admitted
+    to: raft_engine.proposals
+    edge_class: cross_core
+  - from: throttle_gate.rejected
+    to: backpressure_propagator.rejected_in
+
+  # ── Flow control ────────────────────────────────────────
+  - from: flow_controller.credits
+    to: throttle_gate.credit_supply
+  - from: flow_controller.credits
+    to: session_processor.flow_in
+  - from: flow_controller.envelope
+    to: backpressure_propagator.envelope_in
+  - from: replicator.lag_signal
+    to: flow_controller.lag
+    edge_class: cross_core
+  - from: backpressure_propagator.protocol_signals
+    to: session_processor.flow_in
+  - from: backpressure_propagator.status
+    to: client_surface.throttle_status
+    edge_class: cross_core
+  - from: session_processor.forward_out
+    to: prefetch_controller.lag_in
+  - from: prefetch_controller.credits_out
+    to: session_processor.flow_in
+
+  # ── ACK tracking ────────────────────────────────────────
+  - from: durability_ledger.quorum_durable
+    to: ack_tracker.durability_in
+    edge_class: cross_core
+  - from: session_processor.forward_out
+    to: ack_tracker.register_in
+  - from: ack_tracker.ack_out
+    to: session_processor.ack_in
+  - from: ack_tracker.redeliver_out
+    to: session_processor.ack_in
+
+  # ── Topic engine + forwarding (single op_in port, demuxed by msg_type) ──
+  - from: session_processor.topic_out
+    to: topic_engine.op_in
+  - from: topic_engine.deliver_out
+    to: session_processor.deliver_in
+  - from: topic_engine.forward_out
+    to: forward_coordinator.forward_in
+  - from: forward_coordinator.local_out
+    to: raft_engine.proposals
+    edge_class: cross_core
+  - from: forward_coordinator.remote_out
+    to: peer_router.peer_tx
+  - from: forward_coordinator.wal_marker
+    to: raft_engine.proposals
+    edge_class: cross_core
+
+  # ── Messaging infra (cross-core: apply ↔ ops) ───────────
+  - from: session_processor.messaging_out
+    to: dedup_engine.check_in
+    edge_class: cross_core
+  - from: dedup_engine.result_out
+    to: session_processor.messaging_in
+    edge_class: cross_core
+  - from: session_processor.messaging_out
+    to: offline_queue.enqueue_in
+    edge_class: cross_core
+  - from: session_processor.messaging_out
+    to: offline_queue.reconnect_in
+    edge_class: cross_core
+  - from: offline_queue.drain_out
+    to: session_processor.messaging_in
+    edge_class: cross_core
+  - from: session_processor.messaging_out
+    to: retained_store.write_in
+    edge_class: cross_core
+  - from: session_processor.messaging_out
+    to: retained_store.read_in
+    edge_class: cross_core
+  - from: retained_store.read_out
+    to: session_processor.messaging_in
+    edge_class: cross_core
+  - from: session_processor.messaging_out
+    to: consumer_group_coordinator.op_in
+    edge_class: cross_core
+  - from: consumer_group_coordinator.assignment_out
+    to: session_processor.messaging_in
+    edge_class: cross_core
+  - from: session_processor.messaging_out
+    to: transaction_coordinator.op_in
+    edge_class: cross_core
+  - from: durability_ledger.quorum_durable
+    to: transaction_coordinator.durability_in
+    edge_class: cross_core
+  - from: transaction_coordinator.result_out
+    to: session_processor.messaging_in
+    edge_class: cross_core
+
+  # ── Raft replication (consensus ↔ network) ──────────────
+  - from: raft_engine.append_entries
+    to: replicator.entries
+    edge_class: cross_core
+  - from: replicator.net_out
+    to: peer_router.peer_tx
+  - from: replicator.match_indices
+    to: commit_tracker.match
+    edge_class: cross_core
+  - from: raft_engine.rpc_out
+    to: peer_router.peer_tx
+    edge_class: cross_core
+
+  # ── Persistence (consensus, inlined) ────────────────────
+  - from: raft_engine.log_append
+    to: wal.entries
+  - from: wal.flushed
+    to: durability_ledger.ack
+  - from: durability_ledger.quorum_durable
+    to: commit_tracker.durable
+
+  # ── Commit → apply → session_processor ──────────────────
+  - from: commit_tracker.committed
+    to: apply_pipeline.entries
+  # Commit feedback to raft (clustor reference): without it
+  # raft_engine.commit_index never advances and raft throttles all
+  # proposals at MAX_UNCOMMITTED_INFLIGHT (24) — a hard ~24-entry cap.
+  - from: commit_tracker.committed
+    to: raft_engine.commit
+  - from: raft_engine.commit_advanced
+    to: apply_pipeline.entries
+    edge_class: cross_core
+  # apply_pipeline.committed_entries is built from log_observe gated
+  # by commit horizon; without this edge Quantum's apply-side state
+  # machine (PUBACK gating, dedup_check, retained_write, topic fan-out
+  # for QoS 1+) never runs.
+  - from: raft_engine.log_observe
+    to: apply_pipeline.log_entries
+    edge_class: cross_core
+  - from: apply_pipeline.applied
+    to: session_processor.committed_in
+  - from: apply_pipeline.committed_entries
+    to: session_processor.committed_in
+  - from: apply_pipeline.applied
+    to: client_surface.client_responses
+    edge_class: cross_core
+
+  # ── Snapshot pipeline ───────────────────────────────────
+  - from: snapshot_engine.export_chunks
+    to: replicator.snapshot_rx
+  - from: replicator.snapshot_import
+    to: snapshot_engine.import_chunks
+  - from: snapshot_engine.manifest_auth
+    to: peer_router.peer_tx
+  - from: wal.compaction_signal
+    to: snapshot_engine.trigger
+    edge_class: cross_core
+  - from: wal.compaction_signal
+    to: dr_manager.wal_signal_in
+    edge_class: cross_core
+  - from: snapshot_engine.export_chunks
+    to: dr_manager.snapshot_resp_in
+  - from: dr_manager.snapshot_req
+    to: snapshot_engine.trigger
+
+  # ── Keys ────────────────────────────────────────────────
+  - from: key_manager.dek_epoch
+    to: wal.key_update
+    edge_class: cross_core
+  - from: key_manager.dek_epoch
+    to: snapshot_engine.key_update
+  # key_manager cert refresh: tls foundation module doesn't have a cert_update
+  # port; cert rotation happens via TLS module reload in production
+
+  # ── Control plane ───────────────────────────────────────
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: read_gate.cache
+    edge_class: cross_core
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker.cp_state
+    edge_class: cross_core
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine.fallback_signal
+    edge_class: cross_core
+  - from: read_gate.permits
+    to: apply_pipeline.read_permits
+  - from: placement_router.routing
+    to: client_codec.placement
+  - from: cp_bridge.tenant_records
+    to: tenant_manager.records_in
+  - from: cp_bridge.capabilities
+    to: session_processor.cp_in
+    edge_class: cross_core
+
+  # ── Tenant enforcement ──────────────────────────────────
+  - from: tenant_manager.quota_signals
+    to: throttle_gate.credit_supply
+    edge_class: cross_core
+  - from: tenant_manager.disconnect_events
+    to: session_processor.cp_in
+    edge_class: cross_core
+
+  # ── Admin ───────────────────────────────────────────────
+  - from: rbac.authorized
+    to: admin_handler.requests
+  - from: rbac.denied
+    to: client_surface.admin_responses
+  - from: admin_handler.raft_commands
+    to: raft_engine.admin_proposals
+    edge_class: cross_core
+  - from: admin_handler.responses
+    to: client_surface.admin_responses
+  - from: dr_manager.promotion
+    to: admin_handler.requests
+
+  # ── Audit fan-in ────────────────────────────────────────
+  - from: rbac.audit_events
+    to: audit_logger.event_in
+  - from: session_processor.audit_out
+    to: audit_logger.event_in
+    edge_class: cross_core
+  - from: tenant_manager.audit_events
+    to: audit_logger.event_in
+  - from: dr_manager.audit_events
+    to: audit_logger.event_in
+  - from: audit_logger.signed_events
+    to: client_surface.admin_responses
+
+  # ── Metrics aggregation ─────────────────────────────────
+  - from: session_processor.metrics_out
+    to: metrics_aggregator.ingest
+    edge_class: cross_core
+  - from: dedup_engine.metrics
+    to: metrics_aggregator.ingest
+  - from: offline_queue.metrics
+    to: metrics_aggregator.ingest
+  - from: forward_coordinator.metrics
+    to: metrics_aggregator.ingest
+    edge_class: cross_core
+  - from: ack_tracker.metrics
+    to: metrics_aggregator.ingest
+    edge_class: cross_core
+  - from: backpressure_propagator.metrics
+    to: metrics_aggregator.ingest
+    edge_class: cross_core
+  - from: prefetch_controller.metrics
+    to: metrics_aggregator.ingest
+    edge_class: cross_core
+  - from: tenant_manager.metrics
+    to: metrics_aggregator.ingest
+  - from: dr_manager.metrics
+    to: metrics_aggregator.ingest
+  - from: topic_engine.metrics
+    to: metrics_aggregator.ingest
+    edge_class: cross_core
+  - from: retained_store.metrics
+    to: metrics_aggregator.ingest
+  - from: consumer_group_coordinator.metrics
+    to: metrics_aggregator.ingest
+  - from: transaction_coordinator.metrics
+    to: metrics_aggregator.ingest
+  - from: metrics_aggregator.rollups
+    to: telemetry_agg.ingest
+
+  # ── Substrate metrics ───────────────────────────────────
+  - from: raft_engine.metrics
+    to: telemetry_agg.ingest
+    edge_class: cross_core
+  - from: replicator.metrics
+    to: telemetry_agg.ingest
+    edge_class: cross_core
+  - from: wal.metrics
+    to: telemetry_agg.ingest
+    edge_class: cross_core
+  - from: flow_controller.metrics
+    to: telemetry_agg.ingest
+    edge_class: cross_core
+  - from: cp_proof_cache.metrics
+    to: telemetry_agg.ingest
+  - from: snapshot_engine.metrics
+    to: telemetry_agg.ingest
+  - from: telemetry_agg.readyz
+    to: client_surface.readyz_data
+  - from: telemetry_agg.why
+    to: client_surface.why_data
+  - from: telemetry_agg.export
+    to: client_surface.metrics_data

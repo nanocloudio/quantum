@@ -1,0 +1,62 @@
+# Quantum project configuration consumed by the `fluxor` CLI.
+# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
+
+# Project identity (standards/dependencies.md §2.1). Required for
+# `fluxor publish`; downstream projects reference quantum by this
+# name.
+[project]
+name    = "quantum"
+version = "0.0.1"
+
+# Cross-project dependencies (standards/dependencies.md §2.2).
+# fluxor provides foundation modules (`ip`, `tls`, `linux_net`, …),
+# the ABI source crate (`fluxor-abi`), and the `fluxor-linux` runtime.
+# clustor provides the substrate modules (`peer_router`, `raft_engine`,
+# `wal`, `durability_ledger`, …) consumed by quantum's deployment
+# graphs. Both resolve via the local registry under
+# `~/.fluxor/registry/`; PIC modules in `modules/app/*/mod.rs` consume
+# the materialised SDK source at
+# `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
+# Live workspace mode (`~/.fluxor/workspace.toml`) overrides the
+# version ranges with on-disk source from each listed checkout — see
+# standards/dependencies.md §6.
+[dependencies]
+fluxor  = "0.0.1"
+clustor = "0.0.1"
+
+[ci]
+# Module targets `fluxor modules build --all` will produce artefacts for.
+# Both targets currently resolve to aarch64-unknown-none under the hood;
+# they're distinguished for downstream packaging.
+targets = ["bcm2712", "cm5"]
+
+[ci.lints]
+# Workspace members allowed to skip the [lints] workspace = true opt-in
+# audit in phase 1.3.
+
+[[ci.lints.exemption]]
+crate  = "tools/quantum-bench"
+reason = "driver-host bench CLI (quantum-mqtt-loadgen + /metrics scrape); prints JSON to stdout and unwraps on arg parsing, so it inlines a relaxed mirror of [workspace.lints] like clustor-bench. Value matches the workspace member path (the opt-in audit keys on member path, not crate name)."
+
+[ci.hygiene]
+# `modules/**` always bans inline tests (no_std PIC target, can't run them).
+# `src/**` does not exist in quantum — the whole source surface is
+# modules/ and tools/. Tools crates follow the strict default.
+forbid_inline_tests = ["modules", "tools"]
+mode                = "strict"
+max_inline_lines    = 80
+
+# Per-file exemptions live as [[ci.hygiene.exemption]] tables. None today.
+
+[ci.templates]
+# Quantum's configs are concrete YAML (no __KEY__ placeholders today),
+# so the template-render phase is a no-op pass over this directory.
+dir = "configs"
+
+[required]
+# Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps
+# only when fluxor's `modules/sdk/wire.rs::ABI_VERSION` changes
+# (module headers / channel hints / contract ids break). The
+# installed `fluxor` CLI must implement this exact ABI version.
+# See standards/fluxor-modules.md §5.
+fluxor = { abi = 1 }

@@ -1,0 +1,15 @@
+# Workspace-shared Clippy configuration. Per standards/lints.md §6.
+# This file holds lints that take *configuration* (paths, names), not
+# levels — levels live in [workspace.lints.clippy] in Cargo.toml.
+
+disallowed-macros = [
+    { path = "std::println",  reason = "use the project's logger" },
+    { path = "std::eprintln", reason = "use the project's logger" },
+    # std::dbg is covered workspace-wide by clippy::dbg_macro (Cargo.toml).
+]
+
+disallowed-methods = [
+    # Add per-project entries here as the codebase grows. The standard
+    # example is std::env::var → crate::config::env_var; quantum doesn't
+    # have a config::env_var helper yet, so no entries today.
+]

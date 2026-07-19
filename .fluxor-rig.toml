@@ -1,0 +1,33 @@
+# Build recipes for quantum scenarios under `tests/hardware/`.
+# Consulted by `fluxor rig test` after walking up from the scenario
+# file. `${scenario.config}` resolves at plan-time to the absolute
+# path of the scenario's `config = "…"` field and is passed to bash
+# as `$1`.
+
+# CM5 / pi5-a: kernel image = fluxor firmware + foundation fmods +
+# clustor substrate fmods + quantum modules + config blob. Steps:
+#
+#   1. Build fluxor's cm5 firmware from the sibling checkout.
+#      (Firmware is per-deployment, not a registry artefact —
+#      built fresh each scenario.)
+#   2. `fluxor sync` materialises the fluxor SDK source (used by
+#      quantum's PIC modules via `#[path]`) plus foundation +
+#      substrate fmods into `target/fluxor/`. Must precede the
+#      module build — quantum's `mod.rs` files include
+#      `target/fluxor/fluxor-abi/sdk/abi.rs` directly.
+#   3. Build quantum's PIC modules into `target/fluxor/bcm2712/modules/`.
+#   4. Stage `target/cm5/firmware.bin` where `fluxor build` expects it.
+#   5. `fluxor build` consolidates firmware + modules + config into
+#      a single kernel image at `target/cm5/images/<stem>.img`.
+#
+# Assumes the sibling-checkout layout (../fluxor and ../clustor
+# resolvable from quantum's root) the workspace-mode dev rig uses.
+[build.cm5]
+command = [
+    "bash",
+    "-c",
+    "set -e && make -C ../fluxor firmware TARGET=cm5 && fluxor sync && fluxor modules build --target bcm2712 --out target && mkdir -p target/cm5 && cp ../fluxor/target/cm5/firmware.bin target/cm5/firmware.bin && fluxor build \"$1\"",
+    "_",
+    "${scenario.config}",
+]
+artifact = "target/cm5/images/consensus-bench-cm5.img"

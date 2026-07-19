@@ -1,0 +1,62 @@
+[Unit]
+Description=Quantum — Fluxor-native multi-protocol message broker
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/nanocloudio/quantum
+
+[Service]
+Type=simple
+# Run as a dedicated user. Provision with:
+#   useradd -r -s /usr/sbin/nologin -d /var/lib/quantum quantum
+User=quantum
+Group=quantum
+
+# Fluxor toolchain expects these to be built and present on disk.
+Environment=QUANTUM_ROOT=/opt/quantum
+Environment=FLUXOR_BIN=/opt/quantum/bin/fluxor
+Environment=FLUXOR_LINUX_BIN=/opt/quantum/bin/fluxor-linux
+Environment=QUANTUM_CONFIG=/etc/quantum/quantum-cm5.yaml
+Environment=RUST_LOG=info
+
+# Working directory must contain target/{bcm2712,linux}/modules/ symlinks
+# pointing to the deployed .fmod artifacts.
+WorkingDirectory=/opt/quantum
+
+# The fluxor `run` command rebuilds config.bin + modules.bin under
+# target/linux/<config-name>/ then exec's fluxor-linux against them.
+ExecStart=/opt/quantum/bin/fluxor run ${QUANTUM_CONFIG}
+
+# Restart on crash with backoff
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=quantum
+
+# Resource limits
+LimitNOFILE=65536
+TasksMax=4096
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no  # need access to NVMe for WAL fsync
+ReadWritePaths=/var/lib/quantum /var/log/quantum
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,118 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Port reduction: session_processor uses message-type multiplexing to stay
+# within the 8-port-per-direction Fluxor limit. Related signals share channels
+# and are demuxed by MSG_* type bytes.
+#
+# Inputs (8):
+#   [0] codec_in         — MQTT/Kafka/AMQP proposals (demux by PROTO_* byte)
+#   [1] committed_in     — applied entries from apply_pipeline
+#   [2] flow_in          — PID credits + backpressure + prefetch (demux by msg_type)
+#   [3] ack_in           — ACK emit + redeliver from ack_tracker
+#   [4] cp_in            — capabilities + epoch events + disconnect (demux)
+#   [5] messaging_in     — dedup result + offline drain + retained read + group assign + txn result
+#   [6] deliver_in       — topic deliveries from topic_engine
+#   [7] assigned_in      — MSG_PROPOSAL_ASSIGNED from raft_engine (correlation_id → wal_index)
+#
+# Outputs (8):
+#   [0] proposals         — legacy untagged proposals to raft_engine (CONNECT/DISCONNECT/etc)
+#   [1] codec_out         — responses to codecs (tag by PROTO_*)
+#   [2] topic_out         — publish + subscribe + unsubscribe to topic_engine
+#   [3] messaging_out     — dedup check + offline enqueue + retained write + group op + txn op
+#   [4] forward_out       — forward requests + inflight register
+#   [5] audit_out         — audit events
+#   [6] metrics_out       — metrics
+#   [7] proposals_tagged  — tagged proposals (correlation_id-prefixed) for QoS 1+ PUBLISH
+
+[[ports]]
+name = "codec_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "committed_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "flow_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ack_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cp_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "messaging_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "deliver_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "assigned_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "codec_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "topic_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "messaging_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "forward_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audit_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_tagged"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = [
+    "bytes_in",
+    "bytes_out",
+    "connects",
+    "disconnects",
+    "publishes_applied",
+    "sessions_active",
+]

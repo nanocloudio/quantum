@@ -1,8 +1,27 @@
-.vscode
-Cargo.lock
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# AI
+.claude/
 .context/
-target
-tools/*/target
-tools/*/Cargo.lock
-certs
-data
+.codex
+
+# Build/test
+Cargo.lock
+/target/
+/tests/
+/data/
+/certs/
+
+modules/module.ld
+
+# fluxor.lock is committed (standards/dependencies.md §5). The lockfile
+# captures (name, version, sha256) for every resolved transitive dep
+# so canonical-mode builds are reproducible across machines.
