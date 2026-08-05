@@ -48,3 +48,7 @@ path = "src/bin/mqtt_loadgen.rs"
 [[bin]]
 name = "quantum-scrape"
 path = "src/bin/scrape.rs"
+
+[[bin]]
+name = "quantum-kafka-loadgen"
+path = "src/bin/kafka_loadgen.rs"

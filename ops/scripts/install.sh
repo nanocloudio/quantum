@@ -35,7 +35,7 @@ fi
 
 echo "==> creating directories"
 install -d -o "${USER_NAME}" -g "${USER_NAME}" "${PREFIX}/bin" "${PREFIX}/modules" \
-    "${PREFIX}/target/bcm2712" "${PREFIX}/target/linux/quantum-cm5" \
+    "${PREFIX}/target/bcm2712" "${PREFIX}/target/linux/quantum-pi5" \
     "${CONFIG_DIR}" "${DATA_DIR}" "${LOG_DIR}"
 
 echo "==> installing fluxor binaries"
@@ -45,8 +45,7 @@ install -m 0755 "${FLUXOR_ROOT}/target/aarch64-unknown-linux-gnu/release/fluxor-
     "${PREFIX}/bin/fluxor-linux"
 
 echo "==> installing .fmod artifacts"
-cp "${FLUXOR_ROOT}/target/cm5/modules/"*.fmod "${PREFIX}/modules/"
-cp "${FLUXOR_ROOT}/target/bcm2712/modules/"*.fmod "${PREFIX}/modules/" 2>/dev/null || true
+cp "${FLUXOR_ROOT}/target/fluxor/bcm2712/modules/"*.fmod "${PREFIX}/modules/"
 chown -R "${USER_NAME}:${USER_NAME}" "${PREFIX}/modules"
 
 echo "==> setting up target/ symlinks"
@@ -54,7 +53,7 @@ ln -sfn "${PREFIX}/modules" "${PREFIX}/target/bcm2712/modules"
 ln -sfn "${PREFIX}/modules" "${PREFIX}/target/linux/modules"
 
 echo "==> installing configs"
-cp "${QUANTUM_ROOT}/configs/quantum-cm5.yaml" "${CONFIG_DIR}/"
+cp "${QUANTUM_ROOT}/configs/quantum-pi5.yaml" "${CONFIG_DIR}/"
 cp "${QUANTUM_ROOT}/configs/quantum-linux-minimal.yaml" "${CONFIG_DIR}/"
 cp "${QUANTUM_ROOT}/configs/quantum-linux.yaml" "${CONFIG_DIR}/"
 

@@ -25,17 +25,25 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/wire.rs"]
 mod wire;
+
+/// Kernel step ABI: 0=Continue, 1=Done, 2=Burst, 3=Ready. Returning
+/// Burst re-runs the domain's exec rotation within the same tick (up to
+/// the kernel's pass cap), so a record consumed here reaches its
+/// consumer in this tick instead of the next. We burst only when a
+/// record was actually consumed: an idle graph reports no burst and the
+/// tick costs exactly one pass, as before.
+const STEP_BURST: i32 = 2;
 
 const MAX_SUBS: usize = 2048;
 const MAX_TOPIC: usize = 256;
 const MAX_SHARED_GROUPS: usize = 64;
 /// Read/write buffer cap for topic ops. Sized to the wire-channel
 /// per-message capacity (`fluxor-abi::CHANNEL_BUFFER_SIZE` = 8192) so
-/// a worst-case MQTT publish (`mqtt_codec::MAX_PACKET` = 4096) plus
+/// a worst-case MQTT publish (`protocol::mqtt`'s `MAX_PACKET` = 4096) plus
 /// `MSG_TOPIC_PUBLISH` framing (tenant + topic_len + topic prefix) and
 /// the cross-PRG forward header (`[ingress_prg][egress_prg][epoch]`)
 /// can all flow without hitting the `channel_read_msg` discard path.
@@ -109,8 +117,8 @@ struct ModuleState {
     last_emit_index: u64,
     last_metrics_ms: u64,
     // MAX_TOPIC_MSG sized to admit a worst-case MSG_TOPIC_PUBLISH
-    // carrying a 4 KiB MQTT packet from mqtt_codec
-    // (mqtt_codec::MAX_PACKET) plus topic + envelope overhead.
+    // carrying a 4 KiB MQTT packet from `protocol::mqtt`
+    // (`protocol::mqtt`'s MAX_PACKET) plus topic + envelope overhead.
     // Anything below this cap silently drops valid MQTT publishes at
     // the channel_read_msg discard path.
     buf: [u8; MAX_TOPIC_MSG],
@@ -241,6 +249,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        let mut worked = 0u32;
         let now = dev_millis(sys);
 
         // Drain op channel — SUBSCRIBE, UNSUBSCRIBE and PUBLISH come on the
@@ -250,7 +259,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for _ in 0..16 {
                 let poll = (sys.channel_poll)(s.in_op, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = wire::channel_read_msg(sys, s.in_op, &mut s.buf);
+                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_op, &mut s.buf) };
                 dev_log(sys, 3, b"[topic] op rx".as_ptr(), 13);
                 if plen == 0 { continue; }
 
@@ -501,10 +510,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
             } else if mt == wire::MSG_APPLY_RESET_FANOUT {
-                // Apply-pipeline reset (Phase 4 of
-                // docs/apply_side_state_machine.md). Wipe all subscriptions
-                // and shared-group state. Phase 5 snapshots will
-                // repopulate; until then state rebuilds from the next
+                // Apply-pipeline reset (docs/architecture/apply_path.md
+                // §Apply-pipeline reset). Wipe all subscriptions and
+                // shared-group state. Snapshot install will repopulate;
+                // until then state rebuilds from the next
                 // MSG_TOPIC_SUBSCRIBE flow.
                 for i in 0..MAX_SUBS {
                     s.subs[i] = Subscription::zero();
@@ -532,6 +541,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        if worked > 0 { STEP_BURST } else { 0 }
     }
 }

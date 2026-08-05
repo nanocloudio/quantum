@@ -22,7 +22,7 @@ pub const MSG_PROPOSAL_ASSIGNED: u8   = 0x14;
 pub const MSG_WAL_ENTRY: u8           = 0x20;
 pub const MSG_DURABILITY_PROOF: u8    = 0x22;
 pub const MSG_COMMITTED_BATCH: u8     = 0x23;
-/// Per-entry body stream from `apply_pipeline.committed_entries`.
+/// Per-entry body stream from `consensus.committed_entries`.
 /// Body: `[term:u64 LE][index:u64 LE][entry_body...]`. Quantum's
 /// session_processor consumes this on `entries_in` to drive the
 /// apply-side state machine (P0 of `docs/partitioning.md`).
@@ -35,8 +35,9 @@ pub const MSG_COMMITTED_ENTRY: u8     = 0x24;
 ///
 /// Every Quantum module that derives state from `MSG_COMMITTED_ENTRY`
 /// must honour this signal by discarding state above the reset index;
-/// see [docs/clustor_capability_surface.md] §7 for the contract and
-/// [docs/apply_side_state_machine.md] §Phase 4 for per-module policy.
+/// see clustor's `docs/architecture/substrate_capability_surface.md`
+/// for the contract and `docs/architecture/apply_path.md`
+/// §Apply-pipeline reset for per-module policy.
 pub const MSG_APPLY_PIPELINE_RESET: u8 = 0x2B;
 
 pub const MSG_CP_PROOF: u8            = 0x30;
@@ -83,12 +84,13 @@ pub const MSG_OFFLINE_ENQUEUE: u8     = 0xB0;
 pub const MSG_OFFLINE_DRAIN: u8       = 0xB1;
 pub const MSG_RETAINED_WRITE: u8      = 0xB2;
 pub const MSG_RETAINED_READ: u8       = 0xB3;
-/// Reconnect notice from session_processor → offline_queue.
+/// Reconnect notice from session_processor → the messaging module's
+/// offline component.
 /// Body: `[session_slot:u32 LE]`. Triggers a drain of every queued
 /// envelope for that slot back to the messaging bus so the now-reconnected
 /// subscriber receives the messages it would have seen had it stayed
 /// online. Routed on the same messaging bus as the other infrastructure
-/// ops; offline_queue's reconnect input filters by msg_type.
+/// ops; the offline component filters by msg_type.
 pub const MSG_OFFLINE_RECONNECT: u8   = 0xB4;
 
 /// Apply-pipeline reset fan-out from `session_processor` to every
@@ -96,9 +98,10 @@ pub const MSG_OFFLINE_RECONNECT: u8   = 0xB4;
 /// substrate signals a snapshot install or leader-driven log
 /// truncation (detected by `session_processor` as a forward jump in
 /// the `MSG_COMMITTED_ENTRY` index sequence) — see
-/// `docs/apply_side_state_machine.md` §Phase 4. Downstream handlers
-/// (topic_engine, dedup_engine, retained_store, offline_queue) clear
-/// all apply-derived state; Phase 5 snapshots will repopulate.
+/// `docs/architecture/apply_path.md` §Apply-pipeline reset. Downstream
+/// handlers (topic_engine, and messaging's dedup / retained / offline
+/// components) clear all apply-derived state; snapshot install
+/// repopulates it.
 pub const MSG_APPLY_RESET_FANOUT: u8  = 0xB5;
 
 // Consumer groups & transactions
@@ -133,13 +136,25 @@ pub const MSG_DR_SNAPSHOT_RESP: u8    = 0xE2;
 pub const MSG_DR_PROMOTE: u8          = 0xE3;
 pub const MSG_METRICS_ROLLUP: u8      = 0xE8;
 
-/// Client-facing frame on the `codec → response_mux → peer_router.client_resp`
+/// Client-facing frame on the `codec → protocol → peer_router.client_resp`
 /// chain. Payload is `[conn_id:u8][protocol bytes]`. Carries an
 /// envelope so back-to-back writes don't coalesce on the merge
 /// module's byte FIFO — same rationale as the `codec_in` fan-in fix.
 /// `peer_router` ignores the msg_type and just unwraps the conn_id
-/// prefix; `response_mux` forwards the envelope verbatim.
+/// prefix; `protocol` forwards the envelope verbatim.
 pub const MSG_CLIENT_FRAME: u8        = 0xEA;
+
+/// Transport-level connection-closed notice on the same
+/// `peer_router.cleartext → protocol::router → codec` chain as
+/// MSG_CLIENT_FRAME. Payload is `[conn_id:u8]`. peer_router emits it when
+/// a CLIENT socket closes (NMSG_CLOSED, replica_id < 0); `protocol::router`
+/// clears its sniff state and forwards it to the conn's codec, which
+/// clears per-conn reassembly and forwards MSG_SESSION_DISCONNECT to
+/// session_processor. This is the generic "connection closed" verb that
+/// lets every protocol release conn-keyed state (AMQP consumers, Kafka
+/// group members) deterministically instead of leaking until a timeout —
+/// and closes the conn_id-reuse cross-delivery hazard.
+pub const MSG_CONN_CLOSED: u8         = 0xEB;
 
 // ── Envelope primitives ─────────────────────────────────────────────────────
 
@@ -246,7 +261,7 @@ pub const PROPOSAL_ASSIGNED_LEN: usize = 18;
 
 /// Decode a MSG_PROPOSAL_ASSIGNED payload (18 bytes).
 /// Returns `(correlation_id, partition_id, wal_index)`. The
-/// `partition_id` is needed by `ack_tracker` to disambiguate the
+/// `partition_id` is needed by `flow::ack` to disambiguate the
 /// same `wal_index` arriving from different partitions when QoS 1
 /// PUBLISHes are routed through `partition_router`.
 pub fn decode_proposal_assigned(buf: &[u8]) -> (u64, u16, u64) {
@@ -367,7 +382,7 @@ pub fn mqtt_topic_match(pattern: &[u8], topic: &[u8]) -> bool {
 //     Clustor's `decode_tagged_proposal` strips the 8-byte
 //     `correlation_id` prefix before storing the entry, so the WAL
 //     body — and the `MSG_COMMITTED_ENTRY` body forwarded by
-//     `apply_pipeline` — is byte-identical to the untagged form.
+//     the apply path — is byte-identical to the untagged form.
 //
 //   canonical envelope = [version:u8][op:u8][tenant:u32 LE]
 //                        [session_slot:u32 LE][op-body]
@@ -378,14 +393,14 @@ pub fn mqtt_topic_match(pattern: &[u8], topic: &[u8]) -> bool {
 // not carried through the apply stream; the leader recovers it from
 // the matching publisher inflight (`Session.inflight[i].correlation_id`).
 //
-// See `docs/apply_side_state_machine.md` §Phase 1 for the design
-// rationale and the per-op body shapes; see
-// `docs/clustor_capability_surface.md` for the substrate contract
-// that delivers these bodies on `committed_entries`.
+// See `docs/architecture/apply_path.md` §Canonical proposal format for
+// the design rationale and the per-op body shapes; see clustor's
+// `docs/architecture/substrate_capability_surface.md` for the substrate
+// contract that delivers these bodies on `committed_entries`.
 
 /// Canonical envelope body version. Increment for breaking shape
 /// changes; never decrement — replay must understand every shipped
-/// version forever. Phase 1 ships with v1 only.
+/// version forever.
 pub const QPROP_VERSION_V1: u8 = 1;
 
 /// V2 bumps the QOP_PUBLISH body shape to interleave a `user_props`
@@ -395,8 +410,7 @@ pub const QPROP_VERSION_V1: u8 = 1;
 /// keep emitting V1 for ops that haven't changed shape. Replay
 /// support: apply-side parsers MUST honour both V1 and V2 forever —
 /// any new V3 must keep this rule. See
-/// `docs/apply_side_state_machine.md` §"Don't change the proposal
-/// body wire format quietly".
+/// `docs/architecture/apply_path.md` §Canonical proposal format.
 pub const QPROP_VERSION_V2: u8 = 2;
 
 /// Size of the canonical envelope header
@@ -450,7 +464,7 @@ pub const QPROP_TAGGED_HDR_LEN: usize = TAGGED_PROPOSAL_HDR + QPROP_HEADER_LEN;
 /// Additive: a parser written against the pre-Will / pre-expiry shape
 /// stops at the last field it understands and treats the missing
 /// fields as defaults (no Will / `session_expiry == 0`). No
-/// `QPROP_VERSION` bump per `docs/apply_side_state_machine.md` rules
+/// `QPROP_VERSION` bump per `docs/architecture/apply_path.md` rules
 /// (additive only).
 pub const QOP_CONNECT: u8 = 0x01;
 
@@ -517,6 +531,40 @@ pub const QOP_PUBREL: u8 = 0x06;
 ///
 /// Op-body: `[topic_len:u16 BE][topic]`.
 pub const QOP_RETAINED_CLEAR: u8 = 0x07;
+
+/// KAFKA_PRODUCE: one Kafka record batch appended to a topic-partition.
+/// The `base_offset` returned to the producer is the WAL index assigned
+/// to this entry (offsets are WAL indexes interpreted through the
+/// topic's view of the WAL — see docs/architecture/kafka_adapter.md
+/// §Retention). Tagged when `acks != 0` so the ProduceResponse is
+/// gated on quorum durability; untagged (fire-and-forget) for
+/// `acks == 0`.
+///
+/// Op-body: `[partition:u16 LE][topic_len:u16 LE][topic]
+///           [records: remaining bytes — the verbatim Kafka record
+///            batch (magic v2) from the ProduceRequest]`.
+pub const QOP_KAFKA_PRODUCE: u8 = 0x08;
+
+/// AMQP_PUBLISH: one AMQP 0-9-1 Basic.Publish body appended to the
+/// routing key's message log (shared apply-side store with Kafka —
+/// entries are flagged raw, so Kafka Fetch skips them and AMQP
+/// Basic.Get returns them verbatim). Tagged when the channel is in
+/// confirm mode so the Basic.Ack is gated on quorum durability
+/// (publisher-confirms == ACK-DURABILITY); untagged otherwise.
+///
+/// Op-body: `[rk_len:u16 LE][routing_key][payload: remaining bytes]`.
+pub const QOP_AMQP_PUBLISH: u8 = 0x09;
+
+/// KAFKA_OFFSET: one consumer-group offset commit. Durable (offset
+/// commits survive restart exactly like session records, per
+/// docs/architecture/kafka_adapter.md §Consumer groups); the
+/// OffsetCommitResponse is NOT gated on durability — a lost commit
+/// re-consumes from the previous offset, which the at-least-once
+/// contract already admits.
+///
+/// Op-body: `[group_len:u16 LE][group][topic_len:u16 LE][topic]
+///           [partition:u16 LE][offset:i64 LE]`.
+pub const QOP_KAFKA_OFFSET: u8 = 0x0A;
 
 // ── Disconnect reasons (QOP_DISCONNECT body) ────────────────────────────────
 

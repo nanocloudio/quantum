@@ -11,8 +11,8 @@ version = "0.0.1"
 # Cross-project dependencies (standards/dependencies.md §2.2).
 # fluxor provides foundation modules (`ip`, `tls`, `linux_net`, …),
 # the ABI source crate (`fluxor-abi`), and the `fluxor-linux` runtime.
-# clustor provides the substrate modules (`peer_router`, `raft_engine`,
-# `wal`, `durability_ledger`, …) consumed by quantum's deployment
+# clustor provides the substrate modules (`peer_router`, `consensus`,
+# `durability`, `gateway`, …) consumed by quantum's deployment
 # graphs. Both resolve via the local registry under
 # `~/.fluxor/registry/`; PIC modules in `modules/app/*/mod.rs` consume
 # the materialised SDK source at
@@ -26,9 +26,9 @@ clustor = "0.0.1"
 
 [ci]
 # Module targets `fluxor modules build --all` will produce artefacts for.
-# Both targets currently resolve to aarch64-unknown-none under the hood;
-# they're distinguished for downstream packaging.
-targets = ["bcm2712", "cm5"]
+# Silicon tokens only — the board (pi5) and packaging distinctions live at
+# the rig/board level (`.fluxor-rig.toml`), not in the module matrix.
+targets = ["bcm2712"]
 
 [ci.lints]
 # Workspace members allowed to skip the [lints] workspace = true opt-in
@@ -55,7 +55,7 @@ dir = "configs"
 
 [required]
 # Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps
-# only when fluxor's `modules/sdk/wire.rs::ABI_VERSION` changes
+# only when fluxor's `modules/sdk/wire/wire.rs::ABI_VERSION` changes
 # (module headers / channel hints / contract ids break). The
 # installed `fluxor` CLI must implement this exact ABI version.
 # See standards/fluxor-modules.md §5.

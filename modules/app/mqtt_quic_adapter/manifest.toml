@@ -4,27 +4,26 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # MQTT-over-QUIC adapter. Bridges fluxor's `quic` foundation module
-# (ALPN `mqtt`, raw bidi-stream surface) to quantum's existing
-# `mqtt_codec` without modifying either side.
+# (ALPN `mqtt`, raw bidi-stream surface) to quantum's `protocol` module
+# without modifying either side.
 #
 # Inbound:
 #   quic.app_out  → quic_in   — raw envelopes (MSG_QUIC_STREAM_DATA = 0x13,
 #                              MSG_QUIC_STREAM_OPEN = 0x12, MSG_PEER_IDENTITY
 #                              = 0x5A, MSG_QUIC_DATAGRAM_RX = 0x10)
-#   quic_in       → mqtt_out  — `[conn_id][mqtt bytes]` (matches the
-#                              protocol_router.mqtt_out shape mqtt_codec
-#                              already consumes)
+#   quic_in       → mqtt_out  — `[conn_id][mqtt bytes]`, the same shape
+#                              `protocol.raw_in` consumes on the TCP path
 #
 # Outbound (response path):
-#   response_mux.mux_out → frames_in — envelope-framed MSG_CLIENT_FRAME
+#   protocol.frames_out → frames_in — envelope-framed MSG_CLIENT_FRAME
 #                                     (0xEA) carrying `[conn_id][mqtt bytes]`
-#   frames_in            → quic_out  — raw MSG_QUIC_STREAM_WRITE envelope
+#   frames_in           → quic_out  — raw MSG_QUIC_STREAM_WRITE envelope
 #                                     (0x14) `[0x14][cid][sid=0][fin=0][data…]`
 #
 # Conn-id namespace: this adapter does NOT remap conn_ids. It is meant
-# for QUIC-only graphs (no concurrent peer_router TCP path on the same
-# mqtt_codec). A future revision can add a high-bit offset if a mixed
-# TCP+QUIC graph needs both transports feeding the same codec.
+# for QUIC-only graphs (no concurrent peer_router TCP path into the same
+# `protocol` instance). A future revision can add a high-bit offset if a
+# mixed TCP+QUIC graph needs both transports feeding one codec.
 
 [[ports]]
 name = "quic_in"

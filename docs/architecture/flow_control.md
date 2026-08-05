@@ -2,9 +2,9 @@
 
 How Quantum admits work into the apply pipeline, propagates pressure
 back to clients, and issues per-session consumer credits. Three
-modules cooperate: `flow_controller` (substrate, node-wide credits),
-`prefetch_controller` (Quantum, per-session credits), and
-`backpressure_propagator` (Quantum, translation to protocol signals).
+modules cooperate: `admission` (substrate, node-wide credits),
+`flow`'s prefetch component (Quantum, per-session credits), and
+`flow`'s backpressure component (Quantum, translation to protocol signals).
 
 The throughput floor and latency targets stated here are the
 normative performance contracts; the harnesses that exercise them
@@ -27,9 +27,9 @@ something they already know how to interpret.
 
 | Layer | Module | Scope | Driven by |
 |---|---|---|---|
-| **Proposal admission** | `flow_controller` (Clustor) | Node-wide singleton | Replicator lag signal (Q16.16 PID over entry + byte credits) |
-| **Consumer prefetch** | `prefetch_controller` (Quantum) | Per-session | Apply-to-delivery queue depth |
-| **Backpressure translation** | `backpressure_propagator` (Quantum) | Per-protocol | Queue depths + envelope from `flow_controller` |
+| **Proposal admission** | `admission` (Clustor) | Node-wide singleton | Replication lag signal from `consensus.lag_signal` (Q16.16 PID over entry + byte credits) |
+| **Consumer prefetch** | `flow`'s prefetch component (Quantum) | Per-session | Apply-to-delivery queue depth |
+| **Backpressure translation** | `flow`'s backpressure component (Quantum) | Per-protocol | Queue depths + envelope from `admission` |
 
 The split is deliberate. Proposal admission is a node-level resource
 decision (do we have headroom to accept another publish into the WAL
@@ -38,15 +38,15 @@ messages should this consumer hold inflight?); translation is a
 protocol decision (how do we tell the client to slow down in their
 language?).
 
-## Proposal admission (`flow_controller`)
+## Proposal admission (`admission`)
 
 A dual-token PID controller in Q16.16 fixed-point arithmetic. Two
 independent credit pools:
 
 | Credit type | Default cap | Driven by |
 |---|---|---|
-| Entry credits | 4096 (max in flight) | Replicator lag in WAL indexes |
-| Byte credits | 64 MiB | Replicator lag in bytes |
+| Entry credits | 4096 (max in flight) | Replication lag in WAL indexes |
+| Byte credits | 64 MiB | Replication lag in bytes |
 
 The PID samples every 100ms (default) and adjusts credit availability
 based on the lag error term. Profiles tune the gain triple:
@@ -59,13 +59,14 @@ based on the lag error term. Profiles tune the gain triple:
 
 Anti-windup integral clamping prevents the controller from
 accumulating credit debt during sustained overload. When credits
-exhaust, `throttle_gate` rejects new proposals at the apply boundary;
+exhaust, `gateway`'s throttle component rejects new proposals at the
+apply boundary;
 rejected requests trigger backpressure-propagator translation.
 
-## Consumer prefetch (`prefetch_controller`)
+## Consumer prefetch (`flow`'s prefetch component)
 
 Per-session credit windows for consumer delivery. The data shape is
-fundamentally different from `flow_controller`'s singleton PID —
+fundamentally different from `admission`'s singleton PID —
 credits live per session, with their own state and lifecycle.
 
 | Setting | Default | Source |
@@ -85,7 +86,7 @@ inflight accounting. When apply-to-delivery lag exceeds the
 threshold, credits per session reduce until the lag normalises, then
 ramp back to the configured maximum.
 
-## Backpressure translation (`backpressure_propagator`)
+## Backpressure translation (`flow`'s backpressure component)
 
 The operational observability surface for flow control. Tracks queue
 depths, evaluates configurable thresholds, and emits per-protocol
@@ -108,42 +109,31 @@ metrics that operators watch on dashboards.
 | `PermanentDurability` | DISCONNECT with `0x99` (Payload format invalid) semantics | `connection.close` with `INVALID_CONFIG` | `connection.close{reply-code=resource-error}` |
 | `PermanentEpoch` | `dirty_epoch` rejection per [mqtt_adapter.md](mqtt_adapter.md) | `NOT_LEADER_OR_FOLLOWER` | `link-detach{detach-forced}` |
 
-The translation is mechanical — `backpressure_propagator` does not
+The translation is mechanical — `flow`'s backpressure component does not
 make policy decisions, it does protocol mapping. Policy lives in
-`flow_controller` and `tenant_manager`.
+`admission` and `governance`'s tenants component.
 
 ### Metrics
 
 Every translated signal increments a counter dimensioned by
 `(tenant, protocol, prg, reason)`. Gauges expose current queue depths
-for each tracked queue. These flow through `metrics_aggregator` to
-`telemetry_agg` and surface on `/metrics` — they are the primary
+for each tracked queue. These flow through `governance`'s telemetry component to
+`operations` and surface on `/metrics` — they are the primary
 signal operators use to detect that flow control is engaging in
 production. See [observability.md](observability.md).
 
-## Why three modules, not one
-
-A previous design absorbed all three concerns into one module. Two
-problems pushed the split:
-
-1. **Per-session vs. node-wide state.** Prefetch state lives per
-   session; admission state lives once per node. Combining them
-   produces a module whose state arena scales with session count for
-   one concern and is constant for another — confusing to size and
-   harder to reason about.
-2. **PID vs. queue-depth observer.** Admission control is a PID loop
-   with sample periods, integral windup, and gain tuning.
-   Backpressure translation is a stateless observation + lookup.
-   They share no math; combining them just couples release schedules.
-
-The module-alignment analysis in [native_fluxor.md](../native_fluxor.md)
-walks through the full reasoning.
+The three concerns are separate modules because their state and math
+differ: admission control is a node-wide PID loop (sample periods,
+integral windup, gain tuning), prefetch is per-session credit state, and
+backpressure translation is a stateless observation + lookup. See
+[architecture.md](../architecture.md#flow-control--acknowledgement-3)
+for the module boundaries.
 
 ## Operator surfaces
 
-- `/metrics` exposes credit headroom, queue depths, PID error term, replicator lag in bytes and entries, and per-protocol backpressure signal counts.
+- `/metrics` exposes credit headroom, queue depths, PID error term, replication lag in bytes and entries, and per-protocol backpressure signal counts.
 - `/why` includes flow-control state in the "node not ready" explanation when the runtime is gated by sustained backpressure.
-- `admin_handler` accepts profile changes (`Latency` ↔ `Throughput` ↔ `WAN`) and quota overrides without restart; useful for planned-spike incidents.
+- `operations` accepts profile changes (`Latency` ↔ `Throughput` ↔ `WAN`) and quota overrides without restart; useful for planned-spike incidents.
 
 The validation workflow that exercises these surfaces under load
 lives in [guides/performance.md](../guides/performance.md).

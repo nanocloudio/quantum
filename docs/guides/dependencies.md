@@ -10,8 +10,8 @@ Quantum builds against Fluxor and Clustor. Both are declared in `fluxor.toml`:
 
 ```toml
 [dependencies]
-fluxor  = "0.1"
-clustor = "0.1"
+fluxor  = "0.0.1"
+clustor = "0.0.1"
 ```
 
 For active cross-repo iteration, list the colocated checkouts in `~/.fluxor/workspace.toml` and the Fluxor CLI reads them in place (the lockfile is bypassed for workspace members; an advisory prints once per `sync`):
@@ -30,14 +30,14 @@ members = [
 | Project | Role | Notes |
 |---|---|---|
 | [`fluxor`](../../../fluxor) | Runtime + toolchain + module SDK | Provides the `fluxor` host CLI, the `fluxor-linux` runtime, foundation `.fmod` modules (`ip`, `tls`, `linux_net`, …), the `fluxor-abi` source crate, and the platform target/stack catalog. |
-| [`clustor`](../../../clustor) | Substrate `.fmod` modules + `clustor-common` crate | Produces `raft_engine`, `wal`, `commit_tracker`, `apply_pipeline`, `replicator`, `durability_ledger`, `peer_router`, `partition_router`, `cp_bridge`, `cp_proof_cache`, `flow_controller`, `throttle_gate`, `telemetry_agg`, `http_adapter`, plus the rest of the 23-module substrate. |
+| [`clustor`](../../../clustor) | Substrate `.fmod` modules + `clustor-common` crate | Produces the seven-module substrate palette — `peer_router`, `consensus`, `durability`, `gateway`, `admission`, `control_plane`, `operations` — plus the optional `partition_router`, `session_directory`, and `consensus_bench` modules. |
 
 ## Resolving and syncing
 
 ```sh
 fluxor update             # resolve fluxor.lock against the registry
 fluxor sync               # install lockfile-resolved fmods + runtime into target/
-fluxor modules build --target bcm2712 --out target   # build Quantum's PIC modules
+fluxor modules build --target bcm2712   # build Quantum's PIC modules
 ```
 
 `fluxor sync` materialises:
@@ -59,6 +59,19 @@ In live workspace mode the live sources / fmods / runtime are read directly from
 
 Quantum modules build for `aarch64-unknown-none` only — bare-metal `--crate-type=lib` builds with no `std`, no allocator, and no async runtime.
 
+### Fluxor build requirements
+
+The full graph runs at the upper end of stock Fluxor's static limits, so
+the linked Fluxor build must raise the following kernel and tool
+constants. The figures leave headroom for extra listeners and a handful
+of debug modules without another rebuild.
+
+| Constant | Stock | Required | Site |
+|---|---|---|---|
+| `MAX_MODULES` | 24 | 64 | `fluxor/src/kernel/{config,event,scheduler}.rs`, `fluxor/tools/src/{config,modules}.rs` |
+| `MAX_GRAPH_EDGES` | 64 | 128 | as above |
+| Linux state arena | 256 KB | 4 MB | `fluxor-linux` build — covers `session_processor` (~440 KB) and `topic_engine` (~570 KB) |
+
 ## Runtime Dependencies
 
 The `fluxor-linux` runtime relies on:
@@ -71,7 +84,7 @@ No system libraries are linked into modules — they are statically packaged and
 
 ## Test / CI Dependencies
 
-For E2E harnesses under [tests/integration/](../tests/integration/) and the chaos drivers under [ops/scripts/](../ops/scripts/):
+For E2E harnesses under [tests/integration/](../../tests/integration/) and the chaos drivers under [ops/scripts/](../../ops/scripts/):
 
 | Tool | Where used |
 |---|---|
@@ -90,7 +103,6 @@ Reproducibility is enforced by the committed `fluxor.lock` (registry-resolved tr
 |---|---|
 | Lockfile consistent with `fluxor.toml` + registry state | Part of `make ci` (the `lockfile-consistency` phase) |
 | Graph YAML matches current module manifests | `fluxor validate configs/quantum-*.yaml` |
-| Clustor consensus-core manifest is intact | `tools/spec-lint.sh` |
 | Modules compile cleanly for every supported target | `fluxor modules build --all --out target` |
 | Runtime end-to-end behaviour | `tests/integration/module_graph_mqtt.sh && tests/integration/module_graph_load.sh` (after a modules build) |
 

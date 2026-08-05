@@ -1,10 +1,10 @@
 # Disaster Recovery and Upgrades
 
 Quantum's disaster-recovery model and how rolling upgrades preserve
-durability. The DR primitives are owned by `dr_manager`
-(orchestration), `snapshot_engine` (chunked export/import), and
-Clustor's WAL + durability ledger. The upgrade path is mechanically
-standard for a Raft-replicated state machine; the interesting
+durability. The DR primitives are owned by `governance`'s dr component
+(orchestration) and Clustor's `durability` (chunked snapshot
+export/import, WAL, and the durability ledger). The upgrade path is
+mechanically standard for a Raft-replicated state machine; the interesting
 properties are the fencing rules that bound the duplicate window
 during promotion.
 
@@ -29,8 +29,8 @@ snapshot export + WAL archive shipping:
 
 | Component | Role |
 |---|---|
-| `snapshot_engine` | Periodic full + incremental snapshots, 1 MiB chunked, AEAD-encrypted, Ed25519-signed. |
-| `dr_manager` | Schedules checkpoint exports, ships WAL archives with cursor tracking, drives controlled promotion. |
+| `durability` | Periodic full + incremental snapshots, 1 MiB chunked, AEAD-encrypted, Ed25519-signed. |
+| `governance`'s dr component | Schedules checkpoint exports, ships WAL archives with cursor tracking, drives controlled promotion. |
 | Cross-region transport | Operator-provided (object storage, blob store, dedicated replication link). Quantum writes archives, operator ships them. |
 | Standby site | Imports snapshots + WAL archives, replays into PRG state, ready to promote on demand. |
 
@@ -78,16 +78,16 @@ deliveries on QoS 2 / Kafka transactional / AMQP exactly-once paths.
 `controlled_promotion = true` (default) requires the operator-driven
 sequence:
 
-1. **Verify standby readiness.** `dr_manager` reports
+1. **Verify standby readiness.** `governance`'s dr component reports
    `standby_replication_lag_seconds` on `/admin`; promote only when
    lag is below operator threshold.
-2. **FenceCommit on primary.** `admin_handler` issues a fence command
+2. **FenceCommit on primary.** `operations` issues a fence command
    that stops new writes from being accepted at the primary. Existing
    writes drain.
-3. **Verify durability quiescence.** Standby's `durability_ledger`
+3. **Verify durability quiescence.** Standby's `durability` ledger
    confirms no new entries past the fence index.
-4. **Promote standby.** `dr_manager` activates the standby PRG ring;
-   `placement_router` bumps routing epoch; CP-Raft publishes the new
+4. **Promote standby.** `governance`'s dr component activates the standby PRG ring;
+   `control_plane` bumps routing epoch; CP-Raft publishes the new
    primary identity.
 5. **Cut over clients.** L4 / VIP routes new connections to the
    promoted site; old primary serves only durability lookups for
@@ -113,7 +113,7 @@ Consequences:
 - Retries land on the new primary, which has no dedupe state for
   them. The result is duplicate delivery within the dedupe TTL
   window.
-- `audit_logger` records every unfenced promotion with the
+- `governance`'s audit component records every unfenced promotion with the
   duplicate-window estimate.
 
 Operators should prefer controlled promotion; unfenced is the option
@@ -134,7 +134,7 @@ module implementations:
    backlog).
 2. For each node in sequence:
    - Drain the listener via `/admin` (stops new CONNECTs).
-   - Transfer PRG leadership away from the node via `admin_handler`.
+   - Transfer PRG leadership away from the node via `operations`.
    - Wait for active-session quiescence (or DISCONNECT with grace).
    - `systemctl stop quantum`; replace `/opt/quantum/modules/*.fmod`
      and `/opt/quantum/bin/fluxor*` as needed;
@@ -178,9 +178,9 @@ fault classes are exercisable against a running graph:
 | Fault class | Exercised by |
 |---|---|
 | Link drops between peers | `test_fault` + `peer_router` |
-| Disk latency (synthetic fsync stalls) | `test_fault` + `wal` |
-| CP-Raft outage (cache state transitions) | `test_fault` + `cp_bridge` |
-| PRG relocation mid-publish | `admin_handler` placement plan |
+| Disk latency (synthetic fsync stalls) | `test_fault` + `durability` |
+| CP-Raft outage (cache state transitions) | `test_fault` + `control_plane` |
+| PRG relocation mid-publish | `operations` placement plan |
 | Module step-time overrun | `test_fault` + scheduler tier limits |
 
 Deterministic replay tests assert **WAL-SOURCE** and
@@ -190,7 +190,7 @@ procedure lives in [guides/performance.md](../guides/performance.md).
 ## Operator surfaces
 
 - `/admin` — drain, leader transfer, fence command, snapshot trigger, shrink plan, throttle override.
-- `dr_manager` status on `/admin` — current checkpoint cursor, WAL archive lag, standby replication lag.
+- `governance`'s dr component status on `/admin` — current checkpoint cursor, WAL archive lag, standby replication lag.
 - Audit log — every DR event signed and retained for forensics.
 
 The end-to-end operator workflow for rolling upgrade lives in

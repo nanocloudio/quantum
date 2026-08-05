@@ -1,0 +1,66 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# messaging — dedup, offline queues and retained messages as one
+# composite module (standards fluxor-modules.md §8).
+#
+# Components: dedup (16-shard exactly-once dedup with expiry and a
+# WAL-compaction retention floor), offline (per-session FIFO holding
+# delivery envelopes while a subscriber is disconnected, replayed in
+# sequence order on reconnect), retained (MQTT retained-message store,
+# wildcard-matched on SUBSCRIBE).
+#
+# The components share no state and exchange no messages; each serves a
+# request/response pair for the session state machine. They share the
+# request bus: `op_in` carries all five operation types multiplexed by
+# msg_type and `result_out` carries all three reply types back, demuxed
+# by the consumer exactly as it did across the separate edges. The
+# module's dispatch table owns the demux and the per-component per-step
+# budgets.
+
+permissions = []
+
+# ── inputs ───────────────────────────────────────────────────
+
+# Operation bus from the session state machine. Frame types served:
+#   MSG_DEDUP_CHECK        → dedup
+#   MSG_OFFLINE_ENQUEUE    → offline
+#   MSG_OFFLINE_RECONNECT  → offline
+#   MSG_RETAINED_WRITE     → retained
+#   MSG_RETAINED_READ      → retained
+#   MSG_APPLY_RESET_FANOUT → all three (apply-pipeline reset)
+# Any other frame type is ignored — this is a shared bus.
+[[ports]]
+name = "op_in"
+direction = "input"
+content_type = "OctetStream"
+
+# ── outputs ──────────────────────────────────────────────────
+
+# Reply bus: MSG_DEDUP_RESULT, MSG_OFFLINE_DRAIN, MSG_RETAINED_READ.
+[[ports]]
+name = "result_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Component-tagged samples under the dimensional metric envelope
+# `[dim_flag=1][tenant:u32][protocol:u8][prg:u16][metric_id][payload]`,
+# where metric_id is 1=dedup, 2=offline, 3=retained, so the aggregator
+# keys per component instead of by payload hash (§8 rule 8). One frame
+# per component per 10s rollup window.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Per component: dedup (checks, hits, inserts, evicted, earliest_index),
+# offline (enqueued, drained, expired, earliest_index, active),
+# retained (writes, reads, hits, active).
+metrics = [
+    "checks", "hits", "inserts", "evicted", "earliest_index",
+    "enqueued", "drained", "expired", "active",
+    "writes", "reads",
+]

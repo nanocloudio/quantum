@@ -2,17 +2,17 @@
 
 Quantum is a multi-protocol message broker (MQTT 3.1/3.1.1/5.0, Kafka, AMQP 0-9-1) built as a graph of cooperative modules on the [Fluxor](../fluxor) runtime, layered on top of the [Clustor](../clustor) Raft substrate. There is no monolithic Rust binary: the runtime is `fluxor-linux` (or the bare-metal equivalent), and every operational concern — codecs, session state, dedupe, retained store, forward coordination, control-plane enforcement, audit, metrics — is a position-independent `.fmod` module loaded by that runtime.
 
-42 modules across 6 execution domains: 23 Clustor substrate modules (consensus, persistence, network, control plane), 4 Fluxor foundation modules (`nic`, `ip`, `tls`, `test_fault`), and **19 Quantum application modules**. The full architecture, module-by-module rationale, and graph definition live in [docs/native_fluxor.md](docs/native_fluxor.md).
+14 modules across 6 execution domains: 7 Clustor substrate modules (`peer_router`, `consensus`, `durability`, `gateway`, `admission`, `control_plane`, `operations`) and **7 Quantum application modules**. Bare-metal deployments add the Fluxor `tls` foundation module for a 15-module graph. The full architecture — layers, execution domains, module reference, and message graph — lives in [docs/architecture.md](docs/architecture.md).
 
 ---
 
 ## Why Quantum
 
 - **Exactly-once QoS inside the broker** — Session records, dedupe tables, offline queues, retained payloads, consumer groups, and transaction state are committed through Clustor's WAL → fsync → quorum proof pipeline. PUBACK / PUBREC / PUBREL / PUBCOMP, Kafka `ProduceResponse`, and AMQP `Basic.Ack` are gated on durability proofs, not on local apply.
-- **Multi-tenant isolation** — Each tenant owns a ring of PRGs (Partition Raft Groups); routing is fenced by CP-Raft epochs; per-tenant quotas, ACLs, and certificates live in the CP manifest. `tenant_manager` enforces token-bucket quotas with noisy-neighbour disconnect.
-- **Multi-protocol on one substrate** — `protocol_router` ALPN-demuxes inbound traffic into per-protocol codecs (`mqtt_codec`, `kafka_codec`, `amqp_codec`) that all funnel into a unified `session_processor` and `topic_engine`. The same Raft pipeline serves all three.
-- **Deterministic backpressure** — `flow_controller` runs a PID loop on replicator lag for proposal admission; `prefetch_controller` runs per-session consumer credits; `backpressure_propagator` translates substrate envelopes into protocol-native signals (MQTT `0x97`, Kafka `THROTTLING_QUOTA_EXCEEDED`, AMQP `drain=true`).
-- **Operational determinism** — `http_surface` exposes `/readyz`, `/why`, `/metrics`, `/raft`, `/admin`. `dr_manager` orchestrates checkpoint export and fenced promotion; `audit_logger` emits Ed25519-signed compliance events; `metrics_aggregator` handles high-cardinality per-(tenant, protocol, prg) rollups.
+- **Multi-tenant isolation** — Each tenant owns a ring of PRGs (Partition Raft Groups); routing is fenced by CP-Raft epochs; per-tenant quotas, ACLs, and certificates live in the CP manifest. `governance`'s tenants component enforces token-bucket quotas with noisy-neighbour disconnect.
+- **Multi-protocol on one substrate** — `protocol` ALPN-demuxes inbound traffic into its per-protocol codecs (mqtt, kafka, amqp), which all funnel into a unified `session_processor` and `topic_engine`. The same Raft pipeline serves all three.
+- **Deterministic backpressure** — `admission` runs a PID loop on replication lag for proposal admission; `flow`'s prefetch component runs per-session consumer credits; `flow`'s backpressure component translates substrate envelopes into protocol-native signals (MQTT `0x97`, Kafka `THROTTLING_QUOTA_EXCEEDED`, AMQP `drain=true`).
+- **Operational determinism** — `operations` exposes `/readyz`, `/why`, `/metrics`, `/raft`, `/admin`. `governance`'s dr component orchestrates checkpoint export and fenced promotion; `governance`'s audit component emits Ed25519-signed compliance events; `governance`'s telemetry component handles high-cardinality per-(tenant, protocol, prg) rollups.
 - **Composable, not monolithic** — Every module has a fixed step function, explicit input/output ports, a bounded state arena, and a manifest declaring its scheduling tier. The graph is a YAML file. Modules can be swapped, the graph can be reshaped per deployment, and the runtime enforces the contract.
 
 ---
@@ -22,54 +22,37 @@ Quantum is a multi-protocol message broker (MQTT 3.1/3.1.1/5.0, Kafka, AMQP 0-9-
 ```mermaid
 graph TD
     subgraph Network["Network domain (poll-mode, Core 2)"]
-        NIC["nic"]
         IP["ip"]
         TLS["tls"]
         Peer["peer_router"]
-        Repl["replicator"]
     end
     subgraph Ingest["Ingest domain (500µs, Core 3/5)"]
-        Router["protocol_router (ALPN demux)"]
-        MQTT["mqtt_codec"]
-        Kafka["kafka_codec"]
-        AMQP["amqp_codec"]
+        Proto["protocol<br/>router · mqtt · kafka · amqp"]
         Topic["topic_engine"]
     end
     subgraph Apply["Apply domain (250µs, Core 3)"]
         Session["session_processor"]
-        Ack["ack_tracker"]
-        BP["backpressure_propagator"]
-        Pre["prefetch_controller"]
+        Flow["flow<br/>ack · backpressure · prefetch"]
         Fwd["forward_coordinator"]
-        ApplyP["apply_pipeline"]
-        Flow["flow_controller"]
+        Gate["gateway"]
+        Adm["admission"]
     end
     subgraph Consensus["Consensus domain (poll-mode, Core 1)"]
-        Raft["raft_engine"]
-        WAL["wal"]
-        Dur["durability_ledger"]
-        Commit["commit_tracker"]
+        Cons["consensus"]
+        Dur["durability"]
     end
     subgraph Messaging["Messaging domain (250µs, Core 0/4)"]
-        Dedup["dedup_engine"]
-        Offline["offline_queue"]
-        Retained["retained_store"]
-        Groups["consumer_group_coordinator"]
-        Txn["transaction_coordinator"]
+        Msg["messaging<br/>dedup · offline · retained"]
     end
     subgraph Ops["Ops domain (1ms, Core 0)"]
-        CP["cp_bridge"]
-        Place["placement_router"]
-        Tenant["tenant_manager"]
-        DR["dr_manager"]
-        Audit["audit_logger"]
-        Metrics["metrics_aggregator"]
-        HTTP["http_surface"]
+        CP["control_plane"]
+        Gov["governance<br/>tenants · dr · audit · telemetry"]
+        Ops["operations"]
     end
 
-    NIC --> IP --> TLS --> Peer
+    IP --> TLS --> Peer
     Peer -->|client cleartext| Router
-    Peer -->|peer traffic| Repl
+    Peer -->|peer traffic| Cons
     Router --> MQTT
     Router --> Kafka
     Router --> AMQP
@@ -84,25 +67,26 @@ graph TD
     Session --> Retained
     Session --> Groups
     Session --> Txn
-    Session --> Raft
-    Raft --> WAL --> Dur --> Commit --> ApplyP --> Session
+    Session --> Cons
+    Cons --> Dur --> Cons --> Session
     Dur --> Ack
     Ack --> Session
-    Flow --> Session
+    Adm --> Gate
+    Adm --> Session
     CP --> Tenant
     CP --> Session
-    Place --> Session
-    Session --> Metrics --> HTTP
-    Audit --> HTTP
+    CP --> Gate
+    Session --> Metrics --> Ops
+    Audit --> Ops
 ```
 
 - **Edge** terminates TLS 1.3 (mTLS, SNI/ALPN) and ALPN-demuxes into protocol codecs.
 - **Session processor** unifies CONNECT lifecycle, epoch fencing, dedupe lookup, QoS state machines, and proposal emission across all three protocols.
 - **Topic engine** handles subscription matching (MQTT wildcards, Kafka partitions, AMQP bindings), shared-subscription distribution, and cross-PRG forward emission with `forward_seq` idempotence.
-- **Consensus** is Clustor's stock pipeline: Raft batching → WAL (per-entry or group fsync controlled by `wal`'s `fsync_mode` param) → durability ledger quorum → commit tracker → apply pipeline. Quantum's `session_processor` is the apply callback.
+- **Consensus** is Clustor's stock pipeline: `consensus` batches proposals, appends to `durability` (per-entry or group fsync controlled by its `fsync_mode` param), fuses the quorum durability proof into a commit horizon, and delivers ordered applies. Quantum's `session_processor` is the apply callback.
 - **Ops** modules run on the cooperative core: CP polling, tenant policy enforcement, DR orchestration, audit signing, dimensional metric rollup, HTTP surface.
 
-The full module reference, alignment rationale, and YAML graph live in [docs/native_fluxor.md](docs/native_fluxor.md).
+The full module reference and message graph live in [docs/architecture.md](docs/architecture.md); the canonical wireable graph is in [configs/](configs/).
 
 ---
 
@@ -173,12 +157,12 @@ git commit -m "Bump fluxor / clustor"
 ## Build
 
 ```sh
-fluxor modules build --target bcm2712 --out target
+fluxor modules build --target bcm2712
 ```
 
-`--target cm5` and `--target bcm2712` are the supported
-aarch64-unknown-none targets (`--all` builds both). Compiled
-artefacts land in `target/fluxor/<TARGET>/modules/*.fmod`.
+`--target bcm2712` is the sole supported aarch64-unknown-none
+module target (silicon token; `--all` builds it too). Compiled
+artefacts land in `target/fluxor/<silicon>/modules/*.fmod`.
 
 The Makefile is the lifecycle only (`make help` lists it); everything
 else is the `fluxor` CLI or a script invoked directly:
@@ -186,13 +170,11 @@ else is the `fluxor` CLI or a script invoked directly:
 | Command | Purpose |
 |---|---|
 | `fluxor modules build --target … --out target` | Build Quantum's 19 `.fmod` artifacts |
-| `fluxor modules build --all --out target` | Build for every supported target (cm5 + bcm2712) |
+| `fluxor modules build --all --out target` | Build for every supported target (bcm2712) |
 | `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
 | `tests/integration/module_graph_mqtt.sh` | E2E: spin up the graph, run MQTT/AMQP/Kafka smoke against it |
 | `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
 | `fluxor validate configs/quantum-*.yaml` | Validate the shipped graph YAMLs against current module manifests |
-| `tools/spec-lint.sh` | Run clustor spec lint against consensus core manifest |
-
 ---
 
 ## Run
@@ -202,10 +184,10 @@ Graph configs live under [configs/](configs/):
 | Config | Topology |
 |---|---|
 | `quantum-linux-minimal.yaml` | 24-module MQTT-only single-node graph (smallest smoke target) |
-| `quantum-linux.yaml` | Full 42-module single-node graph |
+| `quantum-linux.yaml` | Full 14-module single-node graph |
 | `quantum-linux-2p.yaml` | 2-partition WAL test config |
 | `quantum-node0.yaml` / `node1.yaml` / `node2.yaml` | 3-node Raft cluster |
-| `quantum-cm5.yaml` | Production CM5 4-core layout |
+| `quantum-pi5.yaml` | Production Pi 5 4-core layout |
 
 Launch the runtime:
 
@@ -276,7 +258,7 @@ sudo systemctl edit quantum
 
 ```ini
 [Service]
-Environment=QUANTUM_CONFIG=/etc/quantum/quantum-cm5.yaml
+Environment=QUANTUM_CONFIG=/etc/quantum/quantum-pi5.yaml
 ```
 
 See [docs/guides/deployment.md](docs/guides/deployment.md) for the full deployment guide and [docs/guides/high_availability.md](docs/guides/high_availability.md) for rolling-restart and load-balancer integration.
@@ -287,15 +269,15 @@ See [docs/guides/deployment.md](docs/guides/deployment.md) for the full deployme
 
 | Path | Type | Description |
 |---|---|---|
-| `modules/` | Module source | 19 Quantum `.fmod` source trees (one per module, each with `mod.rs` + optional `manifest.toml`) plus `modules/common/` (helpers shared across modules and exposed as the `quantum-common` crate via the `crates/quantum-common/common` symlink) |
+| `modules/` | Module source | Quantum `.fmod` source trees (one per module, each with `mod.rs` + optional `manifest.toml`) plus `modules/common/` (helpers shared across modules and exposed as the `quantum-common` crate via the `crates/quantum-common/common` symlink) |
 | `crates/quantum-common/` | Cargo crate | Host-consumable façade over `modules/common/*.rs`, depended on by downstream consumers of quantum |
 | `configs/` | Graph YAML | Fluxor graph definitions for every supported deployment topology |
 | `fluxor.toml` + `fluxor.lock` | Project manifest + lockfile | `[project]`, `[dependencies] fluxor / clustor`, `[ci]`, `[required]`. Lockfile records the SHA-256-hashed resolution against the local registry. |
-| `.fluxor-rig.toml` | Rig build recipe | `[build.cm5]` orchestrates firmware + module + kernel-image construction for `fluxor rig test` against `tests/hardware/` scenarios |
+| `.fluxor-rig.toml` | Rig build recipe | `[build.pi5]` orchestrates firmware + module + kernel-image construction for `fluxor rig test` against `tests/hardware/` scenarios |
 | `ops/scripts/` | Operator tooling | `install.sh` (systemd install), `chaos.sh` (fault injection) |
 | `ops/systemd/` | Unit files | `quantum.service` |
 | `tests/integration/` | E2E drivers | Bash + stdlib-Python scripts: smoke, multi-node, pubsub, QoS-1, WAL durability, load, multi-protocol |
-| `tests/hardware/` | Rig scenarios | `fluxor rig test` configs (e.g. `quantum_cm5_boot.toml`) |
+| `tests/hardware/` | Rig scenarios | `fluxor rig test` configs (e.g. `quantum_pi5_boot.toml`) |
 | `docs/` | Documentation | Architecture spec, deployment, HA, runbooks, CLI, interop |
 | `wire/` | Wire schemas | `mqtt.json`, `amqp.json`, `kafka.json`, `catalog.json` |
 | `telemetry/` | Assets | Telemetry catalog |
@@ -311,7 +293,7 @@ A Cargo workspace at the repo root carries the lint baseline and the host-side t
 Start here:
 
 - **[docs/overview.md](docs/overview.md)** — entry point into the documentation set with conventions and pointers.
-- **[docs/native_fluxor.md](docs/native_fluxor.md)** — module alignment analysis (why 42 modules) plus the complete YAML graph and wiring.
+- **[docs/architecture.md](docs/architecture.md)** — the structural reference: layers, execution domains, module reference, message graph, and durability cascade.
 
 Architecture (normative — what the modules contract to do):
 

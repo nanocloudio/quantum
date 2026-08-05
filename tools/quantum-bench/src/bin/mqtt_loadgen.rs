@@ -1,7 +1,7 @@
 //! `quantum-mqtt-loadgen` — off-DUT open-loop MQTT load generator.
 //!
 //! Drives the broker over the real MQTT codec path (plaintext TCP today; TLS
-//! is a follow-up for the CM5 ingress). One TCP connection per shard, each
+//! is a follow-up for the Pi 5 ingress). One TCP connection per shard, each
 //! issuing a fixed-interval (Poisson-free) arrival stream at its share of the
 //! offered rate, with its own latency histogram merged at the end.
 //!

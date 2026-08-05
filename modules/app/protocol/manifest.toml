@@ -1,0 +1,97 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# protocol — client protocol classification, wire codecs and response
+# multiplexing as one composite module (standards fluxor-modules.md §8).
+#
+# Components: router (per-connection classification from the first
+# bytes, pinned for the connection's lifetime), mqtt (3.1 / 3.1.1 / 5.0),
+# kafka (binary protocol), amqp (0-9-1).
+#
+# The MQTT-over-QUIC graph selects the `mqtt` variant behind the
+# standalone `mqtt_quic_adapter`, which bridges the QUIC transport to the
+# same `raw_in` / `frames_out` framing the TCP path uses.
+#
+# These components genuinely interact: the router names the protocol
+# that owns each inbound record and the dispatch table hands the record
+# to that codec's `on_frame`, so a client's first byte reaches its codec
+# in the same step rather than a tick later. Response multiplexing is
+# structural — every codec encodes onto the same `frames_out` handle.
+
+permissions = []
+
+[[variant]]
+name = "full"
+features = ["mqtt", "kafka", "amqp"]
+default = true
+
+[[variant]]
+name = "mqtt"
+features = ["mqtt"]
+
+[[variant]]
+name = "kafka"
+features = ["kafka"]
+
+[[variant]]
+name = "amqp"
+features = ["amqp"]
+
+# ── inputs ───────────────────────────────────────────────────
+
+# Cleartext client records from peer_router, framed as MSG_CLIENT_FRAME
+# `[conn_id][tcp chunk]`, plus MSG_CONN_CLOSED notices.
+[[ports]]
+name = "raw_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Session responses, shared by every codec and filtered on the PROTO_*
+# tag each one stamps — the same demux the separate edges relied on.
+[[ports]]
+name = "responses_in"
+direction = "input"
+content_type = "OctetStream"
+
+# ── outputs ──────────────────────────────────────────────────
+
+# Decoded proposals to the session state machine, PROTO_*-tagged.
+[[ports]]
+name = "proposals_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Encoded client frames back to the transport. Every codec shares this
+# handle; ordering across protocols is not meaningful because each frame
+# is addressed to exactly one connection.
+[[ports]]
+name = "frames_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Records classified as HTTP, forwarded verbatim to the admin surface.
+[[ports]]
+name = "http_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Component-tagged samples under the dimensional metric envelope
+# `[dim_flag=1][tenant:u32][protocol:u8][prg:u16][metric_id][payload]`,
+# where metric_id is 0x21=router, 0x22=mqtt, 0x23=kafka, 0x24=amqp, so
+# the aggregator keys per component instead of by payload hash
+# (§8 rule 8). One frame per component per 10s rollup window.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Per component: router (per-protocol classification counts,
+# unclassified), and each codec's decode/encode/error counters.
+metrics = [
+    "classified_mqtt", "classified_kafka", "classified_amqp",
+    "classified_http", "unclassified",
+    "packets_decoded", "packets_encoded", "parse_errors",
+]

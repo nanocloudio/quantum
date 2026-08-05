@@ -1,8 +1,8 @@
 # Kafka Adapter
 
-The Kafka adapter (`kafka_codec` + the Kafka path through
-`session_processor`, `topic_engine`, `consumer_group_coordinator`,
-`transaction_coordinator`) implements the Kafka binary protocol
+The Kafka adapter (`protocol`'s kafka component + the Kafka path through
+`session_processor` and `topic_engine`) implements the Kafka binary
+protocol
 against Quantum's unified PRG substrate. Common entities and
 invariants live in [messaging_model.md](messaging_model.md); the
 partition model lives in [partitioning.md](partitioning.md).
@@ -10,7 +10,7 @@ partition model lives in [partitioning.md](partitioning.md).
 ## Connection and authentication
 
 - Kafka clients open one TCP connection per broker; Quantum's
-  `protocol_router` ALPN-demuxes the stream into `kafka_codec`.
+  `protocol`'s router component ALPN-demuxes the stream into `protocol`'s kafka component.
 - SASL identities (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) map to
   CP-Raft principals as optional additives to mTLS. mTLS is the
   primary auth surface; SASL provides per-app identity within the
@@ -53,35 +53,33 @@ Producers that need lower latency should reduce `linger.ms` and
 ### Idempotent producers
 
 Idempotent producers carry a producer ID + epoch + sequence number.
-Quantum tracks these via the same `dedup_engine` infrastructure that
+Quantum tracks these via the same dedup infrastructure that
 backs MQTT QoS 2:
 
 - Per-`(producer_id, partition)` sequence numbers detect and reject duplicates.
 - Producer epoch fencing (Kafka `INVALID_PRODUCER_EPOCH`) follows the same `session_epoch` mechanism as MQTT.
 - The dedupe window expires after `dedupe_ttl_default_ms` (72h default).
 
-### Transactions
+### Transactions — not implemented
 
-`transaction_coordinator` implements two-phase commit:
+Quantum answers `InitProducerId` so idempotent producers complete
+their handshake and connect, but it issues a producer id without
+enforcing sequence-number dedupe
+([protocol/kafka.rs](../../modules/app/protocol/kafka.rs)
+`API_INIT_PRODUCER_ID`). Retries are therefore **at-least-once, not
+exactly-once**.
 
-1. Producer issues `InitProducerId` to claim a transactional ID;
-   CP-Raft validates.
-2. `BeginTxn` writes a transaction marker to the WAL.
-3. Produce requests during the transaction accumulate as uncommitted
-   records, persisted with the transaction ID.
-4. `EndTxn{commit}` waits for `wal_committed_index` to advance past
-   all involved partitions before writing the commit marker.
-   Consumers with `isolation.level=read_committed` see records only
-   after the commit marker.
-5. `EndTxn{abort}` writes an abort marker; uncommitted records are
-   skipped by `read_committed` consumers and GC'd on compaction.
-
-Transactional read-write workloads (consume-transform-produce)
-inherit the same atomicity guarantees.
+There is no transactional path: `BeginTxn` / `EndTxn` are not served,
+no transaction markers are written to the WAL, and
+`isolation.level=read_committed` is not honoured. Producers must not
+be configured with a `transactional.id`. Transactional
+consume-transform-produce is future work.
 
 ## Consumer groups and offsets
 
-`consumer_group_coordinator` handles group lifecycle:
+`session_processor` serves the group lifecycle APIs (`JoinGroup`,
+`SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`,
+`OffsetFetch`) against its own group and offset tables:
 
 | Timer | Default |
 |---|---|
@@ -97,7 +95,7 @@ relinquish moved partitions, avoiding stop-the-world consumption
 pauses.
 
 Fetch sessions enforce tenant quotas via `ThrottleEnvelope`,
-translated by `backpressure_propagator` into Kafka's native
+translated by `flow`'s backpressure component into Kafka's native
 `throttle_time_ms` field.
 
 ## Retention and catch-up
@@ -109,7 +107,7 @@ translated by `backpressure_propagator` into Kafka's native
 | Log compaction | Per-topic key-based compaction — the last value per key is retained; suitable for changelog topics. |
 
 Catch-up reads from snapshots + WAL via Clustor's standard
-`read_gate`-permitted path. There is no separate "log offset"
+`admission`-permitted read path. There is no separate "log offset"
 storage — offsets are WAL indexes interpreted through the topic's
 view of the WAL.
 

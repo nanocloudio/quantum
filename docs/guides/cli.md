@@ -1,14 +1,12 @@
 # Quantum CLI Surface
 
-There is no `quantum` binary. The fluxor-native build ships a graph of `.fmod` modules that the `fluxor` and `fluxor-linux` binaries load and execute. Operator and diagnostic workflows are split across:
+There is no `quantum` binary. Quantum ships a graph of `.fmod` modules that the `fluxor` and `fluxor-linux` binaries load and execute. Operator and diagnostic workflows are split across:
 
 1. **`fluxor` tool** — graph validation, build, launch.
 2. **`systemctl` + the bundled systemd unit** — managed runtime lifecycle.
-3. **`make` targets in this repo** — convenience wrappers for build, validate, lint, and E2E test.
+3. **`make` targets in this repo** — the build/test/lint/ci lifecycle plus `make test-mqtt-suite`.
 4. **Scripts under `ops/scripts/` and `tests/integration/`** — chaos drivers and smoke harnesses.
 5. **Standard MQTT clients** (`mosquitto_pub` / `mosquitto_sub` / Paho) for protocol interop.
-
-The old `quantum subscribe` / `quantum publish` / `quantum init` / `quantum inspect` etc. subcommands were removed when the Rust binary went away. The sections below document what replaced them.
 
 ---
 
@@ -19,7 +17,7 @@ The old `quantum subscribe` / `quantum publish` / `quantum init` / `quantum insp
 ```sh
 fluxor validate configs/quantum-*.yaml
 # or, for a single config:
-$FLUXOR_ROOT/target/aarch64-unknown-linux-gnu/release/fluxor validate configs/quantum-linux.yaml
+fluxor validate configs/quantum-linux.yaml
 ```
 
 Checks the YAML against current module manifests: domain assignments, port connectivity, arena sizing, scheduler tier compatibility, and `MAX_MODULES` / `MAX_GRAPH_EDGES` budgets.
@@ -27,8 +25,8 @@ Checks the YAML against current module manifests: domain assignments, port conne
 ### Build the binary blobs without running
 
 ```sh
-$FLUXOR_TOOL build configs/quantum-node0.yaml
-# emits target/linux/quantum-node0/config.bin and modules.bin under the fluxor checkout
+fluxor build configs/quantum-node0.yaml
+# emits the config + modules wire blobs under target/
 ```
 
 Useful for CI / packaging — pre-builds the wire blobs that `fluxor run` would otherwise generate on launch.
@@ -36,7 +34,7 @@ Useful for CI / packaging — pre-builds the wire blobs that `fluxor run` would 
 ### Launch the runtime
 
 ```sh
-$FLUXOR_TOOL run configs/quantum-linux-minimal.yaml
+fluxor run configs/quantum-linux-minimal.yaml
 ```
 
 `fluxor run` is the operator entry point: validate → build blobs → exec `fluxor-linux <config.bin> <modules.bin>`. The runtime stays in the foreground; logs go to stdout/stderr.
@@ -57,11 +55,11 @@ Swap graph configs by editing the systemd unit's `Environment=QUANTUM_CONFIG=...
 
 ## Smoke and diagnostic harnesses
 
-These live in [tests/integration/](../tests/integration/) and require a built graph (`fluxor modules build --target … --out target` here; `make modules TARGET=…` in `clustor`).
+These live in [tests/integration/](../../tests/integration/) and require a built graph (`fluxor modules build --target … --out target` here; `make modules TARGET=…` in `clustor`).
 
 | Script | What it does |
 |---|---|
-| `runtime_smoke.sh` | Launches the minimal graph in the background, verifies all 24 modules loaded, waits for Raft leader election, sends a probe MQTT 3.1.1 CONNECT, asserts CONNACK. Exit 0 = pass. |
+| `runtime_smoke.sh` | Launches the minimal graph in the background, verifies every module loaded, waits for Raft leader election, sends a probe MQTT 3.1.1 CONNECT, asserts CONNACK. Exit 0 = pass. |
 | `multi_node.sh` | Pre-builds 3 node configs, spawns 3 `fluxor-linux` processes in separate working directories, asserts leader election + log replication across all three. |
 | `module_graph_mqtt.sh` | Multi-protocol E2E: MQTT/AMQP/Kafka byte-for-byte handshake assertions against the running graph. First leg of `make test-mqtt-suite`. |
 | `module_graph_load.sh` | Sustained QoS-1 load (`CLIENTS=2 MSGS_PER_CLIENT=10` default) asserting every PUBACK returns. Also runs inside `make test-mqtt-suite`. |
@@ -75,7 +73,7 @@ All Python harnesses speak just enough MQTT 3.1.1 on a raw TCP socket — no `pa
 
 ## Chaos / fault injection
 
-[ops/scripts/chaos.sh](../ops/scripts/chaos.sh) drives the running broker with parameterised load patterns:
+[ops/scripts/chaos.sh](../../ops/scripts/chaos.sh) drives the running broker with parameterised load patterns:
 
 ```sh
 ./ops/scripts/chaos.sh connect-storm N=500           # 500 concurrent MQTT CONNECTs
@@ -119,26 +117,9 @@ script invoked directly:
 | Command | Purpose |
 |---|---|
 | `fluxor modules build --target bcm2712 --out target` | Build all Quantum `.fmod` artifacts |
-| `fluxor modules build --all --out target` | Build for every supported target (cm5 + bcm2712) |
+| `fluxor modules build --all --out target` | Build for every supported target (bcm2712) |
 | `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
 | `tests/integration/module_graph_mqtt.sh` | Multi-protocol E2E against a running graph |
 | `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
 | `fluxor validate configs/quantum-*.yaml` | Validate every shipped graph YAML |
-| `tools/spec-lint.sh` | Run Clustor's `spec_lint` against the consensus core manifest |
 | `make help` | Print the lifecycle plus the CLI commands/scripts that are deliberately not targets |
-
----
-
-## What the old subcommands map to
-
-| Removed subcommand | Replacement |
-|---|---|
-| `quantum start` | `fluxor run configs/<config>.yaml` or `systemctl start quantum` |
-| `quantum subscribe` | `mosquitto_sub` / `tests/integration/pubsub_test.py` |
-| `quantum publish` | `mosquitto_pub` / `tests/integration/qos1_test.py` / `ops/scripts/chaos.sh publish-burst` |
-| `quantum init` (fixture seeding) | Not currently wired in the fluxor-native build — see [dev_seeding.md](dev_seeding.md) |
-| `quantum inspect` (WAL) | Inspect `data/raft/` and `data/prg_*/` directly; WAL frame layout is in Clustor's `wal` module |
-| `quantum snapshot` | `snapshot_engine` exposes triggers via `http_surface`'s `/admin` endpoint |
-| `quantum chaos` | `ops/scripts/chaos.sh` |
-| `quantum telemetry` | Scrape `/metrics` on `http_surface` (default port from graph YAML) |
-| `quantum simulator` / `synthetic` | Not currently wired; use chaos harness + custom drivers |

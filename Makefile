@@ -46,7 +46,6 @@ help:
 	@echo "  tests/integration/module_graph_mqtt_quic.sh      MQTT over QUIC (UDP 4443; skips w/o aioquic)"
 	@echo "  tests/integration/module_graph_kafka.sh          Kafka ApiVersions handshake"
 	@echo "  tests/integration/multi_node.sh                  3-node raft cluster (ports 9090-9092)"
-	@echo "  tools/spec-lint.sh                               clustor spec lint (needs ../clustor)"
 	@echo "One-time setup: cargo install --locked --path ../fluxor/tools"
 
 build:

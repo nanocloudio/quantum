@@ -1,7 +1,7 @@
 //! Forward Coordinator — Cross-PRG forwarding with idempotence.
 //!
 //! Tracks (ingress_prg, egress_prg, routing_epoch) → monotone forward_seq.
-//! Same-node forwards emit proposals directly to raft_engine.
+//! Same-node forwards emit proposals directly to consensus.
 //! Cross-node forwards emit routed envelopes to peer_router.
 
 #![no_std]
@@ -23,10 +23,18 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/wire.rs"]
 mod wire;
+
+/// Kernel step ABI: 0=Continue, 1=Done, 2=Burst, 3=Ready. Returning
+/// Burst re-runs the domain's exec rotation within the same tick (up to
+/// the kernel's pass cap), so a record consumed here reaches its
+/// consumer in this tick instead of the next. We burst only when a
+/// record was actually consumed: an idle graph reports no burst and the
+/// tick costs exactly one pass, as before.
+const STEP_BURST: i32 = 2;
 
 const MAX_FORWARDS: usize = 1024;
 const MAX_ROUTES: usize = 256;
@@ -74,9 +82,9 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_forward: i32,
     in_replay: i32,       // in[1]: WAL replay entries for forward_seq reconstruction
-    out_local: i32,      // to raft_engine (same-node)
+    out_local: i32,      // to consensus (same-node)
     out_remote: i32,     // to peer_router (cross-node)
-    out_wal_marker: i32, // to raft_engine for persisting forward state
+    out_wal_marker: i32, // to consensus for persisting forward state
     out_metrics: i32,
 
     timeout_ms: u32,
@@ -160,6 +168,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        let mut worked = 0u32;
         let now = dev_millis(sys);
 
         // Replay phase: reconstruct forward_seq counters from WAL replay entries.
@@ -168,7 +177,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             loop {
                 let poll = (sys.channel_poll)(s.in_replay, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (_, plen) = wire::channel_read_msg(sys, s.in_replay, &mut s.buf);
+                let (_, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_replay, &mut s.buf) };
                 if plen < 16 { continue; }
                 let ingress = u16::from_le_bytes([s.buf[0], s.buf[1]]);
                 let egress = u16::from_le_bytes([s.buf[2], s.buf[3]]);
@@ -187,7 +196,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_forward, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (_, plen) = wire::channel_read_msg(sys, s.in_forward, &mut s.buf);
+                let (_, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_forward, &mut s.buf) };
                 if plen < 8 { continue; }
                 let plen = plen as usize;
 
@@ -280,6 +289,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        if worked > 0 { STEP_BURST } else { 0 }
     }
 }

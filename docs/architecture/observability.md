@@ -1,18 +1,20 @@
 # Observability
 
 Quantum's observability surface: metrics, traces, and audit. Three
-modules produce the bulk of operator-visible output — `telemetry_agg`
-(substrate metrics), `metrics_aggregator` (high-cardinality
-application metrics), and `audit_logger` (signed compliance events)
-— all surfaced through `http_surface`.
+modules produce the bulk of operator-visible output — `operations`
+(substrate metrics), `governance`'s telemetry component (high-cardinality
+application metrics), and `governance`'s audit component (signed compliance events)
+— all surfaced through `gateway`.
 
 The metric model deliberately splits "fan-in count" from "dimensional
 aggregation". Substrate counters are low-cardinality and
 high-frequency; application metrics are high-cardinality and
 slower-changing; audit is structured tamper-evident logging with a
-different consumer entirely. Conflating them produces a single module
-whose state arena is hard to size and whose retention policy is
-impossible to set correctly.
+different consumer entirely. These stay separate concerns with separate
+state and separate retention: `governance`'s telemetry and audit
+components each own their table and their own bound, and neither can
+reach into the other's. Co-locating them in one module shares a
+scheduler entity, not an arena or a retention policy.
 
 ## Metrics
 
@@ -20,12 +22,12 @@ impossible to set correctly.
 
 | Source | Cardinality | Tick rate | Surfaces on |
 |---|---|---|---|
-| `telemetry_agg` (Clustor substrate) | Low (Raft state, WAL throughput, replicator lag, fsync time) | 1s | `/metrics` directly |
-| `metrics_aggregator` (Quantum) | High (per-tenant × per-protocol × per-PRG) | 10s rollup default | Forwarded to `telemetry_agg` for export |
-| `backpressure_propagator` (Quantum) | Per-protocol counters + queue-depth gauges | Real-time | Streamed via `telemetry_agg` |
+| `operations` (Clustor substrate) | Low (Raft state, WAL throughput, replication lag, fsync time) | 1s | `/metrics` directly |
+| `governance`'s telemetry component (Quantum) | High (per-tenant × per-protocol × per-PRG) | 10s rollup default | Forwarded to `operations` for export |
+| `flow`'s backpressure component (Quantum) | Per-protocol counters + queue-depth gauges | Real-time | Streamed via `operations` |
 
 The aggregator-then-export pattern keeps cardinality explosion
-contained: per-dimension storm guards in `metrics_aggregator` cap the
+contained: per-dimension storm guards in `governance`'s telemetry component cap the
 number of unique label combinations exposed per export window, so a
 misconfigured client cannot blow up the metric registry.
 
@@ -37,13 +39,13 @@ misconfigured client cannot blow up the metric registry.
 | `clustor_raft_commit_index` | gauge | Latest committed WAL index per PRG. |
 | `clustor_wal_fsync_seconds` | histogram | Per-fsync duration. |
 | `clustor_apply_lag_seconds` | gauge | Apply lag vs. commit. |
-| `clustor_replicator_lag_bytes` | gauge | Replicator behind leader in bytes. |
-| `clustor_replicator_lag_entries` | gauge | Replicator behind in WAL entries. |
+| `clustor_replication_lag_bytes` | gauge | Follower behind leader in bytes. |
+| `clustor_replication_lag_entries` | gauge | Follower behind in WAL entries. |
 | `clustor_cp_cache_state` | gauge | 0=Fresh, 1=Cached, 2=Stale, 3=Expired. |
 | `clustor_cp_cache_age_ms` | gauge | Age of cached CP manifest. |
 | `clustor_durability_proof_lag_seconds` | gauge | Time from quorum durable to proof emit. |
 
-These are emitted by `telemetry_agg` at 1Hz with no per-tenant
+These are emitted by `operations` at 1Hz with no per-tenant
 dimension; cardinality is bounded by node count × PRG count per node.
 
 ### Application metrics (high-cardinality)
@@ -66,7 +68,7 @@ Dimensioned by `(tenant, protocol, prg)` where applicable:
 | `quantum_quota_exceeded_total` | counter | Per-tenant quota violations. |
 
 Cardinality budget: `cardinality_limit = 100 000` default. Beyond
-that, `metrics_aggregator` aggregates excess dimensions into an
+that, `governance`'s telemetry component aggregates excess dimensions into an
 `__overflow__` bucket and emits a warning event.
 
 ### Operator queries
@@ -75,10 +77,70 @@ that, `metrics_aggregator` aggregates excess dimensions into an
 |---|---|
 | Is the broker accepting new connections? | `quantum_active_sessions` rate; `/readyz` |
 | Are publishes acknowledged? | `quantum_publish_latency_seconds` p99; `quantum_backpressure_signal_total` rate |
-| Is consensus healthy? | `clustor_raft_term` stability; `clustor_replicator_lag_bytes` headroom |
+| Is consensus healthy? | `clustor_raft_term` stability; `clustor_replication_lag_bytes` headroom |
 | Are we durable? | `clustor_durability_proof_lag_seconds` near zero |
 | Is one tenant hot? | `quantum_publish_total` by tenant; `quantum_quota_exceeded_total` by tenant |
 | Is CP stale? | `clustor_cp_cache_state == Fresh`; `clustor_cp_cache_age_ms` < `refresh_fresh_ms` |
+
+## Export id-table budget
+
+`fluxor validate` warns that the OTLP id-table exceeds its cap on the
+larger graphs:
+
+```
+warning: observability id-table is 2696 bytes (> 2048 cap); names beyond
+the 2030-byte boundary won't resolve in otlp_http
+```
+
+The table is built by the config tool as one `module_idx:instrument_id=name;`
+entry per declared instrument across every module in the graph, and the
+`otlp_http` exporter parses it into a fixed `IDTABLE_MAX = 2048` buffer.
+Past that boundary an instrument still *emits* — the sample carries a
+numeric `(module, id)` pair and is exported — but it resolves to no name
+on the collector side. So the failure is silent and cosmetic-looking,
+and it lands on whichever modules sort last by graph index.
+
+Attribution for `quantum-pi5.yaml` (2626 B by this accounting; the tool
+reports 2696 B including instruments this table omits):
+
+| module | instruments | bytes |
+|---|---:|---:|
+| `consensus` (substrate) | 32 | 616 |
+| `operations` (substrate) | 21 | 430 |
+| `durability` (substrate) | 18 | 372 |
+| `governance` | 10 | 211 |
+| `flow` | 10 | 169 |
+| `protocol` | 8 | 155 |
+| `messaging` | 11 | 144 |
+| `topic_engine` | 6 | 114 |
+| `forward_coordinator` | 6 | 105 |
+| `session_processor` | 6 | 98 |
+| everything else | 11 | 212 |
+
+**The three Clustor substrate modules are 54% of the table.** Quantum's
+own application modules total 679 B, and their declared lists match what
+the code emits — there is no padding to trim. Deleting every Quantum
+application instrument would barely clear the 578 B overflow, at the
+cost of the entire application-metrics surface.
+
+So this is not a Quantum-side problem to fix by trimming. The options,
+in order of preference:
+
+1. **Raise `IDTABLE_MAX`** in fluxor
+   (`tools/src/config/builder.rs`, and the matching exporter buffer).
+   The graph has outgrown a 2 KiB table; 4 KiB restores headroom for
+   both the substrate and the application tier. This is a Fluxor change
+   and is the right one.
+2. **Shorten instrument names.** Entry overhead is ~5 B plus the name,
+   so the ~39 Quantum instruments at ~12 characters average would save
+   roughly 150 B if cut to 8. Not enough alone, and it degrades
+   readability at the collector.
+3. **Drop instruments.** Only worth considering for the substrate,
+   which is where the bytes are — and that is a Clustor decision.
+
+Until (1) lands, treat any missing metric *name* at the collector on a
+large graph as this cap rather than a broken emitter: check whether the
+instrument's module sorts late in the graph's module list.
 
 ## Tracing
 
@@ -98,10 +160,9 @@ cross-node operations carry the originating trace context.
 
 ## Audit
 
-`audit_logger` is structurally distinct from metrics — different
+`governance`'s audit component is structurally distinct from metrics — different
 consumers, different retention, different correctness requirements —
-and lives in its own module for that reason (see the alignment
-analysis in [native_fluxor.md](../native_fluxor.md)).
+and lives in its own module for that reason.
 
 ### Event classes
 
@@ -146,13 +207,13 @@ parsing free text.
 
 Every observability module has a storm guard:
 
-- `telemetry_agg.incident_storm_guard = 50` — caps incident-related
+- `operations.incident_storm_guard = 50` — caps incident-related
   metric emissions per export window so a single misbehaving module
   cannot saturate the export channel.
-- `metrics_aggregator.per_dimension_storm_guard = 50` — same idea,
+- `governance` telemetry's `per_dimension_storm_guard = 50` — same idea,
   applied per-dimension to prevent one tenant from monopolising the
   cardinality budget.
-- `audit_logger` rate-limits per event class with overflow events
+- `governance`'s audit component rate-limits per event class with overflow events
   when limits are hit; an "audit lost" warning is itself audited.
 
 These exist because observability surfaces are the most common source
@@ -164,7 +225,7 @@ guards trade fidelity for safety under pathological conditions.
 
 - `/metrics` — Prometheus exposition. Default port `9100`; scrape interval 15s recommended.
 - `/why` — Polled by operator dashboards; not by load balancers.
-- `/admin` audit replay — `admin_handler` exposes a windowed audit query (signed-only, no mutation).
+- `/admin` audit replay — `operations` exposes a windowed audit query (signed-only, no mutation).
 - OpenTelemetry traces — forwarded to whatever OTLP collector the deployment configures; standard span format.
 
 The validation workflow that exercises these surfaces under load

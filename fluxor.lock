@@ -147,11 +147,11 @@ source = "fmod/fluxor/bcm2712/gesture/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "http"
+name = "http_edge"
 target = "bcm2712"
 version = "2.0.0"
-hash = "sha256:c149e41768d995d67cb4b5bf56f4a02d8c2aa0f94baf7a463800f57eef532376"
-source = "fmod/fluxor/bcm2712/http/2.0.0.fmod"
+hash = "sha256:967b620936d92e4848f2d422d2309514b6f4b021ff32231531afb9c442dc56f3"
+source = "fmod/fluxor/bcm2712/http_edge/2.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -408,14 +408,6 @@ target = "bcm2712"
 version = "1.0.0"
 hash = "sha256:5e8d7ee8d1e7f2e8b7aac6d93b9f0dc0f1dd03af4747716df203fff7bb7675a1"
 source = "fmod/fluxor/bcm2712/virtio_net/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "ws_stream"
-target = "bcm2712"
-version = "1.0.0"
-hash = "sha256:25181e4b4676724c4494d161ba8d991687503379418b66ec00858668e7b132b6"
-source = "fmod/fluxor/bcm2712/ws_stream/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -715,14 +707,6 @@ source = "fmod/fluxor/rp2350/gt911/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "http"
-target = "rp2350"
-version = "2.0.0"
-hash = "sha256:23fb5233e69722a8d1579683df27b8cf6a3b86428c6a9e06f118425737e602ed"
-source = "fmod/fluxor/rp2350/http/2.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "i2c_dw"
 target = "rp2350"
 version = "1.0.0"
@@ -923,14 +907,6 @@ source = "fmod/fluxor/rp2350/remote_channel/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "rtp"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:ffe98767c1f9910c243a6449d5cdbc2ac680092c290c5b29fb1c1d41b77d476f"
-source = "fmod/fluxor/rp2350/rtp/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "rules"
 target = "rp2350"
 version = "1.0.0"
@@ -1043,14 +1019,6 @@ source = "fmod/fluxor/rp2350/wifi/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "ws_stream"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:56ae3d58080a486aee7374a2fdb651afc72d054739fcfafd4e647943bb38e4e6"
-source = "fmod/fluxor/rp2350/ws_stream/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "bank"
 target = "wasm"
 version = "2.0.0"
@@ -1104,14 +1072,6 @@ target = "wasm"
 version = "1.0.0"
 hash = "sha256:6824ecc9d8f7144fcbcadd38fab06e302faf0053014bc90b6e654e98eff3814e"
 source = "fmod/fluxor/wasm/remote_channel/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "ws_stream"
-target = "wasm"
-version = "1.0.0"
-hash = "sha256:1b58319f339aebe06dcc78facfd13e9820def8dba7fea54d811379e15066706a"
-source = "fmod/fluxor/wasm/ws_stream/1.0.0.fmod"
 
 [[runtime]]
 project = "fluxor"

@@ -1,0 +1,309 @@
+# Quantum: LINUX multi-domain Kafka bench — local proxy for the Pi 5
+# graph (same domains + cross_core edges) so the multi-domain path can
+# be tested with fast local iteration instead of slow rig power-cycles.
+# Derived from quantum-pi5-kafka-bench.yaml (linux_net, localhost).
+#
+# Quantum: Pi 5 Kafka produce bench (rig DUT at 192.168.1.9, port 9092).
+#
+# LEAN graph: the produce-path module set from quantum-linux-minimal.yaml
+# (20 modules) mapped onto the Pi 5 4-domain layout. The full 26-module
+# production graph exceeds the kernel's MAX_GRAPH_EDGES=128 budget once
+# tee/merge expansion runs ("channel limit for tee" at prepare_graph), so
+# a bench derived from it cannot boot; this graph carries every module the
+# Kafka produce path and its flow control actually touch, and nothing else.
+#
+# Bench deltas vs production intent, all documented per-knob below:
+#   cleartext (no tls), listener on 9092, advertised 192.168.1.9:9092,
+#   durability skip_replay=1 + root_path=1, rig-proven WAL write profile,
+#   1 ms raft proposal batching, rate-classed consensus→durability edge, and the
+#   leader self-durability + replay-complete handshake edges.
+#
+# Drive from the driver host (192.168.1.10):
+#   perf/run_kafka_rig.sh                 # matrix -> perf/results/
+#   quantum-kafka-loadgen --host 192.168.1.9 --port 9092 ...
+
+target: linux
+tick_us: 1000
+
+# Request/response edges + flow-control feedback make this graph
+# inherently cyclic. v1 fluxor accepts cycles when explicitly opted in.
+scheduler:
+  accept_cycles: true
+
+module_search_paths:
+  - ../../clustor/modules/app
+
+platform:
+  net: {}
+
+execution:
+  domains:
+    - name: ops
+      exec_mode: cooperative
+    - name: consensus
+      exec_mode: poll
+    - name: network
+      exec_mode: poll
+    - name: apply
+      # Bring-up: 1000µs (was 250) so the heavy protocol modules
+      # (session_processor's per-second sweep especially) get a step
+      # budget wide enough not to trip the deadline on the Pi 5 core. The
+      # burst deadline is capped at 16×tick, so 250µs allowed at most a
+      # 4ms burst — too tight for the full protocol stack on one core.
+      # Retune down once the graph serves and per-module step costs are
+      # measured on the rig.
+      tick_us: 1000
+      exec_mode: high_rate
+
+modules:
+  # ── Network (poll-mode) ─────────────────────────────────
+  - name: peer_router
+    domain: network
+    params:
+      # Standard Kafka client port; this bench serves Kafka only.
+      listen_port: 9092
+
+  # ── Consensus + persistence (poll-mode) ─────────────────
+  - name: partition_router
+    domain: consensus
+  - name: consensus
+    domain: consensus
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+    params:
+      # 10 ms (default) proposal batching put a hard ~100 batch/s pacing
+      # floor under every durable ack; 1 ms restores latency without
+      # hurting batch amortisation.
+      proposal_batch_timeout_ms: 1
+  - name: durability
+    domain: consensus
+    params:
+      # Rig-proven write profile (lattice bare-metal-pi5). root_path=1 is
+      # load-bearing on FAT32 (no mkdir -> no wal/ parent -> silent
+      # in-memory WAL). skip_replay=1 is bench hygiene: fresh log each
+      # boot so run-over-run replay drift never contaminates comparisons;
+      # OMIT for crash-recovery validation.
+      fsync_mode: 1
+      group_window_ms: 0
+      group_max_pending: 8
+      fence_depth: 8
+      segment_bytes: 4194304
+      root_path: 1
+      skip_replay: 1
+
+  # ── Apply + ingest ──────────────────────────────────────
+  - name: admission
+    domain: apply
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+  - name: gateway
+    domain: apply
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+  - name: protocol
+    domain: apply
+    params:
+      # The address CLIENTS reach the DUT on — sent verbatim in the
+      # Metadata broker list.
+      advertised_host: "127.0.0.1"
+      advertised_port: 9092
+      partitions: 1
+  - name: session_processor
+    domain: apply
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+  - name: flow
+    domain: apply
+  - name: topic_engine
+    domain: apply
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+  # ── Ops ─────────────────────────────────────────────────
+  - name: control_plane
+    domain: ops
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+  - name: operations
+    domain: ops
+    step_deadline_us: 8000
+    step_deadline_burst_us: 16000
+    fault_policy: skip
+  - name: messaging
+    domain: ops
+
+wiring:
+  # Client-path channels enlarged from the 8 KiB default to 64 KiB so
+  # bursts of simultaneous CONNECTs / PUBLISHes don't drop frames at
+  # the linux_net → peer_router → … → protocol hops. The default
+  # is sized for a single steady client; we want concurrent ones.
+  # ── Transport: linux_net ↔ peer_router ──────────────────
+  - from: linux_net.net_out
+    to: peer_router.net_in
+    buffer_bytes: 65536
+  - from: peer_router.net_out
+    to: linux_net.net_in
+    buffer_bytes: 65536
+
+  # ── peer_router → protocol (sole client path) ────
+  - from: peer_router.cleartext
+    to: protocol.raw_in
+    buffer_bytes: 65536
+  - from: peer_router.peer_rx
+    to: consensus.ack
+
+  # ── protocol's router classification → codecs / http ──────
+  - from: protocol.http_out
+    to: operations.request
+
+  # ── Client response mux: codec + http fan-in → peer_router ──
+  - from: protocol.frames_out
+    to: peer_router.client_resp
+    buffer_bytes: 65536
+  - from: operations.response
+    to: peer_router.client_resp
+    buffer_bytes: 65536
+
+  # ── Codec ↔ session_processor (shared codec_in/codec_out) ──
+  - from: protocol.proposals_out
+    to: session_processor.codec_in
+    buffer_bytes: 65536
+  - from: session_processor.codec_out
+    to: protocol.responses_in
+    buffer_bytes: 65536
+
+  # ── session_processor → Raft ────────────────────────────
+  # Untagged path (CONNECT / DISCONNECT) flows through partition_router
+  # so the 5-byte partitioned envelope sees runtime exercise even in
+  # single-partition deployments (num_partitions=1 → partition_id=0).
+  # consensus accepts both the 3-byte (untagged) and 5-byte
+  # (partitioned) wire forms.
+  - from: session_processor.proposals
+    to: partition_router.proposals
+  - from: partition_router.proposals_p0
+    to: consensus.proposals_partitioned
+
+  # Tagged path for QoS 1+ PUBLISH — consensus echoes
+  # MSG_PROPOSAL_ASSIGNED so session_processor can bind correlation_id
+  # → wal_index and register the inflight with `flow`. Bypasses
+  # partition_router because the tagged envelope already carries the
+  # partition id end-to-end.
+  - from: session_processor.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: session_processor.assigned_in
+
+  - from: consensus.net_out
+    to: peer_router.peer_tx
+  - from: consensus.rpc_out
+    to: peer_router.peer_tx
+
+  # ── Persistence ─────────────────────────────────────────
+  - from: consensus.log_append
+    to: durability.entries
+    # Rate-class the durability edge: unclassed (grant=0) pins the WAL
+    # entry-pump to ONE record per step regardless of backlog — see the
+    # matching comment in quantum-linux.yaml.
+    rate: transaction
+  # A restarted replica reads its replayed log bodies back out of the
+  # local WAL: replay restores the log, so log-matching succeeds and the
+  # leader never re-ships those entries. Without this pair the apply path
+  # stalls at the first gap.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  # Boot handoff: Raft resumes at the WAL replay high-water before
+  # intake opens. Without it a warm restart has raft proposing from
+  # index 1 against a WAL replayed to N — the WAL wedges and durable
+  # writes stall within ~MAX_UNCOMMITTED_INFLIGHT entries.
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  # Leader self-durability: raft learns its own WAL flush progress
+  # directly. Without this edge the leader's match/durable advance rides
+  # the ~150 ms heartbeat round instead — measured locally as a flat
+  # ~200 ms floor under every durable produce ack. (Present in
+  # consensus-bench-pi5.yaml; the app graphs had dropped it.)
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  # Cross-node durability acks fan back into the ledger (multi-node
+  # quorum; harmless single-node). Mirrors consensus-bench-pi5.yaml.
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # ── Commit → apply → session_processor ──────────────────
+  - from: consensus.applied
+    to: session_processor.committed_in
+  - from: consensus.committed_entries
+    to: session_processor.committed_in
+
+  # ── Flow composite: ack / backpressure / prefetch ────────
+  - from: durability.quorum_durable
+    to: flow.durability_in
+  - from: session_processor.forward_out
+    to: flow.forward_in
+  - from: flow.ack_out
+    to: session_processor.ack_in
+
+  # ── Admission credits (direct) + flow inputs ────────────
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: admission.credits
+    to: session_processor.flow_in
+  - from: admission.envelope
+    to: flow.envelope_in
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: gateway.rejected
+    to: flow.rejected_in
+  - from: flow.flow_out
+    to: session_processor.flow_in
+
+  # ── Topic engine (single op_in port, demuxed by msg_type) ──
+  - from: session_processor.topic_out
+    to: topic_engine.op_in
+  - from: topic_engine.deliver_out
+    to: session_processor.deliver_in
+
+  # ── Messaging composite (dedup / offline / retained) ────
+  # One op bus in, one reply bus out: the composite's dispatch
+  # table demuxes by msg_type and the session state machine
+  # demuxes the replies, exactly as across the separate edges.
+  - from: session_processor.messaging_out
+    to: messaging.op_in
+  - from: messaging.result_out
+    to: session_processor.messaging_in
+
+  # ── Control plane ───────────────────────────────────────
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
+
+  # ── Metrics fan-in ──────────────────────────────────────
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
+  - from: session_processor.metrics_out
+    to: operations.ingest
+
+  # ── Capability registry — advertises storage surfaces +
+  # fence kinds. local_ad would fan out to peer nodes in a
+  # multi-node graph; here it stays unwired (loaded for
+  # init-tick + log visibility). Metrics drain into the same
+  # aggregator pool.

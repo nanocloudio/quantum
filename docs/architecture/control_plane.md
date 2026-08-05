@@ -6,9 +6,9 @@ data-plane invariants the control plane enforces live in
 [messaging_model.md](messaging_model.md) (particularly
 **ROUTING-EPOCH**) and [partitioning.md](partitioning.md).
 
-The fluxor-native build supports **embedded CP only**. A remote /
-external CP-Raft was part of the older Tokio binary; that code path
-is not in this build.
+The control plane runs **embedded only** — CP-Raft is part of the same
+process graph, not a separate service. It is configured through the
+graph YAML like any other subsystem.
 
 ## Responsibilities
 
@@ -28,29 +28,30 @@ CP failures degrade gracefully through the cache.
 
 | Endpoint | Purpose |
 |---|---|
-| `/routing` | Current routing manifest (placements + epoch). Polled by `cp_bridge`. |
+| `/routing` | Current routing manifest (placements + epoch). Polled by `control_plane`. |
 | `/features` | Per-tenant feature gates and capability manifest. |
 | `/admin` | Mutations: tenant create / delete, placement plans, throttle overrides, shrink plans, leader transfer. mTLS-required, signed requests, canonical-JSON responses. |
 | `/why` | Structured explanation surface for CP state machine decisions. |
 | `/healthz` | Liveness; cheap, no quorum read. |
 | `/readyz` | Readiness; gated on quorum freshness + manifest reachability. |
 
-The HTTP surface is served by `http_surface` (Clustor substrate
-module) using the manifest produced by CP-Raft's apply pipeline.
+The HTTP surface is served by `gateway` (Clustor substrate module)
+using the manifest produced by CP-Raft's apply path.
 
 ## Cache states
 
-`cp_proof_cache` runs a four-state FSM per cached object:
+`admission`'s proof cache runs a four-state FSM per cached object,
+published on `admission.cache_state`:
 
 | State | Meaning | Effect on data plane |
 |---|---|---|
 | **Fresh** | Within TTL (`refresh_fresh_ms`, default 60s). | All operations admitted. |
-| **Cached** | Past TTL but within grace (`refresh_stale_ms`, default 600ms before refresh trigger). | Operations admitted; background refresh in flight. |
+| **Cached** | Past TTL but within grace; `control_plane` polls at the faster `refresh_stale_ms` cadence (default 600ms) to recover. | Operations admitted; background refresh in flight. |
 | **Stale** | Grace exceeded (`grace_period_s`, default 120s). | New handshakes requiring policy evaluation are blocked. Existing sessions continue but cannot establish new authorisations. |
 | **Expired** | Long-term outage beyond grace. | Policy-bound operations tear down. Adapters return `ControlPlaneUnavailable` and clients must reconnect once CP returns. |
 
 The Stale → Expired transition is the strict-fallback boundary.
-Operators can override `strict_fallback` per-PRG via `admin_handler`
+Operators can override `strict_fallback` per-PRG via `operations`
 for documented incident responses, but the default is fail-closed.
 
 ## Embedded mode
@@ -63,16 +64,16 @@ separate process, no separate Raft cluster.
 ### Composition
 
 - CP-Raft consensus runs in the same Clustor substrate modules
-  (`raft_engine`, `wal`, `commit_tracker`, `durability_ledger`) that
-  serve the data plane; CP gets its own PRG namespace, not a separate
-  runtime.
-- `cp_bridge` polls CP-Raft and emits three output classes: proofs
-  (`out[0]`), tenant records (`out[1]`), capability manifests
-  (`out[2]`).
-- `placement_router` emits epoch-change events (`out[1]`) so
+  (`consensus` and `durability`) that serve the data plane; CP gets
+  its own PRG namespace, not a separate runtime.
+- `control_plane` polls CP-Raft and emits three output classes:
+  proofs (`control_plane.proof`), tenant records
+  (`control_plane.tenant_records`), capability manifests
+  (`control_plane.capabilities`).
+- `control_plane.epoch_events` carries epoch changes so
   `session_processor` can fence in-flight state on rebalance.
-- `http_surface` exposes the CP HTTP API on the bind configured in
-  the graph YAML.
+- `gateway` exposes the CP HTTP API on the bind configured in the
+  graph YAML.
 - All CP on-disk state lives under `data/cp/` colocated with PRG
   storage (`data/cp/raft`, `data/cp/snapshots`, `data/cp/manifests`,
   `data/cp/system_log`).
@@ -83,7 +84,7 @@ separate process, no separate Raft cluster.
 |---|---|---|
 | CP HTTP (TLS) | `127.0.0.1:19000` | Widened to `0.0.0.0` for multi-node embedded experiments. |
 | CP Raft RPC (mTLS) | `127.0.0.1:19001` | Widened similarly. |
-| Public HTTP (`http_surface`) | `0.0.0.0:9100` | Operator-facing `/readyz`, `/metrics`, `/admin`. |
+| Public HTTP (`gateway`) | `0.0.0.0:9100` | Operator-facing `/readyz`, `/metrics`, `/admin`. |
 | MQTT TCP listener | `0.0.0.0:8883` (production) / `127.0.0.1:9090` (minimal smoke) | Configured per graph YAML. |
 
 Bind validation in the graph YAML rejects collisions between the CP
@@ -141,13 +142,12 @@ Multi-node embedded is the path to HA. Single-node embedded with
 | **Drain** | Listeners and PRGs drain first; then CP HTTP and Raft drain, manifests flush, process exits. Keeps CP state durable through shutdown. |
 | **Readiness** | Overall runtime readiness requires CP to be up, serving routing / features, and publishing freshness signals. `/readyz` continues to require a Fresh CP cache and cleared fences. |
 
-## API and manifest parity
+## API and manifest stability
 
-Embedded CP serves `/routing` and `/features` with the same payloads
-and semantics the historical external CP exposed. This is
-intentional: it preserves the surface that adapter clients and
-operator tooling consume, and it keeps the contract testable without
-mocking CP internals.
+`/routing` and `/features` are a stable payload and semantic contract
+independent of where CP runs. That independence is intentional: it
+fixes the surface that adapter clients and operator tooling consume,
+and it keeps the contract testable without mocking CP internals.
 
 ## Storage layout
 

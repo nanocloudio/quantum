@@ -3,22 +3,52 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
+# Variants mirror `protocol`'s: a deployment that serves one protocol
+# compiles out the others' handlers and their component state. MQTT is
+# the base — its session lifecycle, QoS state machine and delivery path
+# are what the module is — so every variant carries it.
+#
+# `store` (the apply-side message log) is shared by Kafka and AMQP, so
+# the `mqtt` variant drops it entirely while `kafka` and `amqp` each
+# keep it. That sharing is why a per-protocol *component* split was
+# impossible; gating adapters is the seam that works.
+
+[[variant]]
+name = "full"
+features = ["mqtt", "kafka", "amqp"]
+default = true
+
+[[variant]]
+name = "mqtt"
+# Marker feature: MQTT is the base surface, so the marker satisfies the
+# variant-is-a-feature-set rule without gating any code of its own —
+# the same pattern clustor's `durability` uses for `disk`.
+features = ["mqtt"]
+
+[[variant]]
+name = "kafka"
+features = ["mqtt", "kafka"]
+
+[[variant]]
+name = "amqp"
+features = ["mqtt", "amqp"]
+
 # Port reduction: session_processor uses message-type multiplexing to stay
 # within the 8-port-per-direction Fluxor limit. Related signals share channels
 # and are demuxed by MSG_* type bytes.
 #
 # Inputs (8):
 #   [0] codec_in         — MQTT/Kafka/AMQP proposals (demux by PROTO_* byte)
-#   [1] committed_in     — applied entries from apply_pipeline
+#   [1] committed_in     — applied entries from consensus
 #   [2] flow_in          — PID credits + backpressure + prefetch (demux by msg_type)
-#   [3] ack_in           — ACK emit + redeliver from ack_tracker
+#   [3] ack_in           — ACK emit + redeliver from `flow::ack`
 #   [4] cp_in            — capabilities + epoch events + disconnect (demux)
 #   [5] messaging_in     — dedup result + offline drain + retained read + group assign + txn result
 #   [6] deliver_in       — topic deliveries from topic_engine
-#   [7] assigned_in      — MSG_PROPOSAL_ASSIGNED from raft_engine (correlation_id → wal_index)
+#   [7] assigned_in      — MSG_PROPOSAL_ASSIGNED from consensus (correlation_id → wal_index)
 #
 # Outputs (8):
-#   [0] proposals         — legacy untagged proposals to raft_engine (CONNECT/DISCONNECT/etc)
+#   [0] proposals         — untagged proposals to consensus (CONNECT/DISCONNECT/etc)
 #   [1] codec_out         — responses to codecs (tag by PROTO_*)
 #   [2] topic_out         — publish + subscribe + unsubscribe to topic_engine
 #   [3] messaging_out     — dedup check + offline enqueue + retained write + group op + txn op

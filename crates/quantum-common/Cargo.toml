@@ -19,7 +19,7 @@ path = "src/lib.rs"
 # fluxor-abi is consumed from the local fluxor registry, bootstrapped
 # by `fluxor registry setup-cargo` on the developer's machine.
 [dependencies]
-fluxor-abi = { version = "0.1", registry = "fluxor" }
+fluxor-abi = { version = "0.0.1", registry = "fluxor" }
 
 # Inline lints rather than `workspace = true`: the bundled common
 # files carry alignment-driven `unsafe` and pedantic-relaxed

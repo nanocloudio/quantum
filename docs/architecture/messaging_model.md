@@ -17,12 +17,12 @@ sits on top.
 |---|---|
 | **PRG** | Partition Raft Group — a tenant-scoped Clustor partition (3 voters by default) that owns a slice of session and topic state. |
 | **CP-Raft** | Control Plane Raft cluster holding tenant manifests, routing epochs, quotas, PKI bundles, feature gates, and durability proofs. |
-| **Protocol adapter** | Module that maps a wire protocol onto session-processor APIs and Clustor durability primitives. Quantum ships three: `mqtt_codec`, `kafka_codec`, `amqp_codec`. |
-| **Session Processor** | Messaging state machine (the `session_processor` module). Handles connection binding, QoS / ack handshakes, inflight replay, offline queues, protocol reason codes. Plugs into Clustor's `apply_pipeline`. |
+| **Protocol adapter** | Module that maps a wire protocol onto session-processor APIs and Clustor durability primitives. Quantum ships three: `protocol`'s mqtt component, `protocol`'s kafka component, `protocol`'s amqp component. |
+| **Session Processor** | Messaging state machine (the `session_processor` module). Handles connection binding, QoS / ack handshakes, inflight replay, offline queues, protocol reason codes. Plugs into Clustor's `consensus` apply path. |
 | **session_epoch** | Monotone counter per `(tenant_id, stream_id)` fencing session state; increments on clean reconnect or fenced takeover. |
 | **stream_id** | Protocol-defined logical stream identifier (MQTT `client_id`, Kafka producer ID, AMQP container ID). |
-| **dedupe entry** | `(tenant_id, stream_id, session_epoch, message_id)` map rejecting duplicates until `dedupe_ttl` expires. Owned by `dedup_engine`. |
-| **offline_queue** | Persistent FIFO storing durable deliveries for disconnected or throttled sessions. Owned by `offline_queue` module. |
+| **dedupe entry** | `(tenant_id, stream_id, session_epoch, message_id)` map rejecting duplicates until `dedupe_ttl` expires. Owned by `messaging`'s dedup component. |
+| **offline queue** | Persistent FIFO storing durable deliveries for disconnected or throttled sessions. Owned by `messaging`'s offline component. |
 | **forward_seq** | Idempotence key for cross-PRG forwarding; monotonically increasing per `(ingress PRG, egress PRG, routing_epoch)` and persisted so replay fences duplicates. Owned by `forward_coordinator`. |
 | **dirty_epoch** | Routing-epoch mismatch condition; adapters map it to protocol-specific outcomes (reject, disconnect, retry). |
 
@@ -57,8 +57,7 @@ session_record {
 ```
 
 Persisted by `session_processor` through WAL frames committed via
-`raft_engine` → `wal` → `durability_ledger`. Survives node restart and
-leader transfer.
+`consensus` ↔ `durability`. Survives node restart and leader transfer.
 
 ### Routing record
 
@@ -85,7 +84,7 @@ retained_record {
 }
 ```
 
-Owned by `retained_store`. Payload references are content-addressed
+Owned by `messaging`'s retained component. Payload references are content-addressed
 so identical retained payloads across topics share storage.
 
 ### Dedupe entry
@@ -99,7 +98,7 @@ DedupeKey → DedupeState {
 }
 ```
 
-Owned by `dedup_engine` (16-shard partitioned map). Entries expire
+Owned by `messaging`'s dedup component (16-shard partitioned map). Entries expire
 after `dedupe_ttl_default_ms`. The earliest non-expired index per PRG
 (`earliest_dedupe_index`) is the WAL compaction floor for dedupe
 state.
@@ -114,7 +113,7 @@ offline_entry {
 }
 ```
 
-Owned by `offline_queue`. The earliest non-expired index per PRG
+Owned by `messaging`'s offline component. The earliest non-expired index per PRG
 (`earliest_offline_queue_index`) is the WAL compaction floor for
 queued state. Bounded by per-tenant quota policy.
 
@@ -142,8 +141,8 @@ produce byte-identical PRG state.
 ### ACK-DURABILITY
 
 Protocol-level ACKs emit only after WAL entries reach quorum
-durability. `ack_tracker` consumes proofs from
-`durability_ledger.quorum_durable` directly; there is no path from
+durability. `flow`'s ack component consumes proofs from
+`durability.quorum_durable` directly; there is no path from
 "WAL written locally" to "PUBACK sent" that skips quorum.
 
 This is the contract that gives MQTT QoS 1/2, Kafka `acks=all`, and
@@ -160,9 +159,9 @@ protocol-specific outcome:
 - Kafka: `NOT_LEADER_OR_FOLLOWER` + epoch fence.
 - AMQP: `link-detach` with `amqp:link:detach-forced`.
 
-Epoch changes propagate through `cp_bridge` →
-`placement_router.epoch_events` → `session_processor`, which fences
-in-flight state before accepting traffic on the new epoch.
+Epoch changes propagate through `control_plane.epoch_events` →
+`session_processor`, which fences in-flight state before accepting
+traffic on the new epoch.
 
 ## Crash model
 

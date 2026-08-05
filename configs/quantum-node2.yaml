@@ -14,9 +14,9 @@ tick_us: 1000
 scheduler:
   accept_cycles: true
 
-# Substrate (raft, wal, peer_router, partition_router, etc.) lives in
+# Substrate (consensus, durability, peer_router, partition_router, etc.) lives in
 # clustor/modules/ — quantum/modules/ is reserved for quantum-specific
-# modules (mqtt_codec, session_processor, …). The fluxor tool searches
+# modules (protocol, session_processor, …). The fluxor tool searches
 # these paths in order when resolving manifests; see
 # `clustor/docs/substrate_sharing.md`.
 module_search_paths:
@@ -34,42 +34,27 @@ modules:
     peer1_port: 9091
     peer2_port: 9092
 
-  - name: raft_engine
+  - name: consensus
     self_id: 2
     voter_count: 3
     heartbeat_interval_ms: 150
-
-  - name: replicator
-    self_id: 2
     peer_count: 3
-
-  - name: commit_tracker
-    self_id: 2
-    voter_count: 3
-
-  - name: apply_pipeline
-  - name: wal
-  - name: durability_ledger
+  - name: durability
     self_id: 2
     voter_count: 1
 
-  - name: cp_bridge
-  - name: cp_proof_cache
-  - name: flow_controller
-  - name: throttle_gate
-  - name: telemetry_agg
-  - name: client_surface
+  - name: control_plane
+  - name: admission
+  - name: gateway
+  - name: operations
 
-  - name: protocol_router
-  - name: mqtt_codec
+  - name: protocol
+    variant: mqtt
   - name: session_processor
-  - name: ack_tracker
-  - name: backpressure_propagator
+    variant: mqtt
+  - name: flow
   - name: topic_engine
-  - name: dedup_engine
-  - name: offline_queue
-  - name: retained_store
-  - name: response_mux
+  - name: messaging
 
 wiring:
   - from: linux_net.net_out
@@ -78,86 +63,71 @@ wiring:
     to: linux_net.net_in
 
   - from: peer_router.cleartext
-    to: protocol_router.raw_in
+    to: protocol.raw_in
   - from: peer_router.peer_rx
-    to: replicator.ack
+    to: consensus.ack
 
-  - from: protocol_router.mqtt_out
-    to: mqtt_codec.raw_in
-  - from: protocol_router.http_out
-    to: client_surface.requests
+  - from: protocol.http_out
+    to: gateway.requests
 
-  - from: mqtt_codec.frames_out
-    to: response_mux.mqtt_in
-  - from: client_surface.responses
-    to: response_mux.http_in
-  - from: response_mux.mux_out
+  - from: gateway.responses
+    to: peer_router.client_resp
+  - from: protocol.frames_out
     to: peer_router.client_resp
 
-  - from: mqtt_codec.proposals_out
+  - from: protocol.proposals_out
     to: session_processor.codec_in
   - from: session_processor.codec_out
-    to: mqtt_codec.responses_in
+    to: protocol.responses_in
 
   - from: session_processor.proposals
-    to: raft_engine.proposals
+    to: consensus.proposals
   - from: session_processor.proposals_tagged
-    to: raft_engine.proposals_tagged
-  - from: raft_engine.proposal_assigned
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
     to: session_processor.assigned_in
-
-  - from: raft_engine.append_entries
-    to: replicator.entries
-  - from: replicator.net_out
+  - from: consensus.net_out
     to: peer_router.repl_tx
-  - from: replicator.match_indices
-    to: commit_tracker.match
-  - from: raft_engine.rpc_out
+  - from: consensus.rpc_out
     to: peer_router.peer_tx
 
-  - from: raft_engine.log_append
-    to: wal.entries
-  - from: wal.flushed
-    to: durability_ledger.ack
-  - from: durability_ledger.quorum_durable
-    to: commit_tracker.durable
-
-  - from: commit_tracker.committed
-    to: apply_pipeline.entries
-  # Commit feedback to raft (clustor reference): without it
-  # raft_engine.commit_index never advances and raft throttles all
-  # proposals at MAX_UNCOMMITTED_INFLIGHT (24) — a hard ~24-entry cap.
-  - from: commit_tracker.committed
-    to: raft_engine.commit
-  - from: raft_engine.commit_advanced
-    to: apply_pipeline.entries
-  - from: raft_engine.log_observe
-    to: apply_pipeline.log_entries
-  - from: apply_pipeline.applied
+  - from: consensus.log_append
+    to: durability.entries
+  # A restarted replica reads its replayed log bodies back out of the
+  # local WAL: replay restores the log, so log-matching succeeds and the
+  # leader never re-ships those entries. Without this pair the apply path
+  # stalls at the first gap.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: durability.quorum_durable
+    to: consensus.durable
+  - from: consensus.applied
     to: session_processor.committed_in
-  - from: apply_pipeline.committed_entries
+  - from: consensus.committed_entries
     to: session_processor.committed_in
 
-  - from: durability_ledger.quorum_durable
-    to: ack_tracker.durability_in
+  - from: durability.quorum_durable
+    to: flow.durability_in
   - from: session_processor.forward_out
-    to: ack_tracker.register_in
-  - from: ack_tracker.ack_out
-    to: session_processor.ack_in
-  - from: ack_tracker.redeliver_out
+    to: flow.forward_in
+  - from: flow.ack_out
     to: session_processor.ack_in
 
-  - from: flow_controller.credits
-    to: throttle_gate.credit_supply
-  - from: flow_controller.credits
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: admission.credits
     to: session_processor.flow_in
-  - from: flow_controller.envelope
-    to: backpressure_propagator.envelope_in
-  - from: replicator.lag_signal
-    to: flow_controller.lag
-  - from: throttle_gate.rejected
-    to: backpressure_propagator.rejected_in
-  - from: backpressure_propagator.protocol_signals
+  - from: admission.envelope
+    to: flow.envelope_in
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: gateway.rejected
+    to: flow.rejected_in
+  - from: flow.flow_out
     to: session_processor.flow_in
 
   - from: session_processor.topic_out
@@ -165,47 +135,39 @@ wiring:
   - from: topic_engine.deliver_out
     to: session_processor.deliver_in
 
+  # ── Messaging composite (dedup / offline / retained) ────
+  # One op bus in, one reply bus out: the composite's dispatch
+  # table demuxes by msg_type and the session state machine
+  # demuxes the replies, exactly as across the separate edges.
   - from: session_processor.messaging_out
-    to: dedup_engine.check_in
-  - from: dedup_engine.result_out
-    to: session_processor.messaging_in
-  - from: session_processor.messaging_out
-    to: offline_queue.enqueue_in
-  - from: session_processor.messaging_out
-    to: offline_queue.reconnect_in
-  - from: offline_queue.drain_out
-    to: session_processor.messaging_in
-  - from: session_processor.messaging_out
-    to: retained_store.write_in
-  - from: session_processor.messaging_out
-    to: retained_store.read_in
-  - from: retained_store.read_out
+    to: messaging.op_in
+  - from: messaging.result_out
     to: session_processor.messaging_in
 
-  - from: cp_bridge.proof
-    to: cp_proof_cache.proof
-  - from: cp_proof_cache.cache_state
-    to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
 
   # Inbound peer Raft RPCs (votes / heartbeats / AppendEntries) demuxed
   # by peer_router land here. Without this edge no node ever receives a
-  # vote and elections never converge. raft_engine.rpc takes a single
-  # writer; client_surface.raft_rpc stays unwired (matches clustor's
+  # vote and elections never converge. consensus.rpc takes a single
+  # writer; gateway.raft_rpc stays unwired (matches clustor's
   # multi-3node.yaml) to avoid a fan-in collision on the byte FIFO.
   - from: peer_router.raft_rpc
-    to: raft_engine.rpc
+    to: consensus.rpc
 
-  - from: raft_engine.metrics
-    to: telemetry_agg.ingest
-  - from: wal.metrics
-    to: telemetry_agg.ingest
-  - from: flow_controller.metrics
-    to: telemetry_agg.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
   - from: session_processor.metrics_out
-    to: telemetry_agg.ingest
-  - from: telemetry_agg.readyz
-    to: client_surface.readyz_data
-  - from: telemetry_agg.export
-    to: client_surface.metrics_data
+    to: operations.ingest
+  - from: operations.readyz
+    to: gateway.readyz_data
+  - from: operations.export
+    to: gateway.metrics_data

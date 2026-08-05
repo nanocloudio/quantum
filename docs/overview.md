@@ -3,8 +3,9 @@
 Quantum is a multi-protocol messaging overlay (MQTT 3.1/3.1.1/5.0,
 Kafka, AMQP 0-9-1) built as a graph of cooperative modules on the
 [Fluxor](../../fluxor) runtime atop the [Clustor](../../clustor) Raft
-substrate. 42 `.fmod` modules across 6 execution domains compose into
-a single-process broker that delivers quorum-durable exactly-once
+substrate. 26 `.fmod` modules — 7 Clustor substrate modules plus 19
+Quantum application modules — compose into a single-process broker
+that delivers quorum-durable exactly-once
 semantics, multi-tenant isolation, deterministic backpressure, and a
 uniform on-disk format across all three protocols.
 
@@ -17,7 +18,7 @@ to drive the system to achieve a goal.
 
 ## Start Here
 
-- [native_fluxor.md](native_fluxor.md) — module alignment analysis (why 42 modules) and the canonical YAML graph
+- [architecture.md](architecture.md) — the structural reference: layers, execution domains, every module, the graph, the durability cascade
 - [architecture/messaging_model.md](architecture/messaging_model.md) — entities and invariants every adapter maps onto
 - [architecture/partitioning.md](architecture/partitioning.md) — PRG sharding, routing epochs, placement
 - [guides/deployment.md](guides/deployment.md) — install layout, systemd unit, runtime state
@@ -26,8 +27,15 @@ to drive the system to achieve a goal.
 
 How the system works. These are the authoritative references; each
 covers one concern and assumes the reader has read this overview.
+[architecture.md](architecture.md) is the top-level structural
+reference — the layers, execution domains, module reference, message
+graph, and durability cascade; the canonical wireable graph lives in
+[configs/](../configs/). The documents below drill into one concern
+each.
 
+- [architecture.md](architecture.md) — layers, execution domains, module reference, message graph, durability cascade
 - [architecture/messaging_model.md](architecture/messaging_model.md) — entities, invariants (WAL-SOURCE, DETERMINISTIC-REPLAY, ACK-DURABILITY, ROUTING-EPOCH), default timers, terminology
+- [architecture/apply_path.md](architecture/apply_path.md) — the propose/apply seam, proposal format, reset handling, snapshot format
 - [architecture/partitioning.md](architecture/partitioning.md) — PRG sharding, placement, routing epochs, rebalance, system model
 - [architecture/mqtt_adapter.md](architecture/mqtt_adapter.md) — connection lifecycle, QoS 0/1/2 semantics, shared subscriptions, offline delivery
 - [architecture/kafka_adapter.md](architecture/kafka_adapter.md) — topics, partitions, produce semantics, consumer groups, transactions, retention
@@ -38,26 +46,22 @@ covers one concern and assumes the reader has read this overview.
 - [architecture/security.md](architecture/security.md) — TLS / mTLS, identity, RBAC, at-rest crypto, signing
 - [architecture/observability.md](architecture/observability.md) — metrics, tracing, audit logging
 - [architecture/disaster_recovery.md](architecture/disaster_recovery.md) — DR orchestration, fenced promotion, upgrades, fault injection
-
-The full module graph — every module, every port, every wiring edge —
-lives in [native_fluxor.md](native_fluxor.md). That document is the
-alignment analysis (why 42 modules, not 30 or 11) plus the complete
-YAML graph. Read the architecture docs first for what each concern
-looks like; read `native_fluxor.md` for how those concerns decompose
-into modules.
+- [architecture/session_decomposition.md](architecture/session_decomposition.md) — how `session_processor` splits into components, and the rules each one enforces
 
 ## Guides
 
 How to drive the system. Operational patterns and recipes.
 
-- [guides/deployment.md](guides/deployment.md) — build artifacts, `/opt/quantum` layout, systemd unit, runtime state
-- [guides/high_availability.md](guides/high_availability.md) — front-door patterns, rolling-restart sequence, client expectations
+- [guides/configuration.md](guides/configuration.md) — the graph-YAML config surface, platform stack, listeners, durability tuning
+- [guides/deployment.md](guides/deployment.md) — Linux/systemd install: build artifacts, `/opt/quantum` layout, unit, runtime state
+- [guides/bring_up.md](guides/bring_up.md) — the bare-metal production path: rig topology, build recipe, smoke, pass signals
+- [guides/high_availability.md](guides/high_availability.md) — front-door patterns, rolling-restart runbook, client expectations
 - [guides/scaling.md](guides/scaling.md) — scale-up / shrink runbooks with CP-Raft hooks
-- [guides/performance.md](guides/performance.md) — targets, harnesses, validation procedure
+- [guides/performance.md](guides/performance.md) — targets, harnesses, validated behaviour, validation procedure
 - [guides/interop.md](guides/interop.md) — exercising the broker against `mosquitto_pub` / `mosquitto_sub` / Paho
 - [guides/cli.md](guides/cli.md) — `fluxor` tool, `make` targets, smoke harnesses, chaos drivers
-- [guides/dependencies.md](guides/dependencies.md) — Fluxor / Clustor checkouts, toolchain, runtime requirements
-- [guides/dev_seeding.md](guides/dev_seeding.md) — current bootstrap path and what was removed
+- [guides/dependencies.md](guides/dependencies.md) — Fluxor / Clustor checkouts, toolchain, build requirements, runtime deps
+- [guides/dev_seeding.md](guides/dev_seeding.md) — bootstrap path, on-disk state, producing seed data
 
 ## Conventions
 

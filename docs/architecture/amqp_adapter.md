@@ -1,7 +1,7 @@
 # AMQP Adapter
 
-The AMQP adapter (`amqp_codec` + the AMQP path through
-`session_processor`, `topic_engine`, `dedup_engine`, `offline_queue`)
+The AMQP adapter (`protocol`'s amqp component + the AMQP path through
+`session_processor`, `topic_engine`, `messaging`)
 implements AMQP 0-9-1 over TLS/TCP. The codec also handles enough of
 AMQP 1.0's framing for protocol-header negotiation, but the in-tree
 adapter targets 0-9-1 semantics (exchanges, queues, bindings,
@@ -60,12 +60,12 @@ re-enters the queue at the head; if `requeue=false` and a
 dead-letter exchange is configured, the message is routed there
 instead.
 
-### Transactions
+### Transactions — not implemented
 
-`Tx.Select` / `Tx.Commit` / `Tx.Rollback` map to the same
-`transaction_coordinator` two-phase pipeline used by Kafka. Commit
-waits for `wal_committed_index` to advance past all involved PRGs
-before acknowledging.
+`Tx.Select` / `Tx.Commit` / `Tx.Rollback` are not served; there is no
+two-phase pipeline behind them, on either the AMQP or the Kafka side
+(see [kafka_adapter.md](kafka_adapter.md)). Channels must not be put
+into transactional mode.
 
 Exactly-once delivery is valid only under XO-BOUND (see
 [messaging_model.md](messaging_model.md)). `forward_seq` plus
@@ -75,13 +75,13 @@ healthy or in a fenced DR promotion for the guarantee to hold.
 ## Flow control and credits
 
 AMQP 1.0 credit-based flow control is mirrored in the 0-9-1 path
-through `prefetch_controller`:
+through `flow`'s prefetch component:
 
 - `Basic.Qos` `prefetch_count` and `prefetch_size` set per-consumer
   credit windows.
 - Link credits persist in session state so credits survive reconnect
   and replay.
-- When `backpressure_propagator` raises pressure, credits clamp to
+- When `flow`'s backpressure component raises pressure, credits clamp to
   zero with `Channel.Flow{active=false}` (or AMQP 1.0
   `Flow{drain=true}`) until pressure clears.
 

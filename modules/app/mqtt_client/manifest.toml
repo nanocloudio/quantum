@@ -1,0 +1,56 @@
+version = "2.0.0"
+type             = "Transformer"
+entry            = "mod.rs"
+# timer_class: keepalive/reconnect timers read wall-clock (dev_millis).
+timer_class = "wall_clock"
+hardware_targets = ["rp2350", "bcm2712"]
+
+# mqtt_client — minimal MQTT 3.1.1 edge client (QoS 0). Connects to a broker,
+# subscribes to one topic, publishes application events fed on `app_in`, and
+# forwards received PUBLISH payloads on `app_out`. The complement to quantum's
+# broker-side `protocol` mqtt codec: this is the constrained-node publisher
+# (e.g. a pico2w sensor) that talks TO a broker.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+# in[0]: net_in (from IP).
+buffer_size = 2048
+
+[[ports]]
+name = "app_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+# in[1]: application messages to PUBLISH (framed [topic_len][topic][hdr][payload]).
+buffer_size = 256
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+# out[0]: net_out (to IP).
+buffer_size = 2048
+# NET_BUF_SIZE — frame assembly is bounded by the 1600-byte net_buf.
+max_record = 1600
+
+[[ports]]
+name = "app_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+# out[1]: received PUBLISH payloads delivered to the application.
+buffer_size = 256
+# CHAN_BUF_SIZE — app frames are guarded to total_frame <= 192.
+max_record = 192
+
+# Module-scope observability. Optional 3rd output (out[2]); wired to
+# `observe.telemetry` when the debug stack's observe overlay is on. Emits
+# cumulative byte counters; no-op when unwired. See standards/observability.md.
+[observability]
+metrics = ["bytes_in", "bytes_out"]
+
+[[resources]]
+requires_contract = "channel"
+access = "read"

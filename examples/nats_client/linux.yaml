@@ -1,0 +1,27 @@
+# Quantum's NATS client (subscribe; pushed messages stream to stdout) — standalone.
+#   docker run -d --rm --name qtm-nats -p 14222:4222 nats:latest
+#   fluxor run examples/nats_client/linux.yaml &
+#   # publish from the host (the nats:latest image has no shell):
+#   python3 -c "import socket,time; s=socket.create_connection(('127.0.0.1',14222),3); \
+#     s.recv(1024); s.sendall(b'CONNECT {}\r\n'); time.sleep(0.2); \
+#     s.sendall(b'PUB orders.new 5\r\nhello\r\n'); time.sleep(0.3)"
+#   # -> "hello" on stdout
+target: linux
+tick_us: 100
+scheduler:
+  accept_cycles: true
+platform:
+  cli: {}
+  net: {}
+modules:
+  - name: nats_client
+    params:
+      endpoint: "7f0000018e37"   # 127.0.0.1:14222
+      subject: "orders.>"
+wiring:
+  - from: nats_client.net_out
+    to: linux_net.net_in
+  - from: linux_net.net_out
+    to: nats_client.net_in
+  - from: nats_client.message_out
+    to: cli_out.bytes_in

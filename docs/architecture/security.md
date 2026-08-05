@@ -8,8 +8,7 @@ artifacts. There are no optional auth methods; every surface enforces
 the same stack.
 
 The mechanics of the modules that implement these contracts (`tls`,
-`rbac`, `key_manager`, `audit_logger`, `wal`, `snapshot_engine`) are
-documented in the Clustor substrate; this document specifies what
+`operations`, `durability`, `governance`'s audit component) are documented in the Clustor substrate; this document specifies what
 they guarantee for Quantum.
 
 ## Transport
@@ -50,7 +49,7 @@ regardless of JWT presence.
 
 ## Authorisation
 
-`rbac` evaluates per-operation policy against:
+`operations`' RBAC component evaluates per-operation policy against:
 
 1. Cert-derived identity (always present in mTLS).
 2. SPIFFE ID (when present).
@@ -64,7 +63,7 @@ Roles:
 | `Operator` | Full read-write across operator-scoped endpoints (`/admin`, placement plans, tenant CRUD). |
 | `TenantAdmin` | Read-write within one tenant's namespace (ACLs, quotas, certificates). |
 | `Observer` | Read-only against `/metrics`, `/why`, audit logs. |
-| `BreakGlass` | Time-limited (`breakglass_max_ttl_ms`, default 300ms) elevated access for incident response; every action is signed and audited. |
+| `BreakGlass` | Time-limited (`breakglass_max_ttl_ms`; a short, CP-bounded window) elevated access for incident response; every action is signed and audited. |
 
 Tenant ACLs gate publish, subscribe, and admin operations per
 subject. Wildcards in ACLs follow the same semantics as the protocol
@@ -81,15 +80,15 @@ All persisted data is encrypted with AEAD:
 
 | Layer | Cipher | Key source |
 |---|---|---|
-| WAL segments | AES-256-GCM | DEK from `key_manager` (epoch-rotated) |
-| Snapshots | AES-256-GCM | DEK from `key_manager` |
+| WAL segments | AES-256-GCM | DEK from `durability`'s key component (epoch-rotated) |
+| Snapshots | AES-256-GCM | DEK from `durability`'s key component |
 | Retained payloads | AES-256-GCM | Same DEK as the topic's PRG snapshot |
 | Offline queue payloads | AES-256-GCM | Same DEK as the session's PRG snapshot |
 | CP-Raft state | AES-256-GCM | Separate DEK; same KEK |
 
 ### Key rotation
 
-`key_manager` rotates DEKs weekly (`rotation_interval_h = 168` by
+`durability` rotates DEKs weekly (`rotation_interval_h = 168` by
 default), retains the previous epoch for 48h (`retention_h = 48`),
 and reserves nonces in 65 536-window batches to avoid nonce reuse
 under concurrent encryption.
@@ -104,9 +103,9 @@ Ed25519 signing for artifacts that require tamper evidence:
 
 | Artifact | Signed by |
 |---|---|
-| Snapshots | `snapshot_engine`; verified on import and replay |
+| Snapshots | `durability`; verified on import and replay |
 | CP-Raft manifests | CP-Raft signing key; verified on every cache load |
-| Audit log entries | `audit_logger`; verified during compliance review |
+| Audit log entries | `governance`'s audit component; verified during compliance review |
 | Durability proofs | Per Clustor §9.8; verified before adapter emits ACK |
 | Break-glass actions | RBAC + signed audit; verified during forensics |
 
@@ -115,7 +114,7 @@ on a different schedule (manual, typically per compliance cycle).
 
 ## Audit
 
-`audit_logger` emits a signed structured event for:
+`governance`'s audit component emits a signed structured event for:
 
 | Event class | Examples |
 |---|---|

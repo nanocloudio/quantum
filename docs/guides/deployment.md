@@ -1,5 +1,11 @@
 # Deployment & Packaging
 
+This guide covers the **Linux deployment**: the `fluxor-linux` userspace
+runtime managed by systemd, which is the target for Linux hosts and the
+usual path for staging and development. The production bare-metal target
+— Fluxor as the kernel on BCM2712, with no Linux on the device — is
+brought up through the hardware rig; see [bring_up.md](bring_up.md).
+
 Quantum deploys as the Fluxor runtime plus a directory of `.fmod` module artifacts. There is no monolithic binary to ship — packaging means assembling the runtime, the Quantum modules, the Clustor substrate modules, and a graph YAML on disk in a layout the systemd unit understands.
 
 ## Build artifacts
@@ -7,29 +13,29 @@ Quantum deploys as the Fluxor runtime plus a directory of `.fmod` module artifac
 Run the full build in dependency order:
 
 ```sh
-# 1. Fluxor toolchain + Linux runtime
-cd ../fluxor && make tools && make linux-bin
+# 1. Fluxor toolchain + Linux runtime, then the CLI onto PATH
+cd ../fluxor && make build && make install
 
 # 2. Clustor substrate modules
-cd ../clustor && make modules TARGET=bcm2712
+cd ../clustor && fluxor modules build --target bcm2712
 
-# 3. Quantum application modules
-cd ../quantum && fluxor modules build --target bcm2712 --out target
+# 3. Quantum application modules, plus the foundation fmods it depends on
+cd ../quantum && fluxor sync && fluxor modules build --target bcm2712
 ```
 
 Outputs:
 
 | Path | What |
 |---|---|
-| `../fluxor/target/aarch64-unknown-linux-gnu/release/fluxor` | Host toolchain (`validate`, `build`, `run`, `pack`) |
+| `../fluxor/target/aarch64-unknown-linux-gnu/release/fluxor` | Host toolchain (`validate`, `build`, `run`, `sync`, `modules build`) |
 | `../fluxor/target/aarch64-unknown-linux-gnu/release/fluxor-linux` | Userspace runtime |
-| `../fluxor/target/<TARGET>/modules/*.fmod` | All 42 `.fmod` artifacts (Quantum + Clustor + foundation) |
+| `<project>/target/fluxor/bcm2712/modules/*.fmod` | The `.fmod` artefacts each project builds. Every project writes into its own tree; `fluxor sync` copies the cross-project ones (foundation, and in canonical mode the Clustor substrate) into the consuming project's tree. |
 
-`TARGET` is `cm5` or `bcm2712`; both compile to `aarch64-unknown-none`. `fluxor modules build --all --out target` builds both targets in one pass.
+Module artefacts are keyed by silicon: `bcm2712` is the sole module target (`aarch64-unknown-none`). Firmware images for the board are built separately with `make -C ../fluxor firmware TARGET=pi5`.
 
 ## Production install
 
-[ops/scripts/install.sh](../ops/scripts/install.sh) provisions `/opt/quantum`, creates a `quantum` system user, and copies in the runtime + modules:
+[ops/scripts/install.sh](../../ops/scripts/install.sh) provisions `/opt/quantum`, creates a `quantum` system user, and copies in the runtime + modules:
 
 ```sh
 sudo ./ops/scripts/install.sh
@@ -56,7 +62,7 @@ sudo PREFIX=/srv/quantum CONFIG_DIR=/srv/quantum/etc DATA_DIR=/srv/quantum/data 
 
 ## systemd unit
 
-The shipped unit is [ops/systemd/quantum.service](../ops/systemd/quantum.service). It runs the runtime as the `quantum` user, exec's `fluxor run ${QUANTUM_CONFIG}`, and pushes logs to the journal.
+The shipped unit is [ops/systemd/quantum.service](../../ops/systemd/quantum.service). It runs the runtime as the `quantum` user, exec's `fluxor run ${QUANTUM_CONFIG}`, and pushes logs to the journal.
 
 Defaults:
 
@@ -64,7 +70,7 @@ Defaults:
 Environment=QUANTUM_ROOT=/opt/quantum
 Environment=FLUXOR_BIN=/opt/quantum/bin/fluxor
 Environment=FLUXOR_LINUX_BIN=/opt/quantum/bin/fluxor-linux
-Environment=QUANTUM_CONFIG=/etc/quantum/quantum-cm5.yaml
+Environment=QUANTUM_CONFIG=/etc/quantum/quantum-pi5.yaml
 ExecStart=/opt/quantum/bin/fluxor run ${QUANTUM_CONFIG}
 Restart=on-failure
 RestartSec=5s
@@ -113,13 +119,13 @@ Mount `/var/lib/quantum` on a durable volume backed by NVMe with write barriers 
 
 ## Health and readiness
 
-`http_surface` exposes (default `:9100`):
+`gateway` exposes (default `:9100`):
 
 | Endpoint | Meaning |
 |---|---|
 | `/readyz` | Green when CP cache is fresh, PRGs have completed replay, durability fences are clear, and the listener is not draining |
 | `/why` | Structured fault explanation for non-ready states |
-| `/metrics` | Prometheus exposition (substrate metrics from `telemetry_agg` + dimensional metrics from `metrics_aggregator`) |
+| `/metrics` | Prometheus exposition (substrate metrics fanned into `operations` + dimensional metrics from `governance`'s telemetry component) |
 | `/raft` | Per-PRG Raft state for diagnostics |
 | `/admin` | Idempotency-keyed admin workflows (partition CRUD, durability toggles, leader transfer, snapshot triggers, shrink/grow plans) |
 

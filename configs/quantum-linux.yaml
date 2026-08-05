@@ -1,8 +1,14 @@
 # Quantum: Single-node Linux test (no TLS)
 #
-# Full 42-module pipeline: 23 Clustor substrate modules + 19 Quantum
+# Full 14-module pipeline: 7 Clustor substrate modules + 7 Quantum
 # application modules. Composes a multi-protocol broker (MQTT/Kafka/AMQP)
 # on top of the Raft consensus substrate.
+#
+# Channel budget: 75 declared edges expand to 92 channels once
+# prepare_graph inserts a tee per fanned output port and a merge per
+# fanned input port (each costs one channel and one internal module),
+# against the kernel's MAX_GRAPH_EDGES=128. Adding a fanned edge here
+# costs two channels, not one — check the budget before wiring.
 #
 # Clients connect on port 9090 (linux_net TCP). Protocol selected by ALPN
 # tag (or first-byte sniffing for non-TLS). Management surface on 9100.
@@ -10,9 +16,16 @@
 target: linux
 tick_us: 1000
 
-# Substrate (raft, wal, peer_router, partition_router, etc.) lives in
+# The graph is cyclic by construction: the session/messaging round trips
+# (session_processor → messaging → session_processor, → topic_engine →,
+# → flow →) and the Raft commit loop are feedback edges, not
+# reentrant paths. prepare_graph rejects the graph outright without this.
+scheduler:
+  accept_cycles: true
+
+# Substrate (consensus, durability, peer_router, partition_router, etc.) lives in
 # clustor/modules/ — quantum/modules/ is reserved for quantum-specific
-# modules (mqtt_codec, session_processor, …). The fluxor tool searches
+# modules (protocol, session_processor, …). The fluxor tool searches
 # these paths in order when resolving manifests; see
 # `clustor/docs/substrate_sharing.md`.
 module_search_paths:
@@ -22,60 +35,55 @@ platform:
   net: {}
 
 modules:
-  # ── Clustor substrate (23 modules, stock) ────────────────
+  # ── Clustor substrate (7 modules, stock) ─────────────────
   - name: peer_router
-  - name: client_codec
-  - name: throttle_gate
-  - name: raft_engine
-  - name: replicator
-  - name: commit_tracker
-  - name: apply_pipeline
-  - name: wal
-  # Group-fsync batching is configured by wal's `fsync_mode`,
-  # `group_window_ms`, and `group_max_pending` params.
-  - name: durability_ledger
-  - name: cp_bridge
-  - name: cp_proof_cache
-  - name: read_gate
-  - name: flow_controller
-  - name: key_manager
-  - name: telemetry_agg
-  - name: client_surface
-  - name: rbac
-  - name: admin_handler
-  - name: snapshot_engine
-  - name: placement_router
+  - name: gateway
+  - name: consensus
+    params:
+      # See quantum-linux-minimal.yaml: 1 ms proposal batching removes the
+      # ~100 batch/s pacing floor the 10 ms default put under every ack.
+      proposal_batch_timeout_ms: 1
+  - name: durability
+    params:
+      # Write-path profile ported from lattice's rig-tuned
+      # bare-metal-pi5.yaml (measured there: write p50/p99 12.0/14.2 →
+      # 5.1/7.1 ms, durable ceiling ~1050 → ~3900/s):
+      #   fsync_mode 1     — group fsync; equal latency, higher ceiling.
+      #   group_window_ms 0 — the wall-clock batch window sat directly in
+      #                       every write ack; flush every poll, batching
+      #                       still engages under burst via max_pending.
+      #   fence_depth 8    — pipeline async fsync fences; >8 gains nothing
+      #                       (device completes barriers serially).
+      #   segment_bytes 4M — segment rotation runs a synchronous snapshot
+      #                       persist; small segments fire it often enough
+      #                       to blow p99.
+      fsync_mode: 1
+      group_window_ms: 0
+      group_max_pending: 8
+      fence_depth: 8
+      segment_bytes: 4194304
+  - name: control_plane
+  - name: admission
+  - name: operations
 
   # ── Quantum: protocol routing & codecs (4 modules) ──────
-  - name: protocol_router
-  - name: mqtt_codec
-  - name: kafka_codec
-  - name: amqp_codec
+  - name: protocol
 
   # ── Quantum: session core (1 module) ────────────────────
   - name: session_processor
 
   # ── Quantum: flow/ack (3 modules) ───────────────────────
-  - name: ack_tracker
-  - name: backpressure_propagator
-  - name: prefetch_controller
+  - name: flow
 
   # ── Quantum: topic & messaging (4 modules) ──────────────
   - name: topic_engine
-  - name: dedup_engine
-  - name: offline_queue
-  - name: retained_store
+  - name: messaging
 
-  # ── Quantum: forwarding & coordination (3 modules) ──────
+  # ── Quantum: forwarding (1 module) ──────────────────────
   - name: forward_coordinator
-  - name: consumer_group_coordinator
-  - name: transaction_coordinator
 
   # ── Quantum: control plane + ops (4 modules) ────────────
-  - name: tenant_manager
-  - name: dr_manager
-  - name: audit_logger
-  - name: metrics_aggregator
+  - name: governance
 
 wiring:
   # ── Transport: linux_net ↔ peer_router ──────────────────
@@ -85,108 +93,77 @@ wiring:
     to: linux_net.net_in
 
   # ── peer_router fan-out ─────────────────────────────────
-  # Client cleartext fans to client_surface (admin/raft HTTP) and to
-  # protocol_router (ALPN demux for the app protocols); peer traffic
-  # goes to replicator.
+  # Client cleartext fans to gateway (admin/raft HTTP) and to
+  # protocol (ALPN demux for the app protocols); peer traffic
+  # goes to consensus.
   - from: peer_router.cleartext
-    to: client_surface.requests
+    to: gateway.requests
   - from: peer_router.cleartext
-    to: protocol_router.raw_in
+    to: protocol.raw_in
   - from: peer_router.peer_rx
-    to: replicator.ack
+    to: consensus.ack
 
   # ── Protocol router → codecs ────────────────────────────
-  - from: protocol_router.mqtt_out
-    to: mqtt_codec.raw_in
-  - from: protocol_router.kafka_out
-    to: kafka_codec.raw_in
-  - from: protocol_router.amqp_out
-    to: amqp_codec.raw_in
 
   # ── Codec response frames → peer_router
-  - from: mqtt_codec.frames_out
-    to: peer_router.client_resp
-  - from: kafka_codec.frames_out
-    to: peer_router.client_resp
-  - from: amqp_codec.frames_out
+  - from: protocol.frames_out
     to: peer_router.client_resp
 
   # ── Codecs → session_processor ──────────────────────────
-  - from: mqtt_codec.proposals_out
-    to: session_processor.codec_in
-  - from: kafka_codec.proposals_out
-    to: session_processor.codec_in
-  - from: amqp_codec.proposals_out
+  - from: protocol.proposals_out
     to: session_processor.codec_in
 
   # ── session_processor response path ─────────────────────
   - from: session_processor.codec_out
-    to: mqtt_codec.responses_in
-  - from: session_processor.codec_out
-    to: kafka_codec.responses_in
-  - from: session_processor.codec_out
-    to: amqp_codec.responses_in
+    to: protocol.responses_in
 
   # ── session_processor → Raft proposals ──────────────────
   - from: session_processor.proposals
-    to: raft_engine.proposals
+    to: consensus.proposals
 
-  # Tagged path for QoS 1+ PUBLISH — raft_engine echoes
+  # Tagged path for QoS 1+ PUBLISH — consensus echoes
   # MSG_PROPOSAL_ASSIGNED so session_processor can bind correlation_id
-  # → wal_index and register the inflight with ack_tracker.
+  # → wal_index and register the inflight with `flow`.
   - from: session_processor.proposals_tagged
-    to: raft_engine.proposals_tagged
-  - from: raft_engine.proposal_assigned
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
     to: session_processor.assigned_in
 
   # ── HTTP surface (admin + raft RPC via stock path) ──────
-  - from: client_surface.raft_rpc
-    to: raft_engine.rpc
-  - from: client_surface.client_req
-    to: client_codec.raw
-  - from: client_surface.admin_req
-    to: rbac.request
-  - from: client_surface.responses
+  - from: gateway.raft_rpc
+    to: consensus.rpc
+  - from: gateway.admin_req
+    to: operations.admin_req
+  - from: gateway.responses
     to: peer_router.client_resp
-
   # ── Client pipeline (HTTP admin clients) ─────────────────
-  - from: client_codec.parsed
-    to: throttle_gate.requests
-  - from: throttle_gate.admitted
-    to: raft_engine.proposals
-  - from: throttle_gate.rejected
-    to: backpressure_propagator.rejected_in
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: gateway.rejected
+    to: flow.rejected_in
 
   # ── Flow control ────────────────────────────────────────
-  - from: flow_controller.credits
-    to: throttle_gate.credit_supply
-  - from: flow_controller.credits
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: admission.credits
     to: session_processor.flow_in
-  - from: flow_controller.envelope
-    to: backpressure_propagator.envelope_in
-  - from: replicator.lag_signal
-    to: flow_controller.lag
+  - from: admission.envelope
+    to: flow.envelope_in
+  - from: consensus.lag_signal
+    to: admission.lag
 
-  # ── Backpressure propagator → session_processor + http ──
-  - from: backpressure_propagator.protocol_signals
+  - from: flow.flow_out
     to: session_processor.flow_in
-  - from: backpressure_propagator.status
-    to: client_surface.throttle_status
+  - from: flow.status
+    to: gateway.throttle_status
 
-  # ── Prefetch controller (consumer flow) ─────────────────
   - from: session_processor.forward_out
-    to: prefetch_controller.lag_in
-  - from: prefetch_controller.credits_out
-    to: session_processor.flow_in
+    to: flow.forward_in
 
-  # ── ACK tracker ─────────────────────────────────────────
-  - from: durability_ledger.quorum_durable
-    to: ack_tracker.durability_in
-  - from: session_processor.forward_out
-    to: ack_tracker.register_in
-  - from: ack_tracker.ack_out
-    to: session_processor.ack_in
-  - from: ack_tracker.redeliver_out
+  # ── Flow composite: ack / backpressure / prefetch ────────
+  - from: durability.quorum_durable
+    to: flow.durability_in
+  - from: flow.ack_out
     to: session_processor.ack_in
 
   # ── Topic engine (single op_in port, demuxed by msg_type) ──
@@ -197,196 +174,158 @@ wiring:
   - from: topic_engine.forward_out
     to: forward_coordinator.forward_in
 
-  # ── Messaging infrastructure ────────────────────────────
+  # ── Messaging composite (dedup / offline / retained) ────
+  # One op bus in, one reply bus out: the composite's dispatch
+  # table demuxes by msg_type and the session state machine
+  # demuxes the replies, exactly as across the separate edges.
   - from: session_processor.messaging_out
-    to: dedup_engine.check_in
-  - from: dedup_engine.result_out
+    to: messaging.op_in
+  - from: messaging.result_out
     to: session_processor.messaging_in
-  - from: session_processor.messaging_out
-    to: offline_queue.enqueue_in
-  - from: session_processor.messaging_out
-    to: offline_queue.reconnect_in
-  - from: offline_queue.drain_out
-    to: session_processor.messaging_in
-  - from: session_processor.messaging_out
-    to: retained_store.write_in
-  - from: session_processor.messaging_out
-    to: retained_store.read_in
-  - from: retained_store.read_out
-    to: session_processor.messaging_in
+  - from: messaging.metrics
+    to: governance.ingest
 
-  # ── Consumer groups & transactions ──────────────────────
-  - from: session_processor.messaging_out
-    to: consumer_group_coordinator.op_in
-  - from: consumer_group_coordinator.assignment_out
-    to: session_processor.messaging_in
-  - from: session_processor.messaging_out
-    to: transaction_coordinator.op_in
-  - from: transaction_coordinator.result_out
-    to: session_processor.messaging_in
+  # Kafka consumer groups (JoinGroup/SyncGroup/Heartbeat/OffsetCommit,
+  # API keys 8-16) are served inside session_processor against its own
+  # group + offset tables; they need no graph edge.
 
   # ── Cross-PRG forwarding ────────────────────────────────
   - from: forward_coordinator.local_out
-    to: raft_engine.proposals
+    to: consensus.proposals
   - from: forward_coordinator.remote_out
     to: peer_router.peer_tx
-
   # ── Raft replication ────────────────────────────────────
-  - from: raft_engine.append_entries
-    to: replicator.entries
-  - from: replicator.net_out
+  - from: consensus.net_out
     to: peer_router.peer_tx
-  - from: replicator.match_indices
-    to: commit_tracker.match
-  - from: raft_engine.rpc_out
+  - from: consensus.rpc_out
     to: peer_router.peer_tx
 
   # ── Persistence ─────────────────────────────────────────
-  - from: raft_engine.log_append
-    to: wal.entries
-  - from: wal.flushed
-    to: durability_ledger.ack
-  - from: durability_ledger.quorum_durable
-    to: commit_tracker.durable
-
+  - from: consensus.log_append
+    to: durability.entries
+    # Rate-class the durability edge so the WAL's entry-pump gets a real
+    # per-step byte grant instead of 0. Unclassed (grant=0) forces the pump
+    # to `process_entries` exactly ONCE per step (`if grant == 0 { break; }`),
+    # capping durable-write throughput at 1 entry/tick regardless of backlog,
+    # fence depth, or cores. With a transaction grant the pump batches up to
+    # MAX_ENTRY_PUMP_RECORDS entries/step → one fsync amortises the whole
+    # batch. (Same fix as lattice's bare-metal-pi5.yaml.)
+    rate: transaction
+  # A restarted replica reads its replayed log bodies back out of the
+  # local WAL: replay restores the log, so log-matching succeeds and the
+  # leader never re-ships those entries. Without this pair the apply path
+  # stalls at the first gap.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  # Leader self-durability: raft learns its own WAL flush progress
+  # directly; without it the leader's durable advance rides the ~150 ms
+  # heartbeat round (measured: flat ~200 ms floor under every durable
+  # produce ack). Mirrors consensus-bench-pi5.yaml.
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  # Boot handoff: raft resumes at the WAL replay high-water before
+  # intake opens; a warm restart without it wedges the WAL within
+  # ~MAX_UNCOMMITTED_INFLIGHT entries.
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  # Cross-node durability acks fan back into the ledger (multi-node
+  # quorum; harmless single-node).
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
   # ── Commit → apply → session_processor ──────────────────
-  - from: commit_tracker.committed
-    to: apply_pipeline.entries
-  # Commit feedback to raft (clustor reference): without it
-  # raft_engine.commit_index never advances and raft throttles all
-  # proposals at MAX_UNCOMMITTED_INFLIGHT (24) — a hard ~24-entry cap.
-  - from: commit_tracker.committed
-    to: raft_engine.commit
-  - from: raft_engine.commit_advanced
-    to: apply_pipeline.entries
-  # log_observe → log_entries is required for the per-entry
-  # committed_entries stream that drives Quantum's apply-side state
-  # machine (PUBACK gating, dedup_check, retained_write, fan-out).
-  - from: raft_engine.log_observe
-    to: apply_pipeline.log_entries
-  - from: apply_pipeline.applied
+  - from: consensus.applied
     to: session_processor.committed_in
-  - from: apply_pipeline.committed_entries
+  - from: consensus.committed_entries
     to: session_processor.committed_in
-  - from: apply_pipeline.applied
-    to: client_surface.client_responses
+  - from: consensus.applied
+    to: gateway.applied
 
   # ── Snapshots ───────────────────────────────────────────
-  - from: snapshot_engine.export_chunks
-    to: replicator.snapshot_rx
-  - from: replicator.snapshot_import
-    to: snapshot_engine.import_chunks
-  - from: snapshot_engine.manifest_auth
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
     to: peer_router.peer_tx
-  - from: wal.compaction_signal
-    to: snapshot_engine.trigger
-  - from: wal.compaction_signal
-    to: dr_manager.wal_signal_in
-  - from: snapshot_engine.export_chunks
-    to: dr_manager.snapshot_resp_in
-
-  # ── Keys ────────────────────────────────────────────────
-  - from: key_manager.dek_epoch
-    to: wal.key_update
-  - from: key_manager.dek_epoch
-    to: snapshot_engine.key_update
+  - from: durability.compaction_signal
+    to: governance.wal_signal_in
+  - from: durability.export_chunks
+    to: governance.snapshot_resp_in
 
   # ── Control plane ───────────────────────────────────────
-  - from: cp_bridge.proof
-    to: cp_proof_cache.proof
-  - from: cp_proof_cache.cache_state
-    to: read_gate.cache
-  - from: cp_proof_cache.cache_state
-    to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
-  - from: read_gate.permits
-    to: apply_pipeline.read_permits
-  - from: placement_router.routing
-    to: client_codec.placement
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
+  - from: admission.permits
+    to: consensus.read_permits
+  - from: control_plane.routing
+    to: gateway.placement
 
-  # ── Tenant manager (Quantum enforcement) ────────────────
-  # NOTE: cp_bridge.tenant_records port requires the enhanced cp_bridge.
-  # Until that lands, tenant_manager operates from bootstrap config only.
-  # - from: cp_bridge.tenant_records
-  #   to: tenant_manager.records_in
-  - from: tenant_manager.quota_signals
-    to: throttle_gate.credit_supply
-  - from: tenant_manager.disconnect_events
+  # ── Tenant enforcement ──────────────────────────────────
+  # control_plane emits one record per refresh tick — currently the
+  # synthetic default `[tenant_id=0][max_rate=10000]` (clustor's cp.rs
+  # marks it a placeholder). Wiring it makes quota enforcement
+  # CP-driven rather than bootstrap-only; it does NOT establish a
+  # CONNECT→tenant mapping, which needs real CP tenant data. See
+  # docs/architecture/multi_tenancy.md "Implementation status".
+  - from: control_plane.tenant_records
+    to: governance.records_in
+  - from: governance.quota_signals
+    to: gateway.credit_supply
+  - from: governance.disconnect_events
     to: session_processor.cp_in
-
   # ── Admin ───────────────────────────────────────────────
-  - from: rbac.authorized
-    to: admin_handler.requests
-  - from: rbac.denied
-    to: client_surface.admin_responses
-  - from: admin_handler.raft_commands
-    to: raft_engine.admin_proposals
-  - from: admin_handler.responses
-    to: client_surface.admin_responses
-  - from: dr_manager.promotion
-    to: admin_handler.requests
+  - from: operations.denied
+    to: gateway.admin_responses
+  - from: operations.raft_commands
+    to: consensus.admin_proposals
+  - from: operations.responses
+    to: gateway.admin_responses
+  - from: governance.promotion
+    to: operations.admin_requests
 
   # ── Audit fan-in ────────────────────────────────────────
-  - from: rbac.audit_events
-    to: audit_logger.event_in
+  - from: operations.audit_events
+    to: governance.audit_in
   - from: session_processor.audit_out
-    to: audit_logger.event_in
-  - from: tenant_manager.audit_events
-    to: audit_logger.event_in
-  - from: dr_manager.audit_events
-    to: audit_logger.event_in
-  - from: audit_logger.signed_events
-    to: client_surface.admin_responses
+    to: governance.audit_in
+  - from: governance.signed_events
+    to: gateway.admin_responses
 
   # ── Metrics aggregator (Quantum dimensional) ────────────
   - from: session_processor.metrics_out
-    to: metrics_aggregator.ingest
-  - from: dedup_engine.metrics
-    to: metrics_aggregator.ingest
-  - from: offline_queue.metrics
-    to: metrics_aggregator.ingest
+    to: governance.ingest
   - from: forward_coordinator.metrics
-    to: metrics_aggregator.ingest
-  - from: consumer_group_coordinator.metrics
-    to: metrics_aggregator.ingest
-  - from: transaction_coordinator.metrics
-    to: metrics_aggregator.ingest
-  - from: ack_tracker.metrics
-    to: metrics_aggregator.ingest
-  - from: backpressure_propagator.metrics
-    to: metrics_aggregator.ingest
-  - from: prefetch_controller.metrics
-    to: metrics_aggregator.ingest
-  - from: tenant_manager.metrics
-    to: metrics_aggregator.ingest
-  - from: dr_manager.metrics
-    to: metrics_aggregator.ingest
+    to: governance.ingest
+  - from: flow.metrics
+    to: governance.ingest
   - from: topic_engine.metrics
-    to: metrics_aggregator.ingest
-  - from: retained_store.metrics
-    to: metrics_aggregator.ingest
-  - from: metrics_aggregator.rollups
-    to: telemetry_agg.ingest
+    to: governance.ingest
+  - from: governance.rollups
+    to: operations.ingest
 
   # ── Substrate metrics fan-in (stock Clustor path) ───────
-  - from: raft_engine.metrics
-    to: telemetry_agg.ingest
-  - from: replicator.metrics
-    to: telemetry_agg.ingest
-  - from: wal.metrics
-    to: telemetry_agg.ingest
-  - from: flow_controller.metrics
-    to: telemetry_agg.ingest
-  - from: cp_proof_cache.metrics
-    to: telemetry_agg.ingest
-  - from: snapshot_engine.metrics
-    to: telemetry_agg.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
 
   # ── Telemetry → HTTP ────────────────────────────────────
-  - from: telemetry_agg.readyz
-    to: client_surface.readyz_data
-  - from: telemetry_agg.why
-    to: client_surface.why_data
-  - from: telemetry_agg.export
-    to: client_surface.metrics_data
+  - from: operations.readyz
+    to: gateway.readyz_data
+  - from: operations.why
+    to: gateway.why_data
+  - from: operations.export
+    to: gateway.metrics_data

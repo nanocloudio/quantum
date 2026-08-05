@@ -1,0 +1,94 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# flow — publish acknowledgement, backpressure and consumer credit as one
+# composite module (standards fluxor-modules.md §8).
+#
+# Components: ack (durable-publish inflight keyed by
+# `(partition_id, wal_index)`, ack emission on quorum durability,
+# redelivery with exponential backoff), backpressure (admission's credit
+# envelope → protocol-native backpressure signals + periodic gateway
+# status), prefetch (per-consumer credit windows scaled by delivery lag).
+#
+# The components share no state and exchange no messages; each closes a
+# different flow-control loop around the session state machine. They
+# share `forward_in`: the session's outbound bus carries both
+# MSG_ACK_REGISTER and MSG_LAG_SIGNAL, which the module's dispatch table
+# demuxes. Replies leave on two ports because they land on two different
+# session inputs — `ack_out` on the ack input, `flow_out` on the flow
+# input.
+
+permissions = []
+
+# ── inputs ───────────────────────────────────────────────────
+
+# Session outbound bus. Frame types served:
+#   MSG_ACK_REGISTER → ack
+#   MSG_LAG_SIGNAL   → prefetch
+# Any other frame type is ignored — this is a shared bus.
+[[ports]]
+name = "forward_in"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_DURABILITY_PROOF (19 bytes), fanned in from every partition's
+# durability instance. Leave unwired only in graphs with no durable
+# publish path: the ack sweep is gated on this port being present,
+# because without proofs the per-partition high-water marks never
+# advance and no inflight entry can ever ack.
+[[ports]]
+name = "durability_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "envelope_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rejected_in"
+direction = "input"
+content_type = "OctetStream"
+
+# ── outputs ──────────────────────────────────────────────────
+
+# MSG_ACK_EMIT + MSG_ACK_REDELIVER → the session's ack input.
+[[ports]]
+name = "ack_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_BP_SIGNAL + MSG_PREFETCH_CREDIT → the session's flow input.
+[[ports]]
+name = "flow_out"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_THROTTLE_ENVELOPE status summary → the gateway, once per second.
+[[ports]]
+name = "status"
+direction = "output"
+content_type = "OctetStream"
+
+# Component-tagged samples under the dimensional metric envelope
+# `[dim_flag=1][tenant:u32][protocol:u8][prg:u16][metric_id][payload]`,
+# where metric_id is 0x11=ack, 0x12=backpressure, 0x13=prefetch, so the
+# aggregator keys per component instead of by payload hash (§8 rule 8).
+# One frame per component per 10s rollup window.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Per component: ack (acks_emitted, redelivers, abandoned, inflight),
+# backpressure (rejections, signals_emitted, entry_credits,
+# byte_credits), prefetch (credit_updates, consumers_active).
+metrics = [
+    "acks_emitted", "redelivers", "abandoned", "inflight",
+    "rejections", "signals_emitted", "entry_credits", "byte_credits",
+    "credit_updates", "consumers_active",
+]

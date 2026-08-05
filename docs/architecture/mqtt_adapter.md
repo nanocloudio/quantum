@@ -1,8 +1,7 @@
 # MQTT Adapter
 
-The MQTT adapter (`mqtt_codec` + the MQTT path through
-`session_processor`, `topic_engine`, `dedup_engine`, `offline_queue`,
-`retained_store`) implements MQTT 3.1, 3.1.1, and 5.0 over TLS/TCP
+The MQTT adapter (`protocol`'s mqtt component + the MQTT path through
+`session_processor`, `topic_engine`, `messaging`) implements MQTT 3.1, 3.1.1, and 5.0 over TLS/TCP
 and QUIC. This document is the MQTT reference; the Kafka and AMQP
 peers live in [kafka_adapter.md](kafka_adapter.md) and
 [amqp_adapter.md](amqp_adapter.md).
@@ -19,7 +18,7 @@ rule:
 | Connect flag | Behaviour |
 |---|---|
 | `clean_start=true` | Increment `session_epoch`, purge prior inflight state, begin fresh session record. |
-| `clean_start=false` | Reuse the stored session record if `session_epoch` matches; resume inflight QoS 1/2 packets and drain `offline_queue`. |
+| `clean_start=false` | Reuse the stored session record if `session_epoch` matches; resume inflight QoS 1/2 packets and drain the offline queue. |
 | Same `client_id`, different connection | Fenced takeover: increment `session_epoch`, DISCONNECT the prior connection with reason `0x8E` (Session taken over), begin a fresh apply context for the new connection. |
 
 Keep-alive defaults to the client-proposed value × 1.5
@@ -29,7 +28,7 @@ triggers DISCONNECT and Will processing.
 ## Authentication and authorization
 
 CP-Raft stores tenant ACLs and feature flags; the manifest flows
-through `cp_bridge` → `tenant_manager` → `session_processor`. Stale
+through `control_plane` → `governance`'s tenants component → `session_processor`. Stale
 CP caches force disconnect with `MQTT-5 0x87` (Not authorized) rather
 than risking authorisation against expired policy.
 
@@ -42,7 +41,7 @@ RBAC.
 | Level | Wire | Durability |
 |---|---|---|
 | **QoS 0** | PUBLISH | Fire-and-forget after syntax validation. No ACK. |
-| **QoS 1** | PUBLISH → PUBACK | PUBACK after WAL entries reach quorum durability via `ack_tracker`. |
+| **QoS 1** | PUBLISH → PUBACK | PUBACK after WAL entries reach quorum durability via `flow`'s ack component. |
 | **QoS 2** | PUBLISH → PUBREC → PUBREL → PUBCOMP | Four-phase handshake; each phase transition persists in WAL and requires quorum durability before progressing. |
 
 QoS 2's four-phase state is owned by `session_processor` and tracked
@@ -70,18 +69,18 @@ distribution function are observable as a routing-epoch bump.
 ## Offline delivery
 
 Sessions with `clean_start=false` accumulate deliveries in
-`offline_queue` while disconnected. On reconnect:
+`messaging`'s offline component while disconnected. On reconnect:
 
 1. `session_processor` validates the resumed session against the
    stored record.
 2. Offline-queue entries are drained in sequence order via
-   `offline_queue.drain_out` → `session_processor.offline_drain`.
+   `messaging.result_out` → `session_processor.messaging_in`.
 3. Drained messages re-enter the inflight slots and obey the same
    QoS contract as live publishes.
 
 Per-message expiry inherits the per-session / per-tenant
 `offline_queue_ttl` (default 72h, max 7d). Expired entries are GC'd
-on the next `offline_queue` sweep and bump
+on the next offline sweep and bump
 `earliest_offline_queue_index` so WAL compaction can advance.
 
 ## Will
@@ -98,7 +97,7 @@ CONNECT may include a Will message:
 
 ## Retained messages
 
-Retained payloads live in `retained_store` (content-addressed,
+Retained payloads live in `messaging`'s retained component (content-addressed,
 snapshot-persisted). New subscriptions receive the current retained
 payload for matching topics immediately after SUBACK. Setting an
 empty payload with `retain=true` clears the retained record.
@@ -109,7 +108,7 @@ empty payload with `retain=true` clears the retained record.
 |---|---|
 | Topic aliases | Implemented (`topic_alias_max = 65535` per graph default). |
 | Subscription identifiers | Implemented; preserved through forwards. |
-| User properties | Decoded by `mqtt_codec`; passed through `WorkloadForwardEnvelope` to subscribers. |
+| User properties | Decoded by `protocol`'s mqtt component; passed through `WorkloadForwardEnvelope` to subscribers. |
 | Reason strings | Emitted on error responses; bounded to keep response size predictable. |
 | Server keep-alive | Default 60s; overridable per tenant. |
 | Server reference | Emitted on DISCONNECT during planned drain to hint reconnection to other nodes. |
@@ -132,8 +131,8 @@ MQTT maps `dirty_epoch` to:
 
 The QUIC listener path is structurally identical to TLS/TCP. The
 `tls` module accepts QUIC streams alongside TLS sessions, and
-`protocol_router` ALPN-demuxes `mqtt-quic` into the same
-`mqtt_codec`. Resume semantics inherit from QUIC:
+`protocol`'s router component ALPN-demuxes `mqtt-quic` into the same
+`protocol`'s mqtt component. Resume semantics inherit from QUIC:
 
 - 0-RTT is disabled for non-CONNECT packets (the codec rejects 0-RTT
   data outside CONNECT).

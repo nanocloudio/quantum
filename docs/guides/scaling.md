@@ -1,89 +1,127 @@
-# Autoscale Upward Runbook (PRG = Partition Raft Group)
+# Scaling
 
-Goal: grow the cluster node count and PRG count with no/near-zero downtime, keeping 3 replicas and 3 voters per PRG. This is structured so it can be automated; each step notes the checks and state needed for intelligent scaling.
+How to grow (and shrink) the cluster's node count and Partition Raft
+Group (PRG) count with no or near-zero downtime, keeping 3 replicas and
+3 voters per PRG throughout. Traffic moves only by routing-epoch change:
+`control_plane` emits an epoch event, `session_processor` fences
+sessions on the old epoch, and stale-epoch publishes are rejected with
+`dirty_epoch`. Each step below states the health predicates that gate
+it, so the runbook is equally usable by an operator or an automation
+supervisor.
 
-## Assumptions
-- Each PRG always has 3 replicas (all voters).
-- The control plane is embedded (only supported mode in the fluxor-native build) and exposes routing/placements and `/readyz` via `http_surface`.
-- TLS trust domain is consistent across nodes; new nodes ship the same cert materials.
-- Routing epoch changes are the only way to move traffic; the `placement_router` epoch-event output fences sessions in `session_processor` and rejects stale-epoch publishes with `dirty_epoch`.
-- Raft transport uses per-peer connection pooling via `peer_router`, so multiple PRGs on a node share the same TLS sessions to peers, keeping FD/handshake overhead low.
+## Model
 
-## Inputs for an automation loop
-- Current node count N; desired node count N'.
-- Current PRG count P; desired PRG count P' (P' > P for scale-up).
-- Per-tenant PRG count (if overrides exist) and total tenant load.
-- Placement template: 3 replicas spread across distinct nodes/AZs.
-- Health signals: cp cache fresh, PRG ready, replication/apply lag, strict-fallback=false.
+- Every PRG has 3 replicas, all voters.
+- The control plane is embedded (the only mode in the fluxor-native
+  build) and exposes routing/placements and `/readyz` via
+  `gateway`.
+- New nodes ship the same TLS trust bundle as the existing cluster.
+- Raft transport pools per-peer connections in `peer_router`, so
+  multiple PRGs on a node share the same TLS sessions to peers.
 
-## Pre-flight checks (block automation if any fail)
-- Control-plane cache is Fresh on all nodes; strict-fallback is false.
-- All PRGs ready; replication/apply lag under thresholds; durability fence inactive.
-- TLS/trust bundle readable on all nodes.
-- Routing epoch monotone and observed by listeners.
+Inputs to a scaling decision: current and desired node count (N → N′),
+current and desired PRG count (P → P′), per-tenant PRG overrides and
+total tenant load, and a placement template (3 replicas across distinct
+nodes/AZs). Size the target with `P′ = ceil(total_load / target_per_prg_load)`.
 
-## Phase 1: Add node capacity
-1) Increase StatefulSet/VM group from N→N' (one at a time).  
-2) On each new node: verify readyz/livez, TLS identity in correct trust domain, and ability to reach control-plane endpoints.  
-3) Do not change placements yet; PRGs stay on existing nodes, so no quorum risk.
+## Pre-flight (all must hold)
 
-## Phase 2: Define new PRGs
-1) Choose new PRG ids (e.g., tenant `default` gains partitions P..P'-1).  
-2) Select 3 distinct nodes for each new PRG (prefer spreading across old+new nodes if you want higher resilience; otherwise bias to new nodes for load offload).  
-3) Create placement records for each new PRG with routing_epoch = current_epoch+1 (will publish after bootstrap).
+- Control-plane cache is Fresh on every node; strict-fallback is false.
+- All PRGs ready; replication and apply lag under thresholds; the
+  durability fence is inactive.
+- The TLS trust bundle is readable on all nodes.
+- The routing epoch is monotone and observed by every listener.
 
-## Phase 3: Bootstrap new PRGs
-1) Start the Raft groups for the new PRGs using their 3-node placements.  
-2) Wait for leader election and replication readiness: commit index advancing, no fences, replication lag low.  
-3) Confirm control-plane placement caches contain the new PRGs and are Fresh.
+## Scaling up
 
-## Phase 4: Publish new routing epoch
-1) Bump routing_epoch by 1 and publish the placements for all PRGs (existing + new).  
-2) Verify all nodes ingest the new epoch (cache Fresh, epoch matches).  
-3) Listeners should now admit sessions/topics that map to the new PRGs.
+Grow capacity first, then define and bootstrap new PRGs, then move
+traffic — so quorum is never at risk.
 
-## Phase 5: Rebalance traffic
-1) Direct new tenants/topics to the new PRGs first (minimizes churn).  
-2) If moving existing tenants/topics, update their placements and bump routing_epoch each time; move small batches to limit fence windows.  
-3) After each move: ensure cp cache Fresh everywhere, PRGs ready, strict-fallback=false.
+1. **Add nodes (N → N′), one at a time.** On each new node verify
+   `/readyz`, TLS identity in the correct trust domain, and
+   reachability to the control-plane endpoints. Placements are unchanged
+   at this point; existing PRGs stay put.
+2. **Define new PRGs.** Choose new PRG ids (e.g. tenant `default` gains
+   partitions P..P′−1) and 3 distinct nodes for each — bias toward new
+   nodes to offload, or spread across old+new for resilience. Create
+   placement records at `routing_epoch = current + 1` (published later).
+3. **Bootstrap new PRGs.** Start their Raft groups on the chosen
+   placements; wait for leader election and replication readiness
+   (commit index advancing, no fences, low lag). Confirm the CP
+   placement caches contain the new PRGs and are Fresh.
+4. **Publish the new epoch.** Bump `routing_epoch` by 1 and publish
+   placements for all PRGs. Verify every node ingests the new epoch
+   (cache Fresh, epoch matches). Listeners now admit sessions/topics
+   mapping to the new PRGs.
+5. **Rebalance traffic.** Direct new tenants/topics to the new PRGs
+   first. To move existing tenants/topics, update their placements and
+   bump `routing_epoch` per move, in small batches to bound the fence
+   window. After each move, confirm caches Fresh everywhere, PRGs ready,
+   strict-fallback false.
+6. **Validate.** Check replication/apply lag, `/readyz`, cache state,
+   routing epoch, and placement count. Roll back a `routing_epoch` bump
+   if caches do not reach Fresh within a timeout, or if any PRG falls
+   out of ready.
 
-## Phase 6: Validation and steady state
-- Check metrics: replication lag, apply lag, readyz, cp cache_state, routing_epoch, placement_count.  
-- Audit logs for rebalance events (if enabled).  
-- When stable, mark rebalancing complete.
+## Scaling down
 
-## Automation cues (hook points)
-- Trigger scale-up when lag/queue depth cross thresholds or when tenant/PRG utilization exceeds target.  
-- Use a planner: compute P' = ceil(total_load / target_per_prg_load).  
-- Place replicas with a spread policy (node/AZ anti-affinity).  
-- Gate each phase on health predicates above; auto-roll back a routing_epoch bump if caches do not reach Fresh within a timeout.
+Shrinking is explicit and operator-initiated — it requires an armed
+shrink plan so that a routine restart never triggers an accidental
+shrink or rebalance. A shrink plan carries a plan id and target
+placements and lives in control-plane state; supervisors reject shrink
+operations unless a plan is armed.
 
-## Scaling down (explicit, operator-initiated)
-- Require an explicit “shrink” command/intent so restarts do not auto-shrink or rebalance by accident. Treat shrink as a change request with a plan id.
-- High-level flow with clustor shrink plans (example: 4 PRGs → 3 PRGs, keeping 3 replicas/voters per PRG):
-  1) Pre-flight: caches Fresh, strict-fallback=false, all PRGs healthy, lag below thresholds.
-  2) Freeze new placements on the PRG(s) to be removed (mark them draining in control plane).
-  3) Choose target PRGs for migration; update placements for a small tenant/topic batch to target PRGs, bump routing_epoch, wait for Fresh everywhere; repeat until draining PRG empty.
-  4) Once empty, shrink the draining PRG’s Raft group membership if needed (still 3 voters until removal), then delete its placement and bump routing_epoch.
-  5) Only after the routing_epoch is stable and caches Fresh, remove the nodes that are no longer needed (or repurpose them).
-- Automation hooks: the shrink intent should live in control-plane state (plan id + target PRGs) so supervisors reject shrink operations unless explicitly armed. Roll back if caches do not reach Fresh after an epoch bump, or if any PRG falls out of ready.
-- Clustor shrink support (admin HTTP):
-  - Endpoints (mTLS): `POST /admin/shrink-plan` (create), `POST /admin/shrink-plan/arm`, `POST /admin/shrink-plan/cancel`, `GET /admin/shrink-plan` (list). One plan can be armed at a time.
-  - Example create payload:
-    ```json
+High-level flow (example: 4 PRGs → 3, keeping 3 replicas/voters each):
+
+1. Pre-flight as above: caches Fresh, strict-fallback false, all PRGs
+   healthy, lag below thresholds.
+2. Freeze new placements on the PRG(s) to be removed (mark them draining
+   in the control plane).
+3. Migrate a small tenant/topic batch to the target PRGs, bump
+   `routing_epoch`, wait for Fresh everywhere; repeat until the draining
+   PRG is empty.
+4. Once empty, adjust the draining PRG's Raft membership if needed
+   (still 3 voters until removal), delete its placement, and bump
+   `routing_epoch`.
+5. Only after the epoch is stable and caches Fresh, remove or repurpose
+   the freed nodes.
+
+Roll back if caches do not reach Fresh after an epoch bump, or if any
+PRG falls out of ready.
+
+### Shrink admin API (mTLS)
+
+Shrink plans are managed through Clustor's `operations` admin surface,
+which `quantum-linux.yaml` and `quantum-pi5.yaml` reach via
+`gateway.admin_req → operations.admin_req`, returning on
+`operations.responses → gateway.admin_responses`.
+
+| Endpoint | Action |
+|---|---|
+| `POST /admin/shrink-plan` | Create a plan |
+| `POST /admin/shrink-plan/arm` | Arm a plan (one at a time) |
+| `POST /admin/shrink-plan/cancel` | Cancel / roll back |
+| `GET /admin/shrink-plan` | List plans |
+
+Create payload:
+
+```json
+{
+  "plan_id": "shrink-p4",
+  "target_placements": [
     {
-      "plan_id": "shrink-p4",
-      "target_placements": [
-        {
-          "prg_id": "tenantA:3",
-          "target_members": ["node-a", "node-b", "node-c"],
-          "target_routing_epoch": 42
-        }
-      ]
+      "prg_id": "tenantA:3",
+      "target_members": ["node-a", "node-b", "node-c"],
+      "target_routing_epoch": 42
     }
-    ```
-  - Arm the plan: `POST /admin/shrink-plan/arm` with `{"plan_id":"shrink-p4"}`. Arm fails if another plan is already armed.
-  - Cancel/roll back: `POST /admin/shrink-plan/cancel` with `{"plan_id":"shrink-p4"}`; state becomes RolledBack if it was armed.
-  - Effects: When armed, the control-plane routing publication substitutes the target placements and advertises the plan id; shrink plan metrics surface via CP metrics (`cp.shrink_plans.total`, `cp.shrink_plans.armed`, `cp.shrink_plans.cancelled`).
-  - Operators/automation should only migrate tenants/topics and bump routing_epoch while a plan is armed; once migrations complete and caches are Fresh, cancel/roll back or mark done and then remove nodes.
-  - Embedded CP in Quantum currently exposes routing/features through `cp_bridge` and `http_surface`; shrink admin endpoints require the full Clustor `admin_handler` surface to be wired into the graph (present in `quantum-linux.yaml` and `quantum-cm5.yaml`, omitted from `quantum-linux-minimal.yaml`).
+  ]
+}
+```
+
+Arm with `{"plan_id":"shrink-p4"}` (fails if another plan is already
+armed); cancel with the same body (state becomes `RolledBack` if it was
+armed). While armed, the control-plane routing publication substitutes
+the target placements and advertises the plan id; migrate tenants/topics
+and bump `routing_epoch` only while the plan is armed, then cancel or
+mark done and remove nodes. Shrink metrics surface via CP
+(`cp.shrink_plans.total`, `.armed`, `.cancelled`).

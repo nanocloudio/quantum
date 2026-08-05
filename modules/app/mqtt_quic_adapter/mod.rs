@@ -1,21 +1,21 @@
 //! MQTT-over-QUIC adapter.
 //!
-//! Bridges fluxor's `quic` foundation module to quantum's `mqtt_codec`
+//! Bridges fluxor's `quic` foundation module to quantum's `protocol`
 //! without modifying either side. Lives between `quic.app_out` /
-//! `quic.app_in` and `mqtt_codec.raw_in` / `response_mux.mux_out`.
+//! `quic.app_in` and `protocol.raw_in` / `protocol.frames_out`.
 //!
-//! Inbound (quic → mqtt_codec): strips fluxor's MSG_QUIC_STREAM_DATA
+//! Inbound (quic → protocol): strips fluxor's MSG_QUIC_STREAM_DATA
 //! envelope (`[0x13][cid][sid:varint=0][fin][data…]`) and emits the
-//! plain `[cid][data]` shape that mqtt_codec already accepts from
-//! `protocol_router.mqtt_out`. STREAM_OPEN, PEER_IDENTITY, and DATAGRAM
+//! plain `[cid][data]` shape `protocol.raw_in` already accepts from the
+//! TCP path. STREAM_OPEN, PEER_IDENTITY, and DATAGRAM
 //! envelopes are observed but not propagated this revision — MQTT-over-
 //! QUIC carries its control channel over a single bidi stream (id 0)
 //! per the WG MQTT QUIC mapping draft, and the datagram path is reserved
 //! for an optional unreliable QoS 0 fast-path that quantum doesn't
 //! plumb yet.
 //!
-//! Outbound (mqtt_codec → quic): consumes envelope-framed
-//! MSG_CLIENT_FRAME (0xEA) messages from `response_mux.mux_out`,
+//! Outbound (protocol → quic): consumes envelope-framed
+//! MSG_CLIENT_FRAME (0xEA) messages from `protocol.frames_out`,
 //! payload shape `[cid][mqtt bytes]`, and re-emits as a raw
 //! MSG_QUIC_STREAM_WRITE envelope (`[0x14][cid][sid=0][fin=0][data…]`)
 //! to `quic.app_in`. The QUIC pump appends `data…` to the named
@@ -41,7 +41,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -65,7 +65,7 @@ const SESSION_ID_BYTES: usize = 4;
 const STREAM_DATA_PREFIX: usize = 8; // session_id(4) + stream_id(4)
 
 /// Largest MQTT control packet we will forward in either direction.
-/// Matches `mqtt_codec::MAX_PACKET` so the adapter cannot become the
+/// Matches the mqtt codec's `MAX_PACKET` so the adapter cannot become the
 /// gating clamp.
 const MAX_PACKET: usize = 4096;
 
@@ -139,7 +139,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
-        // ── Inbound: quic.app_out → mqtt_codec.raw_in ───────────────
+        // ── Inbound: quic.app_out → protocol.raw_in ───────────────
         //
         // quic emits mux frames via net_write_frame, i.e. one
         // `[msg_type:u8][len:u16 LE][payload]` frame per message. Read
@@ -156,7 +156,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let pl = plen;
             if mtype != MSG_MUX_STREAM_RX {
                 // STREAM_ACCEPTED / PEER_IDENTITY / STREAM_CLOSED / DATAGRAM_RX
-                // are observed but not propagated: mqtt_codec auto-creates a
+                // are observed but not propagated: the mqtt codec auto-creates a
                 // conn slot on first byte, identity is a future mTLS hook, and
                 // the MQTT control channel rides the bidi stream, not datagrams.
                 continue;
@@ -183,18 +183,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.frame_buf.as_mut_ptr().add(1),
                 data_len,
             );
-            // mqtt_codec.raw_in is length-delimited (MSG_CLIENT_FRAME
+            // protocol.raw_in is length-delimited (MSG_CLIENT_FRAME
             // envelope) so per-conn records don't coalesce on the byte FIFO —
-            // same framing protocol_router uses on the TCP path.
+            // same framing the router uses on the TCP path.
             let w = wire::channel_write_msg(
                 sys, s.mqtt_out, wire::MSG_CLIENT_FRAME, &s.frame_buf[..total],
             );
             if w > 0 { s.stream_frames_in += 1; } else { s.dropped += 1; }
         }
 
-        // ── Outbound: response_mux.mux_out → quic.app_in ───────────
+        // ── Outbound: protocol.frames_out → quic.app_in ───────────
         //
-        // mux_out emits envelope-framed MSG_CLIENT_FRAME (0xEA) with payload
+        // frames_out emits envelope-framed MSG_CLIENT_FRAME (0xEA) with payload
         // `[cid][mqtt bytes]`. Re-emit as a CMD_MUX_STREAM_SEND net-frame:
         // payload `[session_id:4 LE][stream_id:4 LE][data]`, where session_id
         // is the provider connection index (== cid) and stream_id is 0. quic

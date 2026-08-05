@@ -12,9 +12,9 @@ particular **ROUTING-EPOCH**.
 
 | Component | Role |
 |---|---|
-| **Edge Listener** | TLS termination, SNI / ALPN demux (`tls` + `peer_router` + `protocol_router`); forwards framed packets to the session processor. |
+| **Edge Listener** | TLS termination, SNI / ALPN demux (`tls` + `peer_router` + `protocol`'s router component); forwards framed packets to the session processor. |
 | **Session Processor** | Adapter logic, dedupe, offline queues, Will / retained features. All durable state mutation occurs inside the Raft apply loop. Helpers may precompute, but every mutation commits through the same apply path. |
-| **Control Agent** | Per-node helper (subsumed by `cp_bridge` + `tenant_manager` in the fluxor-native build): syncs CP-Raft objects, publishes health, manages certificates, requests rebalance actions. |
+| **Control Agent** | Per-node helper (`control_plane` + `governance`'s tenants component): syncs CP-Raft objects, publishes health, manages certificates, requests rebalance actions. |
 
 ### Environment
 
@@ -112,7 +112,7 @@ the publish to the topic PRG via `forward_coordinator`. Mechanics:
   persists this state inside the PRG snapshot.
 - Same-node forwards bypass the network entirely —
   `forward_coordinator.local_forward` emits directly to
-  `raft_engine.proposals` on the destination PRG's apply core.
+  `consensus.proposals` on the destination PRG's apply core.
 - Cross-node forwards go through `peer_router.repl_tx`, framed
   identically to Raft AppendEntries, so they share TLS sessions and
   connection-pool slots with regular replication traffic.
@@ -126,9 +126,9 @@ forward primitive.
 
 ## Operator surfaces
 
-- **Routing snapshot.** `http_surface` `/admin` lists the current epoch, placements, and CP cache freshness.
-- **Drain a node.** `admin_handler` accepts a drain command that stops session admission but keeps existing sessions alive; combine with leader transfer for rolling restarts.
-- **Move a PRG.** Issue a placement plan via `admin_handler`; CP-Raft validates anti-affinity and emits a new epoch.
+- **Routing snapshot.** `gateway` `/admin` lists the current epoch, placements, and CP cache freshness.
+- **Drain a node.** `operations` accepts a drain command that stops session admission but keeps existing sessions alive; combine with leader transfer for rolling restarts.
+- **Move a PRG.** Issue a placement plan via `operations`; CP-Raft validates anti-affinity and emits a new epoch.
 
 See [guides/high_availability.md](../guides/high_availability.md) for
 the operator-level workflows that exercise these surfaces.

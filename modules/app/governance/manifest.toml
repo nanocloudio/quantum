@@ -1,0 +1,112 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# governance — tenancy, disaster recovery, audit and telemetry as one
+# composite module (standards fluxor-modules.md §8).
+#
+# Components: tenants (per-tenant quota enforcement, noisy-neighbour
+# control, forced disconnects), dr (checkpoint/archive scheduling and the
+# controlled promotion state machine), audit (sequence-numbered,
+# HMAC-signed audit records), telemetry (dimensional metric aggregation
+# under a cardinality limit, rolled up to the operations export surface).
+#
+# tenants and dr are the two largest producers of audit events and both
+# publish their own counters. Those were graph edges into the audit and
+# telemetry modules; they are now in-module seam rings carrying the same
+# record framing, drained by the dispatch table in the same step the
+# event is raised.
+#
+# Each component keeps its own input ports — there is no shared request
+# bus here, so no demux is needed and no component can consume another's
+# records.
+
+permissions = []
+
+# ── inputs ───────────────────────────────────────────────────
+
+# Metric samples from every other module. Dimensional envelopes
+# (`[dim_flag=1][tenant:u32][protocol:u8][prg:u16][metric_id][payload]`)
+# key by their dimensions; anything else falls back to a payload hash.
+[[ports]]
+name = "ingest"
+direction = "input"
+content_type = "OctetStream"
+
+# Audit events from the external producers (the session state machine,
+# the operations surface). tenants' and dr's own events ride the
+# in-module seam instead.
+[[ports]]
+name = "audit_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "records_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "charge_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "wal_signal_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_resp_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "promotion_req_in"
+direction = "input"
+content_type = "OctetStream"
+
+# ── outputs ──────────────────────────────────────────────────
+
+[[ports]]
+name = "rollups"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "signed_events"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "quota_signals"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "disconnect_events"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_req"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "promotion"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Per component: tenants (records_applied, quota_violations, disconnects),
+# dr (checkpoints_shipped, archives_shipped, promotions), audit
+# (events_logged and the per-category counters), telemetry
+# (total_ingested, cardinality_violations, rollups_emitted).
+metrics = [
+    "records_applied", "quota_violations", "disconnects",
+    "checkpoints_shipped", "archives_shipped", "promotions",
+    "events_logged", "total_ingested", "cardinality_violations",
+    "rollups_emitted",
+]
