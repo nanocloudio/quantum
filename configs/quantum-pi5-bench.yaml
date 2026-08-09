@@ -1,4 +1,4 @@
-# Quantum: Pi 5 multi-domain production graph (26 modules, 6 logical domains).
+# Quantum: Pi 5 multi-domain production graph (16 modules, 6 logical domains).
 #
 # Maps the doc's 6-domain layout onto a 4-core Pi 5: ingest co-locates with
 # apply on Core 3, messaging co-locates with ops on Core 0.
@@ -171,15 +171,11 @@ wiring:
     to: gateway.credit_supply
   - from: admission.credits
     to: session_processor.flow_in
-  - from: admission.envelope
-    to: flow.envelope_in
   - from: consensus.lag_signal
     to: admission.lag
     edge_class: cross_core
   - from: flow.flow_out
     to: session_processor.flow_in
-  - from: flow.status
-    to: gateway.throttle_status
   - from: session_processor.forward_out
     to: flow.forward_in
 

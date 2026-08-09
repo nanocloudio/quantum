@@ -81,7 +81,11 @@ struct LocalEntry {
 
 impl LocalEntry {
     const fn zero() -> Self {
-        Self { surface: 0, max_fence: 0, active: 0 }
+        Self {
+            surface: 0,
+            max_fence: 0,
+            active: 0,
+        }
     }
 }
 
@@ -158,7 +162,8 @@ impl ModuleState {
         // Replace existing entry for the same node_id, else use first free slot.
         let mut chosen: Option<usize> = None;
         for (i, p) in self.peers.iter().enumerate() {
-            if p.active == 1 && p.node_id_len as usize == id_len
+            if p.active == 1
+                && p.node_id_len as usize == id_len
                 && p.node_id[..id_len] == node_id[..id_len]
             {
                 chosen = Some(i);
@@ -167,15 +172,21 @@ impl ModuleState {
         }
         if chosen.is_none() {
             for (i, p) in self.peers.iter().enumerate() {
-                if p.active == 0 { chosen = Some(i); break; }
+                if p.active == 0 {
+                    chosen = Some(i);
+                    break;
+                }
             }
         }
-        let idx = match chosen { Some(i) => i, None => return false };
+        let idx = match chosen {
+            Some(i) => i,
+            None => return false,
+        };
         let dst = &mut self.peers[idx];
         dst.node_id_len = id_len as u8;
         dst.node_id[..id_len].copy_from_slice(&node_id[..id_len]);
         dst.n_entries = n as u8;
-        for i in 0..n { dst.entries[i] = entries[i]; }
+        dst.entries[..n].copy_from_slice(&entries[..n]);
         dst.last_seen_tick = self.tick;
         dst.active = 1;
         true
@@ -188,20 +199,42 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, _ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+pub unsafe extern "C" fn module_new(
+    in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<ModuleState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<ModuleState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
@@ -218,8 +251,12 @@ pub extern "C" fn module_new(
         s.peer_ads_received = 0;
         s.rejected_advertisements = 0;
 
-        for i in 0..MAX_LOCAL_ENTRIES { s.local[i] = LocalEntry::zero(); }
-        for i in 0..MAX_PEERS { s.peers[i] = PeerEntry::zero(); }
+        for i in 0..MAX_LOCAL_ENTRIES {
+            s.local[i] = LocalEntry::zero();
+        }
+        for i in 0..MAX_PEERS {
+            s.peers[i] = PeerEntry::zero();
+        }
 
         // Bootstrap: identify as "quantum-node" + seed the canonical
         // quantum offerings. Graphs with multiple quantum nodes should
@@ -245,43 +282,68 @@ pub extern "C" fn module_new(
 /// Pack the local advertisement payload into `out`. Returns bytes written.
 fn pack_advertisement(s: &ModuleState, out: &mut [u8]) -> usize {
     let mut p = 0usize;
-    if out.len() < 2 + s.node_id_len as usize + 1 { return 0; }
-    out[p] = s.node_id_len; p += 1;
+    if out.len() < 2 + s.node_id_len as usize + 1 {
+        return 0;
+    }
+    out[p] = s.node_id_len;
+    p += 1;
     let id_len = s.node_id_len as usize;
-    out[p..p + id_len].copy_from_slice(&s.node_id[..id_len]); p += id_len;
+    out[p..p + id_len].copy_from_slice(&s.node_id[..id_len]);
+    p += id_len;
     let active = s.local.iter().filter(|e| e.active == 1).count();
-    out[p] = active as u8; p += 1;
+    out[p] = active as u8;
+    p += 1;
     for e in s.local.iter() {
-        if e.active != 1 { continue; }
-        if p + 2 > out.len() { break; }
-        out[p] = e.surface; p += 1;
-        out[p] = e.max_fence; p += 1;
+        if e.active != 1 {
+            continue;
+        }
+        if p + 2 > out.len() {
+            break;
+        }
+        out[p] = e.surface;
+        p += 1;
+        out[p] = e.max_fence;
+        p += 1;
     }
     p
 }
 
-/// Parse an advertisement payload into (node_id slice, entries). Returns
-/// None on malformed input.
-fn parse_advertisement(buf: &[u8]) -> Option<(&[u8], [(u8, u8); MAX_LOCAL_ENTRIES], usize)> {
-    if buf.is_empty() { return None; }
+/// A parsed advertisement: the peer's node id, its `(StorageSurface,
+/// FenceKind)` entries, and how many of them are populated.
+type Advertisement<'a> = (&'a [u8], [(u8, u8); MAX_LOCAL_ENTRIES], usize);
+
+/// Parse an advertisement payload. Returns None on malformed input.
+fn parse_advertisement(buf: &[u8]) -> Option<Advertisement<'_>> {
+    if buf.is_empty() {
+        return None;
+    }
     let id_len = buf[0] as usize;
-    if 1 + id_len + 1 > buf.len() { return None; }
+    if 1 + id_len + 1 > buf.len() {
+        return None;
+    }
     let node_id = &buf[1..1 + id_len];
     let n = buf[1 + id_len] as usize;
     let entries_start = 2 + id_len;
-    if entries_start + n * 2 > buf.len() { return None; }
+    if entries_start + n * 2 > buf.len() {
+        return None;
+    }
     let mut entries = [(0u8, 0u8); MAX_LOCAL_ENTRIES];
     let take = core::cmp::min(n, MAX_LOCAL_ENTRIES);
-    for i in 0..take {
+    for (i, entry) in entries.iter_mut().take(take).enumerate() {
         let off = entries_start + i * 2;
-        entries[i] = (buf[off], buf[off + 1]);
+        *entry = (buf[off], buf[off + 1]);
     }
     Some((node_id, entries, take))
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -289,9 +351,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.tick = s.tick.wrapping_add(1);
 
         // ── Periodic local advertisement ──
-        if s.advertise_at_next_tick == 1
-            || (s.tick % ADVERTISE_PERIOD == 0)
-        {
+        if s.advertise_at_next_tick == 1 || s.tick.is_multiple_of(ADVERTISE_PERIOD) {
             s.advertise_at_next_tick = 0;
             if s.out_local_ad >= 0 {
                 let mut payload = [0u8; MAX_FRAME];
@@ -299,7 +359,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if n > 0 {
                     let poll = (sys.channel_poll)(s.out_local_ad, 0x02);
                     if poll > 0 && (poll as u32 & 0x02) != 0 {
-                        wire::channel_write_msg(sys, s.out_local_ad, MSG_CAP_ADVERTISE, &payload[..n]);
+                        wire::channel_write_msg(
+                            sys,
+                            s.out_local_ad,
+                            MSG_CAP_ADVERTISE,
+                            &payload[..n],
+                        );
                         s.ads_emitted = s.ads_emitted.wrapping_add(1);
                     }
                 }
@@ -310,7 +375,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_peer_ad >= 0 {
             for _ in 0..4 {
                 let poll = (sys.channel_poll)(s.in_peer_ad, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (mt, plen) = wire::channel_read_msg(sys, s.in_peer_ad, &mut s.buf);
                 if mt != MSG_CAP_ADVERTISE || plen == 0 {
                     s.rejected_advertisements = s.rejected_advertisements.wrapping_add(1);
@@ -319,14 +386,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let n = plen as usize;
                 // Copy the slice we need so the immutable borrow on
                 // `s.buf` is released before we mutate `s` in store_peer.
-                let parsed = parse_advertisement(&s.buf[..n]).map(
-                    |(id, entries, count)| {
-                        let mut id_copy = [0u8; MAX_NODE_ID];
-                        let take = core::cmp::min(id.len(), MAX_NODE_ID);
-                        id_copy[..take].copy_from_slice(&id[..take]);
-                        (id_copy, take, entries, count)
-                    },
-                );
+                let parsed = parse_advertisement(&s.buf[..n]).map(|(id, entries, count)| {
+                    let mut id_copy = [0u8; MAX_NODE_ID];
+                    let take = core::cmp::min(id.len(), MAX_NODE_ID);
+                    id_copy[..take].copy_from_slice(&id[..take]);
+                    (id_copy, take, entries, count)
+                });
                 if let Some((id_copy, take, entries, count)) = parsed {
                     if s.store_peer(&id_copy[..take], &entries[..count]) {
                         s.peer_ads_received = s.peer_ads_received.wrapping_add(1);
@@ -350,9 +415,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_query >= 0 {
             for _ in 0..4 {
                 let poll = (sys.channel_poll)(s.in_query, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (mt, plen) = wire::channel_read_msg(sys, s.in_query, &mut s.buf);
-                if mt != MSG_CAP_QUERY || plen < 2 { continue; }
+                if mt != MSG_CAP_QUERY || plen < 2 {
+                    continue;
+                }
                 let req_surface = s.buf[0];
                 let req_fence = s.buf[1];
 
@@ -360,33 +429,54 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut p = 0usize;
                 // Reply format: [n_matches:u8] then
                 //   N × [node_id_len:u8][node_id:N][surface:u8][max_fence:u8]
-                let count_off = p; p += 1;
+                let count_off = p;
+                p += 1;
                 let mut matches = 0u8;
 
                 // Local matches.
                 for e in s.local.iter() {
-                    if e.active != 1 || e.surface != req_surface { continue; }
-                    if e.max_fence < req_fence { continue; }
+                    if e.active != 1 || e.surface != req_surface {
+                        continue;
+                    }
+                    if e.max_fence < req_fence {
+                        continue;
+                    }
                     let id_len = s.node_id_len as usize;
-                    if p + 1 + id_len + 2 > reply.len() { break; }
-                    reply[p] = s.node_id_len; p += 1;
-                    reply[p..p + id_len].copy_from_slice(&s.node_id[..id_len]); p += id_len;
-                    reply[p] = e.surface; p += 1;
-                    reply[p] = e.max_fence; p += 1;
+                    if p + 1 + id_len + 2 > reply.len() {
+                        break;
+                    }
+                    reply[p] = s.node_id_len;
+                    p += 1;
+                    reply[p..p + id_len].copy_from_slice(&s.node_id[..id_len]);
+                    p += id_len;
+                    reply[p] = e.surface;
+                    p += 1;
+                    reply[p] = e.max_fence;
+                    p += 1;
                     matches += 1;
                 }
                 // Peer matches.
                 for peer in s.peers.iter() {
-                    if peer.active != 1 { continue; }
+                    if peer.active != 1 {
+                        continue;
+                    }
                     let id_len = peer.node_id_len as usize;
                     for i in 0..(peer.n_entries as usize) {
                         let (surf, fence) = peer.entries[i];
-                        if surf != req_surface || fence < req_fence { continue; }
-                        if p + 1 + id_len + 2 > reply.len() { break; }
-                        reply[p] = peer.node_id_len; p += 1;
-                        reply[p..p + id_len].copy_from_slice(&peer.node_id[..id_len]); p += id_len;
-                        reply[p] = surf; p += 1;
-                        reply[p] = fence; p += 1;
+                        if surf != req_surface || fence < req_fence {
+                            continue;
+                        }
+                        if p + 1 + id_len + 2 > reply.len() {
+                            break;
+                        }
+                        reply[p] = peer.node_id_len;
+                        p += 1;
+                        reply[p..p + id_len].copy_from_slice(&peer.node_id[..id_len]);
+                        p += id_len;
+                        reply[p] = surf;
+                        p += 1;
+                        reply[p] = fence;
+                        p += 1;
                         matches = matches.saturating_add(1);
                     }
                 }
@@ -396,7 +486,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let poll_out = (sys.channel_poll)(s.out_query_reply, 0x02);
                     if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
                         wire::channel_write_msg(
-                            sys, s.out_query_reply, MSG_CAP_QUERY_REPLY, &reply[..p],
+                            sys,
+                            s.out_query_reply,
+                            MSG_CAP_QUERY_REPLY,
+                            &reply[..p],
                         );
                     }
                 }

@@ -1,7 +1,7 @@
 # quantum Makefile — the lifecycle only: clean / build / test / lint /
 # ci / publish. Anything else is the `fluxor` CLI directly
-# (`fluxor modules build`, `fluxor run`, `fluxor up`, `fluxor
-# update`, `fluxor sync`, `fluxor validate …`) — a make target that
+# (`fluxor modules build`, `fluxor run`, `fluxor
+# update`, `fluxor sync`, `fluxor build --check …`) — a make target that
 # merely renames one CLI command is bloat, not convenience.
 # See ~/Development/nanocloudio/standards/make.md.
 
@@ -14,12 +14,12 @@ SHELL       := /bin/bash
 
 help:
 	@echo "quantum lifecycle:"
-	@echo "  make build     cargo build --workspace --all-targets"
-	@echo "  make test      cargo test --workspace"
-	@echo "  make lint      rustfmt --check + clippy -D warnings"
+	@echo "  make build     cargo build --all-targets, per host crate"
+	@echo "  make test      cargo test --all-targets, per host crate"
+	@echo "  make lint      rustfmt --check + clippy -D warnings, per host crate"
 	@echo "  make ci        fluxor ci — the full gate (lints, hygiene,"
 	@echo "                 tests, strict module build, lockfile checks)"
-	@echo "  make publish   fluxor publish — canonical registry publish"
+	@echo "  make publish   fluxor publish — publish artefacts into the store"
 	@echo "  make clean     cargo clean + module artefacts"
 	@echo ""
 	@echo "quantum-specific:"
@@ -31,10 +31,13 @@ help:
 	@echo "  fluxor modules build --target bcm2712 --out target   PIC modules —"
 	@echo "                            prerequisite for every integration smoke below"
 	@echo "  fluxor modules build --all --out target              every fluxor.toml target"
-	@echo "  fluxor run configs/… / fluxor up …                   bring-up"
-	@echo "  fluxor update / sync                                 registry consumption"
-	@echo "  fluxor validate configs/quantum-*.yaml               graph-YAML validation"
+	@echo "  fluxor run configs/…                                 bring-up"
+	@echo "  fluxor update / sync                                 store consumption"
+	@echo "  fluxor build --check configs/quantum-linux.yaml      graph-YAML validation"
+	@echo "                            (one config per invocation; loop for all)"
 	@echo "  fluxor publish --local                               local-only publish"
+	@echo "  tools/ci-shadow-guard.sh                             shadow-checkout hard-fail (ci 3.5)"
+	@echo "  tools/host_crates_e2e.sh                             host-crate fmt/clippy/test (ci 3.5)"
 	@echo ""
 	@echo "Integration smokes (run the script directly; build modules first):"
 	@echo "  tests/integration/module_graph_mqtt.sh           MQTT/AMQP/Kafka handshake e2e"
@@ -46,17 +49,24 @@ help:
 	@echo "  tests/integration/module_graph_mqtt_quic.sh      MQTT over QUIC (UDP 4443; skips w/o aioquic)"
 	@echo "  tests/integration/module_graph_kafka.sh          Kafka ApiVersions handshake"
 	@echo "  tests/integration/multi_node.sh                  3-node raft cluster (ports 9090-9092)"
-	@echo "One-time setup: cargo install --locked --path ../fluxor/tools"
+	@echo "One-time setup: make -C ../fluxor install"
+
+# No root Cargo workspace: the deployable surface is modules/, built by
+# `fluxor modules build`. The three host crates under tools/ stand alone,
+# so each lifecycle target drives them per-crate — the same set, and the
+# same order, that `tools/host_crates_e2e.sh` enforces in CI.
+HOST_CRATES := tools/telemetry_guard tools/wire_lint tools/quantum-bench
 
 build:
-	cargo build --workspace --all-targets
+	@for c in $(HOST_CRATES); do (cd $$c && cargo build --all-targets) || exit 1; done
 
 test:
-	cargo test --workspace
+	@for c in $(HOST_CRATES); do (cd $$c && cargo test --all-targets) || exit 1; done
 
 lint:
-	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	@for c in $(HOST_CRATES); do \
+	  (cd $$c && cargo fmt -- --check && \
+	   cargo clippy --all-targets --all-features -- -D warnings) || exit 1; done
 
 ci:
 	fluxor ci
@@ -65,7 +75,7 @@ publish:
 	fluxor publish
 
 clean:
-	cargo clean
+	@for c in $(HOST_CRATES); do (cd $$c && cargo clean) || exit 1; done
 	fluxor modules clean
 
 # The one project-specific target (standards/make.md §1.3 / §4): a

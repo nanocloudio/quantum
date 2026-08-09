@@ -10,7 +10,7 @@
 /// Decode ASCII hex into `out`. Returns the byte count, or `None` on odd length,
 /// a non-hex digit, or insufficient output space.
 pub fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     let n = hex.len() / 2;

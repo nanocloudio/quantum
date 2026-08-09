@@ -132,15 +132,12 @@ const PKT_UNSUBACK: u8 = 11;
 const INFLIGHT_PUB: u8 = 0;
 const INFLIGHT_SUB: u8 = 1;
 
-
-
 /// A `Session` slot can be in three logical states:
 ///   - free      : `active == 0 && persisted == 0` — no client uses this slot.
 ///   - connected : `active == 1` — a client is online; conn_id is current.
 ///   - persisted : `active == 0 && persisted == 1` — client disconnected but
-///                 clean_start was false, so subscriptions, inflight, and
-///                 prefetch state must survive until either reconnect or
-///                 explicit purge.
+///     clean_start was false, so subscriptions, inflight, and prefetch state
+///     must survive until either reconnect or explicit purge.
 ///
 /// Per MQTT 3.1.1 §3.1.2.4, sessions with clean_start=false MUST persist
 /// across reconnect; the existing slot is reactivated rather than allocated
@@ -173,22 +170,28 @@ const MAX_USER_PROPS_BYTES: usize =
 /// truncated entry or a body too short for the claimed sizes is
 /// reported as malformed via a `None`-equivalent return.
 fn user_props_block_len(buf: &[u8]) -> Option<usize> {
-    if buf.is_empty() { return None; }
+    if buf.is_empty() {
+        return None;
+    }
     let count = buf[0] as usize;
     let mut off = 1usize;
     for _ in 0..count {
-        if off + 2 > buf.len() { return None; }
+        if off + 2 > buf.len() {
+            return None;
+        }
         let klen = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
         off += 2 + klen;
-        if off + 2 > buf.len() { return None; }
+        if off + 2 > buf.len() {
+            return None;
+        }
         let vlen = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
         off += 2 + vlen;
-        if off > buf.len() { return None; }
+        if off > buf.len() {
+            return None;
+        }
     }
     Some(off)
 }
-
-
 
 /// Operation identifier for tagged Raft proposals, so the ack component's
 /// `MSG_ACK_EMIT` can route to the right MQTT response (PUBACK / PUBREC /
@@ -237,7 +240,6 @@ const KIN_KI_MASK: u32 = 0xFF;
 const KIN_EPOCH_SHIFT: u32 = 8;
 const KIN_EPOCH_MASK: u32 = 0x3F_FFFF;
 
-
 /// Bounds accepted topic names on the produce path (Metadata-side cap in
 /// `protocol::kafka` uses the same value).
 const KAFKA_MAX_TOPIC: usize = 64;
@@ -274,8 +276,6 @@ const KIN_PROTO_AMQP: u8 = 2;
 /// resolves independently and the ProduceResponse fires once all land.
 const KIN_MAX_PARTS: usize = 16;
 
-
-
 // ── Kafka consumer groups + committed offsets ──────────────────────────────
 //
 // Broker-side group membership is deliberately thin: the ASSIGNMENT is
@@ -298,12 +298,6 @@ const KERR_ILLEGAL_GENERATION: i16 = 22;
 const KERR_UNKNOWN_MEMBER_ID: i16 = 25;
 const KERR_REBALANCE_IN_PROGRESS: i16 = 27;
 
-
-
-
-
-
-
 // ── AMQP push consumers (Basic.Consume) ─────────────────────────────────────
 //
 // Registered by `protocol::amqp` op=3; the delivery pump in module_step pushes
@@ -317,22 +311,6 @@ const ACONSUMERS: usize = 16;
 const AMQP_TAG_MAX: usize = 48;
 /// Deliveries pushed per consumer per tick (pump pacing).
 const AMQP_DELIVER_QUOTA: usize = 4;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // ── Apply-side message store (Kafka Fetch / AMQP Basic.Get) ────────────────
 //
@@ -364,10 +342,6 @@ const KFLAG_BATCH: u8 = 1;
 /// `len` sentinel marking "wrap to ring start" (never a real entry len).
 const KWRAP: u16 = 0xFFFF;
 
-
-
-
-
 /// A correlation whose assignment never returns is reclaimed after this
 /// long. Held well above the durability-round-trip tail (fsync stalls,
 /// leadership churn) so a legitimately-slow assignment is never dropped.
@@ -376,10 +350,21 @@ const CORRELATION_TIMEOUT_MS: u64 = 30_000;
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_codec: i32, in_committed: i32, in_flow: i32, in_ack: i32,
-    in_cp: i32, in_messaging: i32, in_deliver: i32, in_assigned: i32,
-    out_proposals: i32, out_codec: i32, out_topic: i32,
-    out_messaging: i32, out_forward: i32, out_audit: i32, out_metrics: i32,
+    in_codec: i32,
+    in_committed: i32,
+    in_flow: i32,
+    in_ack: i32,
+    in_cp: i32,
+    in_messaging: i32,
+    in_deliver: i32,
+    in_assigned: i32,
+    out_proposals: i32,
+    out_codec: i32,
+    out_topic: i32,
+    out_messaging: i32,
+    out_forward: i32,
+    out_audit: i32,
+    out_metrics: i32,
     out_proposals_tagged: i32,
 
     credit_base_window: u32,
@@ -470,31 +455,50 @@ struct ModuleState {
     out_buf: [u8; BUF_SIZE],
 }
 
-impl ModuleState {
-
-
-
-
-}
+impl ModuleState {}
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 { core::mem::size_of::<ModuleState>() as u32 }
+pub extern "C" fn module_state_size() -> u32 {
+    core::mem::size_of::<ModuleState>() as u32
+}
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, _ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+pub unsafe extern "C" fn module_new(
+    in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<ModuleState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<ModuleState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
@@ -524,7 +528,7 @@ pub extern "C" fn module_new(
         s.apply_resets = 0;
         for i in 0..MAX_SESSIONS {
             sessions::clear(&mut s.sessions, i);
-        sessions::clear_flow(&mut s.sessions, i);
+            sessions::clear_flow(&mut s.sessions, i);
         }
         correlate::init(&mut s.correlate);
         store::init(&mut s.store);
@@ -558,12 +562,21 @@ pub extern "C" fn module_new(
 ///
 /// # Safety
 unsafe fn emit_codec_response(
-    sys: &SyscallTable, chan: i32,
-    conn_id: u8, proto: u8, pkt_type: u8, flags: u8, body: &[u8],
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: u8,
+    proto: u8,
+    pkt_type: u8,
+    flags: u8,
+    body: &[u8],
 ) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     let total = 1 + 3 + body.len();
-    if total > BUF_SIZE { return false; }
+    if total > BUF_SIZE {
+        return false;
+    }
     let mut out = [0u8; BUF_SIZE];
     out[0] = conn_id;
     out[1] = proto;
@@ -583,14 +596,25 @@ unsafe fn emit_codec_response(
 ///
 /// # Safety
 unsafe fn emit_kafka_response(
-    sys: &SyscallTable, chan: i32,
-    conn_id: u8, api_key: i16, api_ver: i16, kafka_corr: i32, body: &[u8],
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: u8,
+    api_key: i16,
+    api_ver: i16,
+    kafka_corr: i32,
+    body: &[u8],
 ) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     let total = 10 + body.len();
-    if total > BUF_SIZE { return false; }
+    if total > BUF_SIZE {
+        return false;
+    }
     let mut out = [0u8; 256];
-    if total > out.len() { return false; }
+    if total > out.len() {
+        return false;
+    }
     out[0] = conn_id;
     out[1] = 1; // PROTO_KAFKA envelope discriminator
     out[2..4].copy_from_slice(&api_key.to_le_bytes());
@@ -599,6 +623,19 @@ unsafe fn emit_kafka_response(
     out[10..total].copy_from_slice(body);
     let w = wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]);
     w > 0
+}
+
+/// One partition's ProduceResponse outcome: the request correlation it
+/// answers and the per-partition result.
+#[cfg(feature = "kafka")]
+#[derive(Clone, Copy)]
+struct KafkaProduceAck<'a> {
+    api_ver: i16,
+    kafka_corr: i32,
+    topic: &'a [u8],
+    partition: i32,
+    error: i16,
+    base_offset: i64,
 }
 
 #[cfg(feature = "kafka")]
@@ -612,28 +649,49 @@ unsafe fn emit_kafka_response(
 ///
 /// # Safety
 unsafe fn emit_kafka_produce_response(
-    sys: &SyscallTable, chan: i32,
-    conn_id: u8, api_ver: i16, kafka_corr: i32,
-    topic: &[u8], partition: i32, error: i16, base_offset: i64,
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: u8,
+    ack: KafkaProduceAck<'_>,
 ) -> bool {
-    if topic.len() > KAFKA_MAX_TOPIC { return false; }
+    let KafkaProduceAck {
+        api_ver,
+        kafka_corr,
+        topic,
+        partition,
+        error,
+        base_offset,
+    } = ack;
+    if topic.len() > KAFKA_MAX_TOPIC {
+        return false;
+    }
     let mut body = [0u8; 128];
     let mut p = 0usize;
-    body[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4;
-    body[p..p + 2].copy_from_slice(&(topic.len() as i16).to_be_bytes()); p += 2;
-    body[p..p + topic.len()].copy_from_slice(topic); p += topic.len();
-    body[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4;
-    body[p..p + 4].copy_from_slice(&partition.to_be_bytes()); p += 4;
-    body[p..p + 2].copy_from_slice(&error.to_be_bytes()); p += 2;
-    body[p..p + 8].copy_from_slice(&base_offset.to_be_bytes()); p += 8;
+    body[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    p += 4;
+    body[p..p + 2].copy_from_slice(&(topic.len() as i16).to_be_bytes());
+    p += 2;
+    body[p..p + topic.len()].copy_from_slice(topic);
+    p += topic.len();
+    body[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    p += 4;
+    body[p..p + 4].copy_from_slice(&partition.to_be_bytes());
+    p += 4;
+    body[p..p + 2].copy_from_slice(&error.to_be_bytes());
+    p += 2;
+    body[p..p + 8].copy_from_slice(&base_offset.to_be_bytes());
+    p += 8;
     if api_ver >= 2 {
-        body[p..p + 8].copy_from_slice(&(-1i64).to_be_bytes()); p += 8;
+        body[p..p + 8].copy_from_slice(&(-1i64).to_be_bytes());
+        p += 8;
     }
     if api_ver >= 5 {
-        body[p..p + 8].copy_from_slice(&0i64.to_be_bytes()); p += 8;
+        body[p..p + 8].copy_from_slice(&0i64.to_be_bytes());
+        p += 8;
     }
     if api_ver >= 1 {
-        body[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        body[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
     emit_kafka_response(sys, chan, conn_id, 0, api_ver, kafka_corr, &body[..p])
 }
@@ -654,20 +712,18 @@ unsafe fn emit_kafka_produce_response(
 /// acks!=0 → tagged proposals; base_offset = each entry's WAL index.
 ///
 /// # Safety
-unsafe fn handle_kafka_produce(
-    s: &mut ModuleState, sys: &SyscallTable, now: u64, plen: usize,
-) {
+unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64, plen: usize) {
     let conn_id = s.in_buf[0];
     let api_ver = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let kafka_corr = i32::from_le_bytes([
-        s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9],
-    ]);
+    let kafka_corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
     let req_end = plen;
     let mut off = 10usize;
     let mut parse_ok = true;
     macro_rules! need {
         ($n:expr) => {
-            if off + $n > req_end { parse_ok = false; }
+            if off + $n > req_end {
+                parse_ok = false;
+            }
         };
     }
 
@@ -679,7 +735,9 @@ unsafe fn handle_kafka_produce(
             off += 2;
             if tl > 0 {
                 off += tl as usize;
-                if off > req_end { parse_ok = false; }
+                if off > req_end {
+                    parse_ok = false;
+                }
             }
         }
     }
@@ -696,7 +754,10 @@ unsafe fn handle_kafka_produce(
         need!(4);
         if parse_ok {
             topic_count = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             off += 4;
         }
@@ -724,20 +785,31 @@ unsafe fn handle_kafka_produce(
         need!(4);
         if parse_ok {
             part_count = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             off += 4;
         }
         if parse_ok && (1..=KIN_MAX_PARTS as i32).contains(&part_count) {
             for pi in 0..part_count as usize {
                 need!(8);
-                if !parse_ok { break; }
+                if !parse_ok {
+                    break;
+                }
                 p_ids[pi] = i32::from_be_bytes([
-                    s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                    s.in_buf[off],
+                    s.in_buf[off + 1],
+                    s.in_buf[off + 2],
+                    s.in_buf[off + 3],
                 ]);
                 off += 4;
                 let rlen = i32::from_be_bytes([
-                    s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                    s.in_buf[off],
+                    s.in_buf[off + 1],
+                    s.in_buf[off + 2],
+                    s.in_buf[off + 3],
                 ]);
                 off += 4;
                 if rlen <= 0 || off + rlen as usize > req_end {
@@ -766,9 +838,17 @@ unsafe fn handle_kafka_produce(
         s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
         if topic_len > 0 && acks != 0 {
             emit_kafka_produce_response(
-                sys, s.out_codec, conn_id, api_ver, kafka_corr,
-                &topic[..topic_len], if part_count >= 1 { p_ids[0] } else { 0 },
-                KERR_INVALID_REQUEST, -1,
+                sys,
+                s.out_codec,
+                conn_id,
+                KafkaProduceAck {
+                    api_ver,
+                    kafka_corr,
+                    topic: &topic[..topic_len],
+                    partition: if part_count >= 1 { p_ids[0] } else { 0 },
+                    error: KERR_INVALID_REQUEST,
+                    base_offset: -1,
+                },
             );
         }
         return;
@@ -779,13 +859,15 @@ unsafe fn handle_kafka_produce(
     // stay in p_errs and surface in the aggregated response.
     if acks == 0 {
         for pi in 0..n_parts {
-            if p_errs[pi] != 0 { continue; }
+            if p_errs[pi] != 0 {
+                continue;
+            }
             let op_body_len = 2 + 2 + topic_len + p_lens[pi];
             let hdr = wire::QPROP_HEADER_LEN;
-            if hdr + op_body_len > s.out_buf.len() { continue; }
-            wire::encode_qprop_header(
-                &mut s.out_buf[..hdr], wire::QOP_KAFKA_PRODUCE, 0, 0,
-            );
+            if hdr + op_body_len > s.out_buf.len() {
+                continue;
+            }
+            wire::encode_qprop_header(&mut s.out_buf[..hdr], wire::QOP_KAFKA_PRODUCE, 0, 0);
             s.out_buf[hdr..hdr + 2].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
             s.out_buf[hdr + 2..hdr + 4].copy_from_slice(&(topic_len as u16).to_le_bytes());
             s.out_buf[hdr + 4..hdr + 4 + topic_len].copy_from_slice(&topic[..topic_len]);
@@ -795,7 +877,9 @@ unsafe fn handle_kafka_produce(
                 p_lens[pi],
             );
             if try_emit(
-                sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL,
+                sys,
+                s.out_proposals,
+                wire::MSG_CLIENT_PROPOSAL,
                 &s.out_buf[..hdr + op_body_len],
             ) {
                 s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
@@ -808,17 +892,29 @@ unsafe fn handle_kafka_produce(
     let Some((ki, slot)) = store::inflight_alloc(&mut s.store) else {
         s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
         emit_kafka_produce_response(
-            sys, s.out_codec, conn_id, api_ver, kafka_corr,
-            &topic[..topic_len], p_ids[0], KERR_REQUEST_TIMED_OUT, -1,
+            sys,
+            s.out_codec,
+            conn_id,
+            KafkaProduceAck {
+                api_ver,
+                kafka_corr,
+                topic: &topic[..topic_len],
+                partition: p_ids[0],
+                error: KERR_REQUEST_TIMED_OUT,
+                base_offset: -1,
+            },
         );
         return;
     };
 
     let mut pending = 0u8;
     for pi in 0..n_parts {
-        if p_errs[pi] != 0 { continue; }
+        if p_errs[pi] != 0 {
+            continue;
+        }
         let packet_id = (ki as u16) | ((pi as u16) << 8);
-        let Some(cid) = correlate::allocate(&mut s.correlate, slot, packet_id, OP_KPRODUCE, now) else {
+        let Some(cid) = correlate::allocate(&mut s.correlate, slot, packet_id, OP_KPRODUCE, now)
+        else {
             p_errs[pi] = KERR_REQUEST_TIMED_OUT;
             continue;
         };
@@ -832,7 +928,9 @@ unsafe fn handle_kafka_produce(
         s.out_buf[0..8].copy_from_slice(&cid.to_le_bytes());
         wire::encode_qprop_header(
             &mut s.out_buf[8..8 + wire::QPROP_HEADER_LEN],
-            wire::QOP_KAFKA_PRODUCE, 0, slot,
+            wire::QOP_KAFKA_PRODUCE,
+            0,
+            slot,
         );
         let ob = wire::QPROP_TAGGED_HDR_LEN;
         s.out_buf[ob..ob + 2].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
@@ -844,7 +942,9 @@ unsafe fn handle_kafka_produce(
             p_lens[pi],
         );
         if try_emit(
-            sys, s.out_proposals_tagged, wire::MSG_CLIENT_PROPOSAL,
+            sys,
+            s.out_proposals_tagged,
+            wire::MSG_CLIENT_PROPOSAL,
             &s.out_buf[..prop_total],
         ) {
             s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
@@ -889,40 +989,48 @@ unsafe fn handle_kafka_produce(
 ///
 /// # Safety
 unsafe fn emit_kafka_produce_response_multi(
-    s: &mut ModuleState, sys: &SyscallTable, ki: usize,
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    ki: usize,
 ) -> bool {
-    let Some(e) = store::inflight_get(&s.store, ki) else { return false; };
+    let Some(e) = store::inflight_get(&s.store, ki) else {
+        return false;
+    };
     let tl = e.topic_len as usize;
     let n = e.n_parts as usize;
     let mut p = 0usize;
-    s.out_buf[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4;
-    s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes()); p += 2;
-    s.out_buf[p..p + tl].copy_from_slice(&e.topic[..tl]); p += tl;
-    s.out_buf[p..p + 4].copy_from_slice(&(n as i32).to_be_bytes()); p += 4;
+    s.out_buf[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    p += 4;
+    s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + tl].copy_from_slice(&e.topic[..tl]);
+    p += tl;
+    s.out_buf[p..p + 4].copy_from_slice(&(n as i32).to_be_bytes());
+    p += 4;
     for pi in 0..n {
-        s.out_buf[p..p + 4].copy_from_slice(&e.part_ids[pi].to_be_bytes()); p += 4;
-        s.out_buf[p..p + 2].copy_from_slice(&e.part_errs[pi].to_be_bytes()); p += 2;
-        s.out_buf[p..p + 8].copy_from_slice(&e.part_offs[pi].to_be_bytes()); p += 8;
+        s.out_buf[p..p + 4].copy_from_slice(&e.part_ids[pi].to_be_bytes());
+        p += 4;
+        s.out_buf[p..p + 2].copy_from_slice(&e.part_errs[pi].to_be_bytes());
+        p += 2;
+        s.out_buf[p..p + 8].copy_from_slice(&e.part_offs[pi].to_be_bytes());
+        p += 8;
         if e.api_ver >= 2 {
-            s.out_buf[p..p + 8].copy_from_slice(&(-1i64).to_be_bytes()); p += 8;
+            s.out_buf[p..p + 8].copy_from_slice(&(-1i64).to_be_bytes());
+            p += 8;
         }
         if e.api_ver >= 5 {
-            s.out_buf[p..p + 8].copy_from_slice(&0i64.to_be_bytes()); p += 8;
+            s.out_buf[p..p + 8].copy_from_slice(&0i64.to_be_bytes());
+            p += 8;
         }
     }
     if e.api_ver >= 1 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
     emit_kafka_response_outbuf(s, sys, e.conn_id, 0, e.api_ver, e.kafka_corr, p)
 }
 
 // ── Apply-side message store ────────────────────────────────────────────────
-
-
-
-
-
-
 
 #[cfg(feature = "kafka")]
 /// Apply-side QOP_KAFKA_PRODUCE: store the committed record batches and
@@ -935,10 +1043,14 @@ unsafe fn emit_kafka_produce_response_multi(
 /// back-to-back); each is stored as its own entry with its own
 /// contiguous baseOffset so consumer offset accounting stays monotonic.
 fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
-    if body.len() < 4 { return; }
+    if body.len() < 4 {
+        return;
+    }
     let partition = u16::from_le_bytes([body[0], body[1]]);
     let tl = u16::from_le_bytes([body[2], body[3]]) as usize;
-    if tl == 0 || tl > KAFKA_MAX_TOPIC || 4 + tl >= body.len() { return; }
+    if tl == 0 || tl > KAFKA_MAX_TOPIC || 4 + tl >= body.len() {
+        return;
+    }
     let mut topic = [0u8; KAFKA_MAX_TOPIC];
     topic[..tl].copy_from_slice(&body[4..4 + tl]);
     let records = &body[4 + tl..];
@@ -955,15 +1067,27 @@ fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
     while bo + 61 <= records.len() && guard < 256 {
         guard += 1;
         let batch_len = i32::from_be_bytes([
-            records[bo + 8], records[bo + 9], records[bo + 10], records[bo + 11],
+            records[bo + 8],
+            records[bo + 9],
+            records[bo + 10],
+            records[bo + 11],
         ]);
-        if batch_len < 49 { break; }
+        if batch_len < 49 {
+            break;
+        }
         let total = 12 + batch_len as usize;
-        if bo + total > records.len() { break; }
+        if bo + total > records.len() {
+            break;
+        }
         let nrec_minus1 = i32::from_be_bytes([
-            records[bo + 23], records[bo + 24], records[bo + 25], records[bo + 26],
+            records[bo + 23],
+            records[bo + 24],
+            records[bo + 25],
+            records[bo + 26],
         ]);
-        if !(0..=65535).contains(&nrec_minus1) { break; }
+        if !(0..=65535).contains(&nrec_minus1) {
+            break;
+        }
         let nrec = (nrec_minus1 + 1) as u32;
         // `records` aliases s.in_buf; store::push writes only the store.
         let rec = unsafe { core::slice::from_raw_parts(records.as_ptr().add(bo), total) };
@@ -980,13 +1104,19 @@ fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
 /// routing key's log (partition 0, raw-flagged — invisible to Kafka
 /// Fetch). Op-body: [rk_len:u16 LE][routing_key][payload].
 fn apply_amqp_publish(s: &mut ModuleState, body: &[u8]) {
-    if body.len() < 2 { return; }
+    if body.len() < 2 {
+        return;
+    }
     let rl = u16::from_le_bytes([body[0], body[1]]) as usize;
-    if rl == 0 || rl > KAFKA_MAX_TOPIC || 2 + rl > body.len() { return; }
+    if rl == 0 || rl > KAFKA_MAX_TOPIC || 2 + rl > body.len() {
+        return;
+    }
     let mut rk = [0u8; KAFKA_MAX_TOPIC];
     rk[..rl].copy_from_slice(&body[2..2 + rl]);
     let payload = &body[2 + rl..];
-    let Some(pi) = store::find_or_create(&mut s.store, &rk[..rl], 0) else { return; };
+    let Some(pi) = store::find_or_create(&mut s.store, &rk[..rl], 0) else {
+        return;
+    };
     let pl = payload.len();
     let pp = payload.as_ptr();
     let pay = unsafe { core::slice::from_raw_parts(pp, pl) };
@@ -1002,11 +1132,18 @@ fn apply_amqp_publish(s: &mut ModuleState, body: &[u8]) {
 ///
 /// # Safety
 unsafe fn emit_kafka_response_outbuf(
-    s: &mut ModuleState, sys: &SyscallTable,
-    conn_id: u8, api_key: i16, api_ver: i16, kafka_corr: i32, body_len: usize,
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u8,
+    api_key: i16,
+    api_ver: i16,
+    kafka_corr: i32,
+    body_len: usize,
 ) -> bool {
     let total = 10 + body_len;
-    if total > BUF_SIZE { return false; }
+    if total > BUF_SIZE {
+        return false;
+    }
     // Shift the body up to make room for the 10-byte header (memmove).
     core::ptr::copy(s.out_buf.as_ptr(), s.out_buf.as_mut_ptr().add(10), body_len);
     s.out_buf[0] = conn_id;
@@ -1015,11 +1152,13 @@ unsafe fn emit_kafka_response_outbuf(
     s.out_buf[4..6].copy_from_slice(&api_ver.to_le_bytes());
     s.out_buf[6..10].copy_from_slice(&kafka_corr.to_le_bytes());
     let w = wire::channel_write_msg(
-        sys, s.out_codec, wire::MSG_SESSION_RESPONSE, &s.out_buf[..total],
+        sys,
+        s.out_codec,
+        wire::MSG_SESSION_RESPONSE,
+        &s.out_buf[..total],
     );
     w > 0
 }
-
 
 /// Bounds on how much of a Fetch/ListOffsets request we service in one
 /// response. A real assignment is a handful of topics × ≤16 partitions;
@@ -1044,60 +1183,102 @@ unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usiz
     // replica_id(4) max_wait(4) min_bytes(4) [v3+: max_bytes(4)]
     // [v4+: isolation(1)] topics(4) ...
     let mut off = 10 + 12;
-    if api_ver >= 3 { off += 4; }
-    if api_ver >= 4 { off += 1; }
-    if off + 4 > end { return; }
+    if api_ver >= 3 {
+        off += 4;
+    }
+    if api_ver >= 4 {
+        off += 1;
+    }
+    if off + 4 > end {
+        return;
+    }
     let topic_count = i32::from_be_bytes([
-        s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+        s.in_buf[off],
+        s.in_buf[off + 1],
+        s.in_buf[off + 2],
+        s.in_buf[off + 3],
     ]);
     off += 4;
-    if topic_count < 1 { return; }
+    if topic_count < 1 {
+        return;
+    }
 
     let budget_end = 7600usize.min(BUF_SIZE - 16);
     let mut p = 0usize;
     if api_ver >= 1 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // throttle
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // throttle
     }
     let resp_topic_count = topic_count.min(KFETCH_MAX_TOPICS as i32);
-    s.out_buf[p..p + 4].copy_from_slice(&resp_topic_count.to_be_bytes()); p += 4;
+    s.out_buf[p..p + 4].copy_from_slice(&resp_topic_count.to_be_bytes());
+    p += 4;
 
     for _ in 0..resp_topic_count {
-        if off + 2 > end { break; }
+        if off + 2 > end {
+            break;
+        }
         let tl = i16::from_be_bytes([s.in_buf[off], s.in_buf[off + 1]]) as usize;
         off += 2;
-        if tl == 0 || tl > KAFKA_MAX_TOPIC || off + tl > end { return; }
+        if tl == 0 || tl > KAFKA_MAX_TOPIC || off + tl > end {
+            return;
+        }
         let mut topic = [0u8; KAFKA_MAX_TOPIC];
         topic[..tl].copy_from_slice(&s.in_buf[off..off + tl]);
         off += tl;
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         let part_count = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
         ]);
         off += 4;
         let resp_part_count = part_count.clamp(0, KFETCH_MAX_PARTS as i32);
 
-        if p + 2 + tl + 8 > BUF_SIZE { return; }
-        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes()); p += 2;
-        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]); p += tl;
-        s.out_buf[p..p + 4].copy_from_slice(&resp_part_count.to_be_bytes()); p += 4;
+        if p + 2 + tl + 8 > BUF_SIZE {
+            return;
+        }
+        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes());
+        p += 2;
+        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]);
+        p += tl;
+        s.out_buf[p..p + 4].copy_from_slice(&resp_part_count.to_be_bytes());
+        p += 4;
 
         for _ in 0..part_count {
             // partition(4) fetch_offset(8) [v5+: log_start(8)] max_bytes(4)
             let mut need = 16;
-            if api_ver >= 5 { need += 8; }
-            if off + need > end { return; }
+            if api_ver >= 5 {
+                need += 8;
+            }
+            if off + need > end {
+                return;
+            }
             let partition = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             let fetch_offset = i64::from_be_bytes([
-                s.in_buf[off + 4], s.in_buf[off + 5], s.in_buf[off + 6], s.in_buf[off + 7],
-                s.in_buf[off + 8], s.in_buf[off + 9], s.in_buf[off + 10], s.in_buf[off + 11],
+                s.in_buf[off + 4],
+                s.in_buf[off + 5],
+                s.in_buf[off + 6],
+                s.in_buf[off + 7],
+                s.in_buf[off + 8],
+                s.in_buf[off + 9],
+                s.in_buf[off + 10],
+                s.in_buf[off + 11],
             ]);
             off += need;
 
             // Only the first resp_part_count partitions are answered; the
             // rest are parsed (to stay frame-aligned) but skipped.
-            if p >= budget_end { continue; }
+            if p >= budget_end {
+                continue;
+            }
 
             let (hw, log_start, pi) = match store::find(&s.store, &topic[..tl], partition as u16) {
                 Some(i) => (
@@ -1109,28 +1290,40 @@ unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usiz
             };
             // partition header: index, error, hw, [LSO v4], [logStart v5],
             // [aborted v4], records_len
-            let fixed = 4 + 2 + 8
+            let fixed = 4
+                + 2
+                + 8
                 + if api_ver >= 4 { 8 } else { 0 }
                 + if api_ver >= 5 { 8 } else { 0 }
                 + if api_ver >= 4 { 4 } else { 0 }
                 + 4;
-            if p + fixed > BUF_SIZE { return; }
-            s.out_buf[p..p + 4].copy_from_slice(&partition.to_be_bytes()); p += 4;
-            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
-            s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes()); p += 8;
+            if p + fixed > BUF_SIZE {
+                return;
+            }
+            s.out_buf[p..p + 4].copy_from_slice(&partition.to_be_bytes());
+            p += 4;
+            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
+            s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes());
+            p += 8;
             if api_ver >= 4 {
-                s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes()); p += 8; // LSO
+                s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes());
+                p += 8; // LSO
             }
             if api_ver >= 5 {
-                s.out_buf[p..p + 8].copy_from_slice(&log_start.to_be_bytes()); p += 8;
+                s.out_buf[p..p + 8].copy_from_slice(&log_start.to_be_bytes());
+                p += 8;
             }
             if api_ver >= 4 {
-                s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // aborted
+                s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+                p += 4; // aborted
             }
             let records_len_pos = p;
             p += 4;
             let rb = match pi {
-                Some(pi) => store::fetch_into(&s.store, pi, fetch_offset, &mut s.out_buf, p, budget_end),
+                Some(pi) => {
+                    store::fetch_into(&s.store, pi, fetch_offset, &mut s.out_buf, p, budget_end)
+                }
                 None => 0,
             };
             s.out_buf[records_len_pos..records_len_pos + 4]
@@ -1154,70 +1347,119 @@ unsafe fn handle_kafka_list_offsets(s: &mut ModuleState, sys: &SyscallTable, ple
     // replica_id(4) [v2+: isolation(1)] topics(4) [name partitions(4)
     //   [partition(4) timestamp(8) [v0: max_num_offsets(4)]]]
     let mut off = 10 + 4;
-    if api_ver >= 2 { off += 1; }
-    if off + 4 > end { return; }
+    if api_ver >= 2 {
+        off += 1;
+    }
+    if off + 4 > end {
+        return;
+    }
     let topic_count = i32::from_be_bytes([
-        s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+        s.in_buf[off],
+        s.in_buf[off + 1],
+        s.in_buf[off + 2],
+        s.in_buf[off + 3],
     ]);
     off += 4;
-    if topic_count < 1 { return; }
+    if topic_count < 1 {
+        return;
+    }
 
     let mut p = 0usize;
     if api_ver >= 2 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // throttle
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // throttle
     }
     let resp_topics = topic_count.min(KFETCH_MAX_TOPICS as i32);
-    s.out_buf[p..p + 4].copy_from_slice(&resp_topics.to_be_bytes()); p += 4;
+    s.out_buf[p..p + 4].copy_from_slice(&resp_topics.to_be_bytes());
+    p += 4;
 
     for _ in 0..resp_topics {
-        if off + 2 > end { return; }
+        if off + 2 > end {
+            return;
+        }
         let tl = i16::from_be_bytes([s.in_buf[off], s.in_buf[off + 1]]) as usize;
         off += 2;
-        if tl == 0 || tl > KAFKA_MAX_TOPIC || off + tl > end { return; }
+        if tl == 0 || tl > KAFKA_MAX_TOPIC || off + tl > end {
+            return;
+        }
         let mut topic = [0u8; KAFKA_MAX_TOPIC];
         topic[..tl].copy_from_slice(&s.in_buf[off..off + tl]);
         off += tl;
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         let part_count = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
         ]);
         off += 4;
         let resp_parts = part_count.clamp(0, KFETCH_MAX_PARTS as i32);
 
-        if p + 2 + tl + 4 > BUF_SIZE { return; }
-        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes()); p += 2;
-        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]); p += tl;
-        s.out_buf[p..p + 4].copy_from_slice(&resp_parts.to_be_bytes()); p += 4;
+        if p + 2 + tl + 4 > BUF_SIZE {
+            return;
+        }
+        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes());
+        p += 2;
+        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]);
+        p += tl;
+        s.out_buf[p..p + 4].copy_from_slice(&resp_parts.to_be_bytes());
+        p += 4;
 
         for pi_idx in 0..part_count {
             let need = 12 + if api_ver == 0 { 4 } else { 0 };
-            if off + need > end { return; }
+            if off + need > end {
+                return;
+            }
             let partition = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             let timestamp = i64::from_be_bytes([
-                s.in_buf[off + 4], s.in_buf[off + 5], s.in_buf[off + 6], s.in_buf[off + 7],
-                s.in_buf[off + 8], s.in_buf[off + 9], s.in_buf[off + 10], s.in_buf[off + 11],
+                s.in_buf[off + 4],
+                s.in_buf[off + 5],
+                s.in_buf[off + 6],
+                s.in_buf[off + 7],
+                s.in_buf[off + 8],
+                s.in_buf[off + 9],
+                s.in_buf[off + 10],
+                s.in_buf[off + 11],
             ]);
             off += need;
-            if pi_idx >= resp_parts { continue; }
+            if pi_idx >= resp_parts {
+                continue;
+            }
 
             let (hw, log_start) = match store::find(&s.store, &topic[..tl], partition as u16) {
-                Some(i) => (store::next_offset(&s.store, i) as i64, store::log_start(&s.store, i) as i64),
+                Some(i) => (
+                    store::next_offset(&s.store, i) as i64,
+                    store::log_start(&s.store, i) as i64,
+                ),
                 None => (0i64, 0i64),
             };
             let offset = if timestamp == -2 { log_start } else { hw };
 
             let fixed = 4 + 2 + if api_ver == 0 { 4 + 8 } else { 8 + 8 };
-            if p + fixed > BUF_SIZE { return; }
-            s.out_buf[p..p + 4].copy_from_slice(&partition.to_be_bytes()); p += 4;
-            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
+            if p + fixed > BUF_SIZE {
+                return;
+            }
+            s.out_buf[p..p + 4].copy_from_slice(&partition.to_be_bytes());
+            p += 4;
+            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
             if api_ver == 0 {
-                s.out_buf[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4; // 1 offset
-                s.out_buf[p..p + 8].copy_from_slice(&offset.to_be_bytes()); p += 8;
+                s.out_buf[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+                p += 4; // 1 offset
+                s.out_buf[p..p + 8].copy_from_slice(&offset.to_be_bytes());
+                p += 8;
             } else {
-                s.out_buf[p..p + 8].copy_from_slice(&(-1i64).to_be_bytes()); p += 8; // ts
-                s.out_buf[p..p + 8].copy_from_slice(&offset.to_be_bytes()); p += 8;
+                s.out_buf[p..p + 8].copy_from_slice(&(-1i64).to_be_bytes());
+                p += 8; // ts
+                s.out_buf[p..p + 8].copy_from_slice(&offset.to_be_bytes());
+                p += 8;
             }
         }
     }
@@ -1232,12 +1474,21 @@ unsafe fn handle_kafka_list_offsets(s: &mut ModuleState, sys: &SyscallTable, ple
 ///
 /// # Safety
 unsafe fn emit_amqp_response(
-    sys: &SyscallTable, chan: i32, conn_id: u8, op: u8, channel: u16, rest: &[u8],
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: u8,
+    op: u8,
+    channel: u16,
+    rest: &[u8],
 ) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     let total = 5 + rest.len();
     let mut out = [0u8; 2200];
-    if total > out.len() { return false; }
+    if total > out.len() {
+        return false;
+    }
     out[0] = conn_id;
     out[1] = 2; // PROTO_AMQP envelope discriminator
     out[2] = op;
@@ -1254,15 +1505,21 @@ unsafe fn emit_amqp_response(
 /// (still durably logged; no confirm to route).
 ///
 /// # Safety
-unsafe fn handle_amqp_publish(
-    s: &mut ModuleState, sys: &SyscallTable, now: u64, plen: usize,
-) {
-    if plen < 15 { return; }
+unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64, plen: usize) {
+    if plen < 15 {
+        return;
+    }
     let conn_id = s.in_buf[0];
     let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
     let delivery_tag = u64::from_le_bytes([
-        s.in_buf[5], s.in_buf[6], s.in_buf[7], s.in_buf[8],
-        s.in_buf[9], s.in_buf[10], s.in_buf[11], s.in_buf[12],
+        s.in_buf[5],
+        s.in_buf[6],
+        s.in_buf[7],
+        s.in_buf[8],
+        s.in_buf[9],
+        s.in_buf[10],
+        s.in_buf[11],
+        s.in_buf[12],
     ]);
     let rl = u16::from_le_bytes([s.in_buf[13], s.in_buf[14]]) as usize;
     s.amqp_publish_rx = s.amqp_publish_rx.wrapping_add(1);
@@ -1308,7 +1565,9 @@ unsafe fn handle_amqp_publish(
             rl + body_len,
         );
         if try_emit(
-            sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL,
+            sys,
+            s.out_proposals,
+            wire::MSG_CLIENT_PROPOSAL,
             &s.out_buf[..hdr + op_body_len],
         ) {
             s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
@@ -1317,7 +1576,10 @@ unsafe fn handle_amqp_publish(
     }
 
     // Confirm mode: inflight slot + correlation + tagged proposal.
-    let Some((ki, slot)) = store::inflight_alloc(&mut s.store) else { nack(s, sys); return; };
+    let Some((ki, slot)) = store::inflight_alloc(&mut s.store) else {
+        nack(s, sys);
+        return;
+    };
     let Some(cid) = correlate::allocate(&mut s.correlate, slot, ki as u16, OP_KPRODUCE, now) else {
         nack(s, sys);
         return;
@@ -1325,7 +1587,9 @@ unsafe fn handle_amqp_publish(
     s.out_buf[0..8].copy_from_slice(&cid.to_le_bytes());
     wire::encode_qprop_header(
         &mut s.out_buf[8..8 + wire::QPROP_HEADER_LEN],
-        wire::QOP_AMQP_PUBLISH, 0, slot,
+        wire::QOP_AMQP_PUBLISH,
+        0,
+        slot,
     );
     let ob = wire::QPROP_TAGGED_HDR_LEN;
     s.out_buf[ob..ob + 2].copy_from_slice(&(rl as u16).to_le_bytes());
@@ -1335,7 +1599,9 @@ unsafe fn handle_amqp_publish(
         rl + body_len,
     );
     if !try_emit(
-        sys, s.out_proposals_tagged, wire::MSG_CLIENT_PROPOSAL,
+        sys,
+        s.out_proposals_tagged,
+        wire::MSG_CLIENT_PROPOSAL,
         &s.out_buf[..ob + op_body_len],
     ) {
         let _ = correlate::take(&mut s.correlate, cid);
@@ -1371,11 +1637,15 @@ unsafe fn handle_amqp_publish(
 ///
 /// # Safety
 unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < 15 { return; }
+    if plen < 15 {
+        return;
+    }
     let conn_id = s.in_buf[0];
     let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
     let ql = u16::from_le_bytes([s.in_buf[13], s.in_buf[14]]) as usize;
-    if ql == 0 || ql > KAFKA_MAX_TOPIC || 15 + ql > plen { return; }
+    if ql == 0 || ql > KAFKA_MAX_TOPIC || 15 + ql > plen {
+        return;
+    }
     let mut queue = [0u8; KAFKA_MAX_TOPIC];
     queue[..ql].copy_from_slice(&s.in_buf[15..15 + ql]);
     s.amqp_get_rx = s.amqp_get_rx.wrapping_add(1);
@@ -1387,8 +1657,14 @@ unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) 
         emit_amqp_response(sys, s.out_codec, conn_id, 2, channel, &rest);
     };
 
-    let Some(pi) = store::find(&s.store, &queue[..ql], 0) else { empty(s, sys); return; };
-    if store::is_empty(&s.store, pi) { empty(s, sys); return; }
+    let Some(pi) = store::find(&s.store, &queue[..ql], 0) else {
+        empty(s, sys);
+        return;
+    };
+    if store::is_empty(&s.store, pi) {
+        empty(s, sys);
+        return;
+    }
 
     // Walk oldest→newest for the first raw entry at/past the cursor,
     // counting the raw entries behind it (message-count for GetOk).
@@ -1403,13 +1679,16 @@ unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) 
 
     let mut rest = [0u8; 2048];
     let l = len as usize;
-    if 13 + l > rest.len() { empty(s, sys); return; }
+    if 13 + l > rest.len() {
+        empty(s, sys);
+        return;
+    }
     rest[0] = 0; // result: message
-    // Delivery tag = offset + 1: AMQP reserves tag 0 for the client's
-    // "all messages" ack, so the server MUST NOT assign it (the first
-    // message on a fresh queue has offset 0). GetOk is auto-ack here, so
-    // the tag is informational, but a zero tag makes a client's ack
-    // ambiguous with ack-all.
+                 // Delivery tag = offset + 1: AMQP reserves tag 0 for the client's
+                 // "all messages" ack, so the server MUST NOT assign it (the first
+                 // message on a fresh queue has offset 0). GetOk is auto-ack here, so
+                 // the tag is informational, but a zero tag makes a client's ack
+                 // ambiguous with ack-all.
     rest[1..9].copy_from_slice(&(offset + 1).to_le_bytes());
     rest[9..13].copy_from_slice(&remaining_after.to_le_bytes());
     store::copy_entry_into(&s.store, pi, data_pos as usize, l, &mut rest[13..13 + l]);
@@ -1422,19 +1701,19 @@ unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) 
 /// Read a Kafka STRING (i16 BE len + bytes) out of `buf`. Returns
 /// `(next_off, start, len)`; len 0 for null (-1) strings.
 fn kstr(buf: &[u8], off: usize, end: usize) -> Option<(usize, usize, usize)> {
-    if off + 2 > end { return None; }
+    if off + 2 > end {
+        return None;
+    }
     let l = i16::from_be_bytes([buf[off], buf[off + 1]]);
-    if l < 0 { return Some((off + 2, off + 2, 0)); }
+    if l < 0 {
+        return Some((off + 2, off + 2, 0));
+    }
     let l = l as usize;
-    if off + 2 + l > end { return None; }
+    if off + 2 + l > end {
+        return None;
+    }
     Some((off + 2 + l, off + 2, l))
 }
-
-
-
-
-
-
 
 #[cfg(feature = "kafka")]
 /// JoinGroup (api_key 11, v0-v2). Assigns/refreshes member identity,
@@ -1449,20 +1728,35 @@ unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen:
     let end = plen;
     s.kafka_group_ops = s.kafka_group_ops.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else { return; };
-    if off + 4 > end { return; }
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+        return;
+    };
+    if off + 4 > end {
+        return;
+    }
     off += 4; // session_timeout
     if v >= 1 {
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         off += 4; // rebalance_timeout
     }
-    let Some((off2, ms, ml)) = kstr(&s.in_buf, off, end) else { return; };
+    let Some((off2, ms, ml)) = kstr(&s.in_buf, off, end) else {
+        return;
+    };
     off = off2;
-    let Some((off3, _pts, _ptl)) = kstr(&s.in_buf, off, end) else { return; };
+    let Some((off3, _pts, _ptl)) = kstr(&s.in_buf, off, end) else {
+        return;
+    };
     off = off3;
-    if off + 4 > end { return; }
+    if off + 4 > end {
+        return;
+    }
     let proto_count = i32::from_be_bytes([
-        s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+        s.in_buf[off],
+        s.in_buf[off + 1],
+        s.in_buf[off + 2],
+        s.in_buf[off + 3],
     ]);
     off += 4;
     // First protocol: name + metadata (echoed back in SyncGroup flows).
@@ -1471,17 +1765,26 @@ unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen:
     let mut meta = [0u8; KG_META];
     let mut meta_len = 0usize;
     if proto_count >= 1 {
-        let Some((off4, ps, pl)) = kstr(&s.in_buf, off, end) else { return; };
+        let Some((off4, ps, pl)) = kstr(&s.in_buf, off, end) else {
+            return;
+        };
         pname_len = pl.min(16);
         pname[..pname_len].copy_from_slice(&s.in_buf[ps..ps + pname_len]);
         off = off4;
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         let bl = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
         ]);
         off += 4;
         if bl > 0 {
-            if off + bl as usize > end { return; }
+            if off + bl as usize > end {
+                return;
+            }
             meta_len = (bl as usize).min(KG_META);
             meta[..meta_len].copy_from_slice(&s.in_buf[off..off + meta_len]);
         }
@@ -1506,14 +1809,17 @@ unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen:
     if member_len == 0 {
         member_len = consumers::next_member_id(&mut s.consumers, gi, &mut member);
     }
-    let Some(mi) = consumers::member_join(
-        &mut s.consumers, gi, &member[..member_len], conn_id,
-    ) else {
+    let Some(mi) = consumers::member_join(&mut s.consumers, gi, &member[..member_len], conn_id)
+    else {
         emit_kafka_group_error(s, sys, conn_id, 11, v, corr, 15);
         return;
     };
     consumers::member_set_meta(
-        &mut s.consumers, gi, mi, &meta[..meta_len], &pname[..pname_len],
+        &mut s.consumers,
+        gi,
+        mi,
+        &meta[..meta_len],
+        &pname[..pname_len],
     );
 
     // Response.
@@ -1527,35 +1833,54 @@ unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen:
 
     let mut p = 0usize;
     if v >= 2 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
-    s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
-    s.out_buf[p..p + 4].copy_from_slice(&generation.to_be_bytes()); p += 4;
-    s.out_buf[p..p + 2].copy_from_slice(&(proto_len as i16).to_be_bytes()); p += 2;
-    s.out_buf[p..p + proto_len].copy_from_slice(&proto[..proto_len]); p += proto_len;
-    s.out_buf[p..p + 2].copy_from_slice(&(leader_len as i16).to_be_bytes()); p += 2;
-    s.out_buf[p..p + leader_len].copy_from_slice(&leader_id[..leader_len]); p += leader_len;
-    s.out_buf[p..p + 2].copy_from_slice(&(member_len as i16).to_be_bytes()); p += 2;
-    s.out_buf[p..p + member_len].copy_from_slice(&member[..member_len]); p += member_len;
+    s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + 4].copy_from_slice(&generation.to_be_bytes());
+    p += 4;
+    s.out_buf[p..p + 2].copy_from_slice(&(proto_len as i16).to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + proto_len].copy_from_slice(&proto[..proto_len]);
+    p += proto_len;
+    s.out_buf[p..p + 2].copy_from_slice(&(leader_len as i16).to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + leader_len].copy_from_slice(&leader_id[..leader_len]);
+    p += leader_len;
+    s.out_buf[p..p + 2].copy_from_slice(&(member_len as i16).to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + member_len].copy_from_slice(&member[..member_len]);
+    p += member_len;
     if is_leader {
         let count = (0..KGROUP_MEMBERS)
             .filter(|&i| consumers::member_active(&s.consumers, gi, i))
             .count() as i32;
-        s.out_buf[p..p + 4].copy_from_slice(&count.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&count.to_be_bytes());
+        p += 4;
         for i in 0..KGROUP_MEMBERS {
-            if !consumers::member_active(&s.consumers, gi, i) { continue; }
+            if !consumers::member_active(&s.consumers, gi, i) {
+                continue;
+            }
             let mut mid = [0u8; KG_NAME];
             let mut mmeta = [0u8; KG_META];
             let il = consumers::member_id_into(&s.consumers, gi, i, &mut mid);
             let mel = consumers::member_meta_into(&s.consumers, gi, i, &mut mmeta);
-            if p + 2 + il + 4 + mel > BUF_SIZE - 32 { break; }
-            s.out_buf[p..p + 2].copy_from_slice(&(il as i16).to_be_bytes()); p += 2;
-            s.out_buf[p..p + il].copy_from_slice(&mid[..il]); p += il;
-            s.out_buf[p..p + 4].copy_from_slice(&(mel as i32).to_be_bytes()); p += 4;
-            s.out_buf[p..p + mel].copy_from_slice(&mmeta[..mel]); p += mel;
+            if p + 2 + il + 4 + mel > BUF_SIZE - 32 {
+                break;
+            }
+            s.out_buf[p..p + 2].copy_from_slice(&(il as i16).to_be_bytes());
+            p += 2;
+            s.out_buf[p..p + il].copy_from_slice(&mid[..il]);
+            p += il;
+            s.out_buf[p..p + 4].copy_from_slice(&(mel as i32).to_be_bytes());
+            p += 4;
+            s.out_buf[p..p + mel].copy_from_slice(&mmeta[..mel]);
+            p += mel;
         }
     } else {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
     emit_kafka_response_outbuf(s, sys, conn_id, 11, v, corr, p);
 }
@@ -1566,23 +1891,34 @@ unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen:
 ///
 /// # Safety
 unsafe fn emit_kafka_group_error(
-    s: &mut ModuleState, sys: &SyscallTable,
-    conn_id: u8, api_key: i16, v: i16, corr: i32, err: i16,
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u8,
+    api_key: i16,
+    v: i16,
+    corr: i32,
+    err: i16,
 ) {
     let mut p = 0usize;
     if (api_key == 11 && v >= 2) || (api_key != 11 && v >= 1) {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
-    s.out_buf[p..p + 2].copy_from_slice(&err.to_be_bytes()); p += 2;
+    s.out_buf[p..p + 2].copy_from_slice(&err.to_be_bytes());
+    p += 2;
     if api_key == 11 {
         // generation, protocol "", leader "", member_id "", members []
-        s.out_buf[p..p + 4].copy_from_slice(&(-1i32).to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&(-1i32).to_be_bytes());
+        p += 4;
         for _ in 0..3 {
-            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
+            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
         }
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     } else if api_key == 14 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // empty assignment
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // empty assignment
     }
     emit_kafka_response_outbuf(s, sys, conn_id, api_key, v, corr, p);
 }
@@ -1599,13 +1935,22 @@ unsafe fn handle_kafka_sync_group(s: &mut ModuleState, sys: &SyscallTable, plen:
     let end = plen;
     s.kafka_group_ops = s.kafka_group_ops.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else { return; };
-    if off + 4 > end { return; }
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+        return;
+    };
+    if off + 4 > end {
+        return;
+    }
     let generation = i32::from_be_bytes([
-        s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+        s.in_buf[off],
+        s.in_buf[off + 1],
+        s.in_buf[off + 2],
+        s.in_buf[off + 3],
     ]);
     off += 4;
-    let Some((off2, ms, ml)) = kstr(&s.in_buf, off, end) else { return; };
+    let Some((off2, ms, ml)) = kstr(&s.in_buf, off, end) else {
+        return;
+    };
     off = off2;
     let mut group = [0u8; KG_NAME];
     let gl = gl.min(KG_NAME);
@@ -1630,31 +1975,41 @@ unsafe fn handle_kafka_sync_group(s: &mut ModuleState, sys: &SyscallTable, plen:
     // Store any supplied assignments (leader path).
     if off + 4 <= end {
         let n = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
         ]);
         off += 4;
         for _ in 0..n.clamp(0, KGROUP_MEMBERS as i32 * 2) {
-            let Some((o2, ids, idl)) = kstr(&s.in_buf, off, end) else { break; };
+            let Some((o2, ids, idl)) = kstr(&s.in_buf, off, end) else {
+                break;
+            };
             off = o2;
-            if off + 4 > end { break; }
+            if off + 4 > end {
+                break;
+            }
             let bl = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             off += 4;
-            if bl < 0 { continue; }
+            if bl < 0 {
+                continue;
+            }
             let bl = bl as usize;
-            if off + bl > end { break; }
+            if off + bl > end {
+                break;
+            }
             let mut mid = [0u8; KG_NAME];
             let idl = idl.min(KG_NAME);
             mid[..idl].copy_from_slice(&s.in_buf[ids..ids + idl]);
             let al = bl.min(KG_META);
             let mut abuf = [0u8; KG_META];
-            core::ptr::copy_nonoverlapping(
-                s.in_buf.as_ptr().add(off), abuf.as_mut_ptr(), al,
-            );
-            consumers::member_set_assignment(
-                &mut s.consumers, gi, &mid[..idl], &abuf[..al],
-            );
+            core::ptr::copy_nonoverlapping(s.in_buf.as_ptr().add(off), abuf.as_mut_ptr(), al);
+            consumers::member_set_assignment(&mut s.consumers, gi, &mid[..idl], &abuf[..al]);
             off += bl;
         }
     }
@@ -1663,11 +2018,15 @@ unsafe fn handle_kafka_sync_group(s: &mut ModuleState, sys: &SyscallTable, plen:
     let al = consumers::member_assignment_into(&s.consumers, gi, mi, &mut assign);
     let mut p = 0usize;
     if v >= 1 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
-    s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
-    s.out_buf[p..p + 4].copy_from_slice(&(al as i32).to_be_bytes()); p += 4;
-    s.out_buf[p..p + al].copy_from_slice(&assign[..al]); p += al;
+    s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + 4].copy_from_slice(&(al as i32).to_be_bytes());
+    p += 4;
+    s.out_buf[p..p + al].copy_from_slice(&assign[..al]);
+    p += al;
     emit_kafka_response_outbuf(s, sys, conn_id, 14, v, corr, p);
 }
 
@@ -1676,7 +2035,10 @@ unsafe fn handle_kafka_sync_group(s: &mut ModuleState, sys: &SyscallTable, plen:
 ///
 /// # Safety
 unsafe fn handle_kafka_heartbeat_leave(
-    s: &mut ModuleState, sys: &SyscallTable, plen: usize, api_key: i16,
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    plen: usize,
+    api_key: i16,
 ) {
     let conn_id = s.in_buf[0];
     let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
@@ -1684,16 +2046,25 @@ unsafe fn handle_kafka_heartbeat_leave(
     let end = plen;
     s.kafka_group_ops = s.kafka_group_ops.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else { return; };
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+        return;
+    };
     let mut generation = 0i32;
     if api_key == 12 {
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         generation = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
         ]);
         off += 4;
     }
-    let Some((_o, ms, ml)) = kstr(&s.in_buf, off, end) else { return; };
+    let Some((_o, ms, ml)) = kstr(&s.in_buf, off, end) else {
+        return;
+    };
     let mut group = [0u8; KG_NAME];
     let gl = gl.min(KG_NAME);
     group[..gl].copy_from_slice(&s.in_buf[gs..gs + gl]);
@@ -1719,9 +2090,11 @@ unsafe fn handle_kafka_heartbeat_leave(
     }
     let mut p = 0usize;
     if v >= 1 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
-    s.out_buf[p..p + 2].copy_from_slice(&err.to_be_bytes()); p += 2;
+    s.out_buf[p..p + 2].copy_from_slice(&err.to_be_bytes());
+    p += 2;
     emit_kafka_response_outbuf(s, sys, conn_id, api_key, v, corr, p);
 }
 
@@ -1739,62 +2112,105 @@ unsafe fn handle_kafka_offset_commit(s: &mut ModuleState, sys: &SyscallTable, pl
     let end = plen;
     s.kafka_offset_commits = s.kafka_offset_commits.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else { return; };
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+        return;
+    };
     let mut group = [0u8; KG_NAME];
     let gl = gl.min(KG_NAME);
     group[..gl].copy_from_slice(&s.in_buf[gs..gs + gl]);
     if v >= 1 {
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         off += 4; // generation
-        let Some((o2, _ms, _ml)) = kstr(&s.in_buf, off, end) else { return; };
+        let Some((o2, _ms, _ml)) = kstr(&s.in_buf, off, end) else {
+            return;
+        };
         off = o2;
     }
     if v >= 2 {
-        if off + 8 > end { return; }
+        if off + 8 > end {
+            return;
+        }
         off += 8; // retention_time
     }
-    if off + 4 > end { return; }
+    if off + 4 > end {
+        return;
+    }
     let topic_count = i32::from_be_bytes([
-        s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
-    ]).clamp(0, 4);
+        s.in_buf[off],
+        s.in_buf[off + 1],
+        s.in_buf[off + 2],
+        s.in_buf[off + 3],
+    ])
+    .clamp(0, 4);
     off += 4;
 
     // Response built as we parse (structure mirrors the request).
     let mut p = 0usize;
-    s.out_buf[p..p + 4].copy_from_slice(&topic_count.to_be_bytes()); p += 4;
+    s.out_buf[p..p + 4].copy_from_slice(&topic_count.to_be_bytes());
+    p += 4;
     for _ in 0..topic_count {
-        let Some((o2, ts, tl)) = kstr(&s.in_buf, off, end) else { return; };
+        let Some((o2, ts, tl)) = kstr(&s.in_buf, off, end) else {
+            return;
+        };
         off = o2;
         let tl = tl.min(KAFKA_MAX_TOPIC);
         let mut topic = [0u8; KAFKA_MAX_TOPIC];
         topic[..tl].copy_from_slice(&s.in_buf[ts..ts + tl]);
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         let pc = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
-        ]).clamp(0, 8);
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
+        ])
+        .clamp(0, 8);
         off += 4;
-        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes()); p += 2;
-        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]); p += tl;
-        s.out_buf[p..p + 4].copy_from_slice(&pc.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes());
+        p += 2;
+        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]);
+        p += tl;
+        s.out_buf[p..p + 4].copy_from_slice(&pc.to_be_bytes());
+        p += 4;
         for _ in 0..pc {
-            if off + 12 > end { return; }
+            if off + 12 > end {
+                return;
+            }
             let part = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             let o = i64::from_be_bytes([
-                s.in_buf[off + 4], s.in_buf[off + 5], s.in_buf[off + 6], s.in_buf[off + 7],
-                s.in_buf[off + 8], s.in_buf[off + 9], s.in_buf[off + 10], s.in_buf[off + 11],
+                s.in_buf[off + 4],
+                s.in_buf[off + 5],
+                s.in_buf[off + 6],
+                s.in_buf[off + 7],
+                s.in_buf[off + 8],
+                s.in_buf[off + 9],
+                s.in_buf[off + 10],
+                s.in_buf[off + 11],
             ]);
             off += 12;
             if v == 1 {
-                if off + 8 > end { return; }
+                if off + 8 > end {
+                    return;
+                }
                 off += 8; // timestamp
             }
-            let Some((o3, _mds, _mdl)) = kstr(&s.in_buf, off, end) else { return; };
+            let Some((o3, _mds, _mdl)) = kstr(&s.in_buf, off, end) else {
+                return;
+            };
             off = o3;
             consumers::offset_store(&mut s.consumers, &group[..gl], &topic[..tl], part as u16, o);
-            s.out_buf[p..p + 4].copy_from_slice(&part.to_be_bytes()); p += 4;
-            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
+            s.out_buf[p..p + 4].copy_from_slice(&part.to_be_bytes());
+            p += 4;
+            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
         }
         // Durability: one QOP_KAFKA_OFFSET per (topic) high-water — emit
         // per partition would multiply proposals; commit the LAST
@@ -1808,18 +2224,26 @@ unsafe fn handle_kafka_offset_commit(s: &mut ModuleState, sys: &SyscallTable, pl
             };
             let hdr = wire::QPROP_HEADER_LEN;
             let body_len = 2 + gl + 2 + tl + 2 + 8;
-            if hdr + body_len > s.out_buf.len() { continue; }
+            if hdr + body_len > s.out_buf.len() {
+                continue;
+            }
             // Build the proposal in a stack buffer — out_buf holds the
             // in-progress response.
             let mut prop = [0u8; 200];
             wire::encode_qprop_header(&mut prop[..hdr], wire::QOP_KAFKA_OFFSET, 0, 0);
             let mut q = hdr;
-            prop[q..q + 2].copy_from_slice(&(gl as u16).to_le_bytes()); q += 2;
-            prop[q..q + gl].copy_from_slice(&group[..gl]); q += gl;
-            prop[q..q + 2].copy_from_slice(&(tl as u16).to_le_bytes()); q += 2;
-            prop[q..q + tl].copy_from_slice(&topic[..tl]); q += tl;
-            prop[q..q + 2].copy_from_slice(&ofs_partition.to_le_bytes()); q += 2;
-            prop[q..q + 8].copy_from_slice(&ofs_offset.to_le_bytes()); q += 8;
+            prop[q..q + 2].copy_from_slice(&(gl as u16).to_le_bytes());
+            q += 2;
+            prop[q..q + gl].copy_from_slice(&group[..gl]);
+            q += gl;
+            prop[q..q + 2].copy_from_slice(&(tl as u16).to_le_bytes());
+            q += 2;
+            prop[q..q + tl].copy_from_slice(&topic[..tl]);
+            q += tl;
+            prop[q..q + 2].copy_from_slice(&ofs_partition.to_le_bytes());
+            q += 2;
+            prop[q..q + 8].copy_from_slice(&ofs_offset.to_le_bytes());
+            q += 8;
             if try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, &prop[..q]) {
                 s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
             }
@@ -1838,50 +2262,81 @@ unsafe fn handle_kafka_offset_fetch(s: &mut ModuleState, sys: &SyscallTable, ple
     let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
     let end = plen;
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else { return; };
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+        return;
+    };
     let mut group = [0u8; KG_NAME];
     let gl = gl.min(KG_NAME);
     group[..gl].copy_from_slice(&s.in_buf[gs..gs + gl]);
-    if off + 4 > end { return; }
+    if off + 4 > end {
+        return;
+    }
     let topic_count = i32::from_be_bytes([
-        s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
-    ]).clamp(0, 4);
+        s.in_buf[off],
+        s.in_buf[off + 1],
+        s.in_buf[off + 2],
+        s.in_buf[off + 3],
+    ])
+    .clamp(0, 4);
     off += 4;
 
     let mut p = 0usize;
     if v >= 3 {
-        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
-    s.out_buf[p..p + 4].copy_from_slice(&topic_count.to_be_bytes()); p += 4;
+    s.out_buf[p..p + 4].copy_from_slice(&topic_count.to_be_bytes());
+    p += 4;
     for _ in 0..topic_count {
-        let Some((o2, ts, tl)) = kstr(&s.in_buf, off, end) else { return; };
+        let Some((o2, ts, tl)) = kstr(&s.in_buf, off, end) else {
+            return;
+        };
         off = o2;
         let tl = tl.min(KAFKA_MAX_TOPIC);
         let mut topic = [0u8; KAFKA_MAX_TOPIC];
         topic[..tl].copy_from_slice(&s.in_buf[ts..ts + tl]);
-        if off + 4 > end { return; }
+        if off + 4 > end {
+            return;
+        }
         let pc = i32::from_be_bytes([
-            s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
-        ]).clamp(0, 8);
+            s.in_buf[off],
+            s.in_buf[off + 1],
+            s.in_buf[off + 2],
+            s.in_buf[off + 3],
+        ])
+        .clamp(0, 8);
         off += 4;
-        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes()); p += 2;
-        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]); p += tl;
-        s.out_buf[p..p + 4].copy_from_slice(&pc.to_be_bytes()); p += 4;
+        s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes());
+        p += 2;
+        s.out_buf[p..p + tl].copy_from_slice(&topic[..tl]);
+        p += tl;
+        s.out_buf[p..p + 4].copy_from_slice(&pc.to_be_bytes());
+        p += 4;
         for _ in 0..pc {
-            if off + 4 > end { return; }
+            if off + 4 > end {
+                return;
+            }
             let part = i32::from_be_bytes([
-                s.in_buf[off], s.in_buf[off + 1], s.in_buf[off + 2], s.in_buf[off + 3],
+                s.in_buf[off],
+                s.in_buf[off + 1],
+                s.in_buf[off + 2],
+                s.in_buf[off + 3],
             ]);
             off += 4;
             let o = consumers::offset_get(&s.consumers, &group[..gl], &topic[..tl], part as u16);
-            s.out_buf[p..p + 4].copy_from_slice(&part.to_be_bytes()); p += 4;
-            s.out_buf[p..p + 8].copy_from_slice(&o.to_be_bytes()); p += 8;
-            s.out_buf[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes()); p += 2; // metadata null
-            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
+            s.out_buf[p..p + 4].copy_from_slice(&part.to_be_bytes());
+            p += 4;
+            s.out_buf[p..p + 8].copy_from_slice(&o.to_be_bytes());
+            p += 8;
+            s.out_buf[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+            p += 2; // metadata null
+            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
         }
     }
     if v >= 2 {
-        s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2; // top-level err
+        s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+        p += 2; // top-level err
     }
     emit_kafka_response_outbuf(s, sys, conn_id, 9, v, corr, p);
 }
@@ -1914,16 +2369,22 @@ fn handle_conn_disconnect(s: &mut ModuleState, conn_id: u8) {
 ///
 /// # Safety
 unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < 18 { return; }
+    if plen < 18 {
+        return;
+    }
     let conn_id = s.in_buf[0];
     let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
     let flags = s.in_buf[13];
     let prefetch = u16::from_le_bytes([s.in_buf[14], s.in_buf[15]]);
     let tl = u16::from_le_bytes([s.in_buf[16], s.in_buf[17]]) as usize;
-    if tl == 0 || tl > AMQP_TAG_MAX || 18 + tl + 2 > plen { return; }
+    if tl == 0 || tl > AMQP_TAG_MAX || 18 + tl + 2 > plen {
+        return;
+    }
     let toff = 18;
     let ql = u16::from_le_bytes([s.in_buf[18 + tl], s.in_buf[19 + tl]]) as usize;
-    if ql == 0 || ql > KAFKA_MAX_TOPIC || 20 + tl + ql > plen { return; }
+    if ql == 0 || ql > KAFKA_MAX_TOPIC || 20 + tl + ql > plen {
+        return;
+    }
     let qoff = 20 + tl;
 
     // Replaces any existing consumer on this (conn, channel) — AMQP
@@ -1948,8 +2409,15 @@ unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usi
         None => 0,
     };
     consumers::consumer_register(
-        &mut s.consumers, slot, conn_id, channel, flags & 1 == 1, prefetch,
-        &tag[..tl], &queue[..ql], cursor,
+        &mut s.consumers,
+        slot,
+        conn_id,
+        channel,
+        flags & 1 == 1,
+        prefetch,
+        &tag[..tl],
+        &queue[..ql],
+        cursor,
     );
 }
 
@@ -1958,11 +2426,15 @@ unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usi
 ///
 /// # Safety
 unsafe fn handle_amqp_cancel(s: &mut ModuleState, plen: usize) {
-    if plen < 15 { return; }
+    if plen < 15 {
+        return;
+    }
     let conn_id = s.in_buf[0];
     let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
     let tl = u16::from_le_bytes([s.in_buf[13], s.in_buf[14]]) as usize;
-    if tl == 0 || tl > AMQP_TAG_MAX || 15 + tl > plen { return; }
+    if tl == 0 || tl > AMQP_TAG_MAX || 15 + tl > plen {
+        return;
+    }
     let mut tag = [0u8; AMQP_TAG_MAX];
     tag[..tl].copy_from_slice(&s.in_buf[15..15 + tl]);
     if let Some(ci) = consumers::consumer_by_tag(&s.consumers, conn_id, channel, &tag[..tl]) {
@@ -1985,16 +2457,25 @@ unsafe fn handle_amqp_cancel(s: &mut ModuleState, plen: usize) {
 ///     common `basic_ack(0, multiple=True)` idiom; releases every
 ///     outstanding tag, so a manual-ack consumer never wedges at its
 ///     prefetch limit.
+///
 /// Nack/Reject release credit without redelivery (documented v1 gap).
 ///
 /// # Safety
 unsafe fn handle_amqp_client_ack(s: &mut ModuleState, plen: usize) {
-    if plen < 14 { return; }
+    if plen < 14 {
+        return;
+    }
     let conn_id = s.in_buf[0];
     let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
     let dt = u64::from_le_bytes([
-        s.in_buf[5], s.in_buf[6], s.in_buf[7], s.in_buf[8],
-        s.in_buf[9], s.in_buf[10], s.in_buf[11], s.in_buf[12],
+        s.in_buf[5],
+        s.in_buf[6],
+        s.in_buf[7],
+        s.in_buf[8],
+        s.in_buf[9],
+        s.in_buf[10],
+        s.in_buf[11],
+        s.in_buf[12],
     ]);
     let multiple = s.in_buf[13] & 1 != 0;
     s.amqp_consumer_acks = s.amqp_consumer_acks.wrapping_add(1);
@@ -2010,13 +2491,21 @@ unsafe fn handle_amqp_client_ack(s: &mut ModuleState, plen: usize) {
 /// # Safety
 unsafe fn amqp_delivery_pump(s: &mut ModuleState, sys: &SyscallTable) {
     for ci in 0..ACONSUMERS {
-        if !consumers::consumer_active(&s.consumers, ci) { continue; }
+        if !consumers::consumer_active(&s.consumers, ci) {
+            continue;
+        }
         let mut queue = [0u8; KAFKA_MAX_TOPIC];
         let ql = consumers::consumer_queue_into(&s.consumers, ci, &mut queue);
-        let Some(pi) = store::find(&s.store, &queue[..ql], 0) else { continue; };
+        let Some(pi) = store::find(&s.store, &queue[..ql], 0) else {
+            continue;
+        };
         for _ in 0..AMQP_DELIVER_QUOTA {
-            if !consumers::consumer_in_credit(&s.consumers, ci) { break; }
-            let Some(view) = consumers::consumer_view(&s.consumers, ci) else { break; };
+            if !consumers::consumer_in_credit(&s.consumers, ci) {
+                break;
+            }
+            let Some(view) = consumers::consumer_view(&s.consumers, ci) else {
+                break;
+            };
             let cursor = view.cursor;
             // Find the next raw entry at/past the cursor.
             if store::is_empty(&s.store, pi) || cursor >= store::next_offset(&s.store, pi) {
@@ -2033,16 +2522,27 @@ unsafe fn amqp_delivery_pump(s: &mut ModuleState, sys: &SyscallTable) {
             let tl = consumers::consumer_tag_into(&s.consumers, ci, &mut tag);
             let l = len as usize;
             let mut rest = [0u8; 2048 + 64];
-            if 11 + tl + l > rest.len() { break; }
+            if 11 + tl + l > rest.len() {
+                break;
+            }
             rest[0..8].copy_from_slice(&view.next_dtag.to_le_bytes());
             rest[8] = 0;
             rest[9..11].copy_from_slice(&(tl as u16).to_le_bytes());
             rest[11..11 + tl].copy_from_slice(&tag[..tl]);
             store::copy_entry_into(
-                &s.store, pi, data_pos as usize, l, &mut rest[11 + tl..11 + tl + l],
+                &s.store,
+                pi,
+                data_pos as usize,
+                l,
+                &mut rest[11 + tl..11 + tl + l],
             );
             if !emit_amqp_response(
-                sys, s.out_codec, view.conn_id, 3, view.channel, &rest[..11 + tl + l],
+                sys,
+                s.out_codec,
+                view.conn_id,
+                3,
+                view.channel,
+                &rest[..11 + tl + l],
             ) {
                 // Backpressure: retry next tick from the same cursor.
                 break;
@@ -2064,7 +2564,9 @@ unsafe fn amqp_delivery_pump(s: &mut ModuleState, sys: &SyscallTable) {
 ///
 /// # Safety
 unsafe fn try_emit(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     // channel_write_msg writes the envelope atomically and returns the
     // total written count, or a negative value (CHAN_EAGAIN, oversize,
     // EINVAL, ...) on failure. Anything ≤ 0 means the payload did not
@@ -2099,10 +2601,7 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
             // multi-tenancy lands the tenant will be stashed alongside.
             let stash_env = correlate::stash_env(&s.correlate, stash_idx);
             let pub_qos = stash_env[0];
-            let topic_len = u16::from_be_bytes([
-                stash_env[16],
-                stash_env[17],
-            ]) as usize;
+            let topic_len = u16::from_be_bytes([stash_env[16], stash_env[17]]) as usize;
             if 18 + topic_len + 1 > env_len {
                 correlate::stash_release(&mut s.correlate, stash_idx);
                 return true;
@@ -2135,11 +2634,15 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
             // topic + user_props + payload sit contiguous in the stash
             // starting at offset 18; a single copy reproduces the
             // downstream layout (offset 8 of out_buf).
-            let src = correlate::stash_env(&s.correlate, stash_idx).as_ptr().add(18);
+            let src = correlate::stash_env(&s.correlate, stash_idx)
+                .as_ptr()
+                .add(18);
             let dst = s.out_buf.as_mut_ptr().add(8);
             core::ptr::copy_nonoverlapping(src, dst, topic_len + up_len + payload_len);
             if try_emit(
-                sys, s.out_topic, wire::MSG_TOPIC_PUBLISH,
+                sys,
+                s.out_topic,
+                wire::MSG_TOPIC_PUBLISH,
                 &s.out_buf[..topic_pub_len],
             ) {
                 correlate::stash_release(&mut s.correlate, stash_idx);
@@ -2169,9 +2672,15 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
 /// # Safety
 unsafe fn finalise_durable_stashes(s: &mut ModuleState, sys: &SyscallTable) {
     for i in 0..STASH_SLOTS {
-        if !correlate::stash_occupied(&s.correlate, i) { continue; }
-        if !correlate::stash_is_durable(&s.correlate, i) { continue; }
-        if correlate::stash_dedup_state(&s.correlate, i) == STASH_DEDUP_PENDING { continue; }
+        if !correlate::stash_occupied(&s.correlate, i) {
+            continue;
+        }
+        if !correlate::stash_is_durable(&s.correlate, i) {
+            continue;
+        }
+        if correlate::stash_dedup_state(&s.correlate, i) == STASH_DEDUP_PENDING {
+            continue;
+        }
         finalise_stash(s, sys, i);
     }
 }
@@ -2194,18 +2703,23 @@ enum DeliverResult {
 /// fired so the system contract holds at the publisher edge.
 ///
 /// # Safety
-unsafe fn enqueue_offline(
-    s: &mut ModuleState, sys: &SyscallTable, session_slot: u32, env: &[u8],
-) {
+unsafe fn enqueue_offline(s: &mut ModuleState, sys: &SyscallTable, session_slot: u32, env: &[u8]) {
     let env_len = env.len();
     let total = 6 + env_len;
-    if total > s.out_buf.len() { return; }
+    if total > s.out_buf.len() {
+        return;
+    }
     s.out_buf[0..4].copy_from_slice(&session_slot.to_le_bytes());
     s.out_buf[4..6].copy_from_slice(&(env_len as u16).to_le_bytes());
     let dst = s.out_buf.as_mut_ptr().add(6);
     let src = env.as_ptr();
     core::ptr::copy_nonoverlapping(src, dst, env_len);
-    try_emit(sys, s.out_messaging, wire::MSG_OFFLINE_ENQUEUE, &s.out_buf[..total]);
+    try_emit(
+        sys,
+        s.out_messaging,
+        wire::MSG_OFFLINE_ENQUEUE,
+        &s.out_buf[..total],
+    );
 }
 
 /// Attempt one delivery of a single MSG_TOPIC_DELIVER envelope. Used both
@@ -2213,14 +2727,16 @@ unsafe fn enqueue_offline(
 /// backpressure path stays consistent.
 ///
 /// # Safety
-unsafe fn try_deliver(
-    s: &mut ModuleState, sys: &SyscallTable, env: &[u8],
-) -> DeliverResult {
+unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> DeliverResult {
     let plen = env.len();
-    if plen < 14 { return DeliverResult::Dropped; }
+    if plen < 14 {
+        return DeliverResult::Dropped;
+    }
 
     let session_slot = u32::from_le_bytes([env[0], env[1], env[2], env[3]]) as usize;
-    if session_slot >= MAX_SESSIONS { return DeliverResult::Dropped; }
+    if session_slot >= MAX_SESSIONS {
+        return DeliverResult::Dropped;
+    }
 
     // Persisted session (clean_start=false, currently offline) → enqueue
     // for replay on reconnect. Treated as Delivered from the caller's
@@ -2236,7 +2752,9 @@ unsafe fn try_deliver(
     let sub_qos = env[4] & 0x03;
 
     let topic_len = u16::from_le_bytes([env[12], env[13]]) as usize;
-    if 14 + topic_len > plen { return DeliverResult::Dropped; }
+    if 14 + topic_len > plen {
+        return DeliverResult::Dropped;
+    }
     // user_props block sits immediately after the topic (item 6 wire
     // contract — topic_engine forwards bytes between topic and payload
     // untouched). Apply-side always writes a single zero count byte
@@ -2248,13 +2766,17 @@ unsafe fn try_deliver(
         user_props_block_len(&env[up_off_env..plen]).unwrap_or(0)
     };
     let payload_start = up_off_env + up_len;
-    if payload_start > plen { return DeliverResult::Dropped; }
+    if payload_start > plen {
+        return DeliverResult::Dropped;
+    }
     let payload_len = plen - payload_start;
 
     let pid_bytes = if sub_qos > 0 { 2 } else { 0 };
     let up_bytes = if up_len > 0 { up_len } else { 1 }; // placeholder for empty block
     let body_len = 2 + topic_len + pid_bytes + up_bytes + payload_len;
-    if body_len > s.out_buf.len() { return DeliverResult::Dropped; }
+    if body_len > s.out_buf.len() {
+        return DeliverResult::Dropped;
+    }
     let body_cost = body_len as i32;
 
     if sub_qos > 0 {
@@ -2279,8 +2801,14 @@ unsafe fn try_deliver(
     let mut sub_packet_id: u16 = 0;
     if sub_qos > 0 {
         sub_packet_id = sessions::next_sub_packet_id(&mut s.sessions, session_slot);
-        if sessions::inflight_add(&mut s.sessions, session_slot, sub_packet_id, sub_qos, INFLIGHT_SUB)
-            .is_none()
+        if sessions::inflight_add(
+            &mut s.sessions,
+            session_slot,
+            sub_packet_id,
+            sub_qos,
+            INFLIGHT_SUB,
+        )
+        .is_none()
         {
             return DeliverResult::Backpressured;
         }
@@ -2323,7 +2851,12 @@ unsafe fn try_deliver(
 
     let flags = sub_qos << 1;
     let emitted = emit_codec_response(
-        sys, s.out_codec, conn_id, PROTO_MQTT, PKT_PUBLISH, flags,
+        sys,
+        s.out_codec,
+        conn_id,
+        PROTO_MQTT,
+        PKT_PUBLISH,
+        flags,
         &s.out_buf[..body_len],
     );
     if emitted {
@@ -2333,13 +2866,16 @@ unsafe fn try_deliver(
             sessions::note_delivery(&mut s.sessions, session_slot);
             let mut lag_msg = [0u8; 8];
             lag_msg[0..4].copy_from_slice(&(session_slot as u32).to_le_bytes());
-            lag_msg[4..8].copy_from_slice(&sessions::sub_outstanding(&s.sessions, session_slot).to_le_bytes());
+            lag_msg[4..8].copy_from_slice(
+                &sessions::sub_outstanding(&s.sessions, session_slot).to_le_bytes(),
+            );
             try_emit(sys, s.out_forward, wire::MSG_LAG_SIGNAL, &lag_msg);
         }
         DeliverResult::Delivered
     } else {
         if sub_qos > 0 {
-            if let Some(ii) = sessions::inflight_find(&s.sessions, session_slot, sub_packet_id, INFLIGHT_SUB)
+            if let Some(ii) =
+                sessions::inflight_find(&s.sessions, session_slot, sub_packet_id, INFLIGHT_SUB)
             {
                 sessions::inflight_release(&mut s.sessions, session_slot, ii);
             }
@@ -2423,14 +2959,16 @@ unsafe fn apply_committed_op(
         #[cfg(feature = "kafka")]
         wire::QOP_KAFKA_PRODUCE => {
             let body = core::slice::from_raw_parts(
-                s.in_buf.as_ptr().add(body_start), body_end - body_start,
+                s.in_buf.as_ptr().add(body_start),
+                body_end - body_start,
             );
             apply_kafka_produce(s, body);
         }
         #[cfg(feature = "amqp")]
         wire::QOP_AMQP_PUBLISH => {
             let body = core::slice::from_raw_parts(
-                s.in_buf.as_ptr().add(body_start), body_end - body_start,
+                s.in_buf.as_ptr().add(body_start),
+                body_end - body_start,
             );
             apply_amqp_publish(s, body);
         }
@@ -2439,7 +2977,8 @@ unsafe fn apply_committed_op(
         #[cfg(feature = "kafka")]
         wire::QOP_KAFKA_OFFSET => {
             let b = core::slice::from_raw_parts(
-                s.in_buf.as_ptr().add(body_start), body_end - body_start,
+                s.in_buf.as_ptr().add(body_start),
+                body_end - body_start,
             );
             if b.len() >= 2 {
                 let gl = u16::from_le_bytes([b[0], b[1]]) as usize;
@@ -2453,10 +2992,22 @@ unsafe fn apply_committed_op(
                         let po = 4 + gl + tl;
                         let part = u16::from_le_bytes([b[po], b[po + 1]]);
                         let off = i64::from_le_bytes([
-                            b[po + 2], b[po + 3], b[po + 4], b[po + 5],
-                            b[po + 6], b[po + 7], b[po + 8], b[po + 9],
+                            b[po + 2],
+                            b[po + 3],
+                            b[po + 4],
+                            b[po + 5],
+                            b[po + 6],
+                            b[po + 7],
+                            b[po + 8],
+                            b[po + 9],
                         ]);
-                        consumers::offset_store(&mut s.consumers, &group[..gl], &topic[..tl], part, off);
+                        consumers::offset_store(
+                            &mut s.consumers,
+                            &group[..gl],
+                            &topic[..tl],
+                            part,
+                            off,
+                        );
                     }
                 }
             }
@@ -2483,26 +3034,32 @@ unsafe fn apply_qop_connect(
     body_end: usize,
     _now: u64,
 ) {
-    if body_end < body_start { return; }
+    if body_end < body_start {
+        return;
+    }
     let body_len = body_end - body_start;
     // Minimum: clean_start(1) + keep_alive(2) + stream_hash(8) + cid_len(2) + protocol(1) = 14
-    if body_len < 14 { return; }
+    if body_len < 14 {
+        return;
+    }
     let clean_start = s.in_buf[body_start] != 0;
-    let keep_alive_s = u16::from_be_bytes([
-        s.in_buf[body_start + 1],
-        s.in_buf[body_start + 2],
-    ]) as u32;
+    let keep_alive_s =
+        u16::from_be_bytes([s.in_buf[body_start + 1], s.in_buf[body_start + 2]]) as u32;
     let stream_hash = u64::from_le_bytes([
-        s.in_buf[body_start + 3],  s.in_buf[body_start + 4],
-        s.in_buf[body_start + 5],  s.in_buf[body_start + 6],
-        s.in_buf[body_start + 7],  s.in_buf[body_start + 8],
-        s.in_buf[body_start + 9],  s.in_buf[body_start + 10],
+        s.in_buf[body_start + 3],
+        s.in_buf[body_start + 4],
+        s.in_buf[body_start + 5],
+        s.in_buf[body_start + 6],
+        s.in_buf[body_start + 7],
+        s.in_buf[body_start + 8],
+        s.in_buf[body_start + 9],
+        s.in_buf[body_start + 10],
     ]);
-    let cid_len = u16::from_be_bytes([
-        s.in_buf[body_start + 11],
-        s.in_buf[body_start + 12],
-    ]) as usize;
-    if body_len < 14 + cid_len { return; }
+    let cid_len =
+        u16::from_be_bytes([s.in_buf[body_start + 11], s.in_buf[body_start + 12]]) as usize;
+    if body_len < 14 + cid_len {
+        return;
+    }
     let protocol = s.in_buf[body_start + 13 + cid_len];
 
     // Will section (additive trailer; older proposals omit the
@@ -2528,21 +3085,19 @@ unsafe fn apply_qop_connect(
             will_qos = s.in_buf[q_off];
             will_retain = s.in_buf[q_off + 1];
             will_delay_s = u32::from_le_bytes([
-                s.in_buf[q_off + 2], s.in_buf[q_off + 3],
-                s.in_buf[q_off + 4], s.in_buf[q_off + 5],
+                s.in_buf[q_off + 2],
+                s.in_buf[q_off + 3],
+                s.in_buf[q_off + 4],
+                s.in_buf[q_off + 5],
             ]);
             let wt_len_off = q_off + 6;
-            will_topic_len = u16::from_be_bytes([
-                s.in_buf[wt_len_off], s.in_buf[wt_len_off + 1],
-            ]) as usize;
+            will_topic_len =
+                u16::from_be_bytes([s.in_buf[wt_len_off], s.in_buf[wt_len_off + 1]]) as usize;
             will_topic_off = wt_len_off + 2;
             let wp_len_off = will_topic_off + will_topic_len;
-            if wp_len_off + 2 <= body_end
-                && will_topic_len <= MAX_WILL_TOPIC
-            {
-                will_payload_len = u16::from_be_bytes([
-                    s.in_buf[wp_len_off], s.in_buf[wp_len_off + 1],
-                ]) as usize;
+            if wp_len_off + 2 <= body_end && will_topic_len <= MAX_WILL_TOPIC {
+                will_payload_len =
+                    u16::from_be_bytes([s.in_buf[wp_len_off], s.in_buf[wp_len_off + 1]]) as usize;
                 will_payload_off = wp_len_off + 2;
                 if will_payload_off + will_payload_len <= body_end
                     && will_payload_len <= MAX_WILL_PAYLOAD
@@ -2563,17 +3118,18 @@ unsafe fn apply_qop_connect(
             s.in_buf[post_will_off + 2],
             s.in_buf[post_will_off + 3],
         ])
-    } else { 0 };
+    } else {
+        0
+    };
 
     // ReceiveMaximum trailer (additive after session_expiry_s; older
     // proposals stop here and the field defaults to 0 → "no cap").
     let post_expiry_off = post_will_off + 4;
     let receive_maximum = if post_expiry_off + 2 <= body_end {
-        u16::from_le_bytes([
-            s.in_buf[post_expiry_off],
-            s.in_buf[post_expiry_off + 1],
-        ])
-    } else { 0 };
+        u16::from_le_bytes([s.in_buf[post_expiry_off], s.in_buf[post_expiry_off + 1]])
+    } else {
+        0
+    };
 
     // Look up by durable identity. On the leader, the propose-side
     // will have parked a transient=1 slot for this stream_hash; on a
@@ -2596,7 +3152,9 @@ unsafe fn apply_qop_connect(
     } else {
         sessions::allocate(&s.sessions)
     };
-    let Some(i) = session_idx else { return; };
+    let Some(i) = session_idx else {
+        return;
+    };
 
     // clean_start with a prior slot wipes subscription / inflight /
     // prefetch state. Emit MSG_SESSION_DROP unconditionally on
@@ -2618,7 +3176,7 @@ unsafe fn apply_qop_connect(
         // it. See docs/architecture/apply_path.md.
         if !was_transient {
             sessions::reset_delivery_state(&mut s.sessions, i);
-        sessions::clear_flow(&mut s.sessions, i);
+            sessions::clear_flow(&mut s.sessions, i);
         }
     }
 
@@ -2634,7 +3192,8 @@ unsafe fn apply_qop_connect(
     // Durable identity + parameters (idempotent on the leader where
     // propose-side already set most of these on the transient slot).
     sessions::commit_connect(
-        &mut s.sessions, i,
+        &mut s.sessions,
+        i,
         sessions::ConnectParams {
             tenant,
             stream_hash,
@@ -2664,8 +3223,10 @@ unsafe fn apply_qop_connect(
     if !clean_start && was_persisted {
         let body_reconnect = (i as u32).to_le_bytes();
         try_emit(
-            sys, s.out_messaging,
-            wire::MSG_OFFLINE_RECONNECT, &body_reconnect,
+            sys,
+            s.out_messaging,
+            wire::MSG_OFFLINE_RECONNECT,
+            &body_reconnect,
         );
     }
 
@@ -2677,15 +3238,23 @@ unsafe fn apply_qop_connect(
         let mut wt = [0u8; MAX_WILL_TOPIC];
         let mut wp = [0u8; MAX_WILL_PAYLOAD];
         core::ptr::copy_nonoverlapping(
-            s.in_buf.as_ptr().add(will_topic_off), wt.as_mut_ptr(), will_topic_len,
+            s.in_buf.as_ptr().add(will_topic_off),
+            wt.as_mut_ptr(),
+            will_topic_len,
         );
         core::ptr::copy_nonoverlapping(
-            s.in_buf.as_ptr().add(will_payload_off), wp.as_mut_ptr(), will_payload_len,
+            s.in_buf.as_ptr().add(will_payload_off),
+            wp.as_mut_ptr(),
+            will_payload_len,
         );
         sessions::set_will(
-            &mut s.sessions, i, will_qos, will_retain != 0,
+            &mut s.sessions,
+            i,
+            will_qos,
+            will_retain != 0,
             will_delay_s.saturating_mul(1000),
-            &wt[..will_topic_len], &wp[..will_payload_len],
+            &wt[..will_topic_len],
+            &wp[..will_payload_len],
         );
     } else {
         sessions::clear_will(&mut s.sessions, i);
@@ -2712,13 +3281,10 @@ unsafe fn apply_qop_connect(
 /// # Safety
 /// Caller must hold an exclusive `&mut ModuleState`, supply a valid
 /// `&SyscallTable`, and ensure slot `i < MAX_SESSIONS` is populated.
-unsafe fn fire_will(
-    s: &mut ModuleState,
-    sys: &SyscallTable,
-    tenant: TenantId,
-    i: usize,
-) {
-    let Some(will) = sessions::will_view(&s.sessions, i) else { return; };
+unsafe fn fire_will(s: &mut ModuleState, sys: &SyscallTable, tenant: TenantId, i: usize) {
+    let Some(will) = sessions::will_view(&s.sessions, i) else {
+        return;
+    };
     let (topic_len, payload_len) = (will.topic_len, will.payload_len);
     let (pub_qos, retain) = (will.qos, will.retain);
     let mut will_topic = [0u8; MAX_WILL_TOPIC];
@@ -2750,14 +3316,17 @@ unsafe fn fire_will(
             s.out_buf.as_mut_ptr().add(8 + topic_len + 1),
             payload_len,
         );
-        try_emit(sys, s.out_topic, wire::MSG_TOPIC_PUBLISH, &s.out_buf[..dlv_total]);
+        try_emit(
+            sys,
+            s.out_topic,
+            wire::MSG_TOPIC_PUBLISH,
+            &s.out_buf[..dlv_total],
+        );
     }
     // Retain=1 Will latches in the retained store the same way as an
     // ordinary retained PUBLISH (item 2's wire format).
     if retain {
-        let topic_hash = wire::fnv1a_64(
-            &will_topic[..topic_len],
-        );
+        let topic_hash = wire::fnv1a_64(&will_topic[..topic_len]);
         let rwrite_len = 4 + 8 + 2 + topic_len + 4 + payload_len;
         if rwrite_len <= s.out_buf.len() {
             s.out_buf[0..4].copy_from_slice(&tenant.to_le_bytes());
@@ -2769,14 +3338,18 @@ unsafe fn fire_will(
                 topic_len,
             );
             let pl_off = 14 + topic_len;
-            s.out_buf[pl_off..pl_off + 4]
-                .copy_from_slice(&(payload_len as u32).to_le_bytes());
+            s.out_buf[pl_off..pl_off + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
             core::ptr::copy_nonoverlapping(
                 will_payload.as_ptr(),
                 s.out_buf.as_mut_ptr().add(pl_off + 4),
                 payload_len,
             );
-            try_emit(sys, s.out_messaging, wire::MSG_RETAINED_WRITE, &s.out_buf[..rwrite_len]);
+            try_emit(
+                sys,
+                s.out_messaging,
+                wire::MSG_RETAINED_WRITE,
+                &s.out_buf[..rwrite_len],
+            );
         }
     }
 }
@@ -2798,17 +3371,27 @@ unsafe fn apply_qop_disconnect(
     body_end: usize,
     now: u64,
 ) {
-    if body_end < body_start { return; }
+    if body_end < body_start {
+        return;
+    }
     let body_len = body_end - body_start;
-    if body_len < 9 { return; }
+    if body_len < 9 {
+        return;
+    }
     let reason = s.in_buf[body_start];
     let stream_hash = u64::from_le_bytes([
-        s.in_buf[body_start + 1], s.in_buf[body_start + 2],
-        s.in_buf[body_start + 3], s.in_buf[body_start + 4],
-        s.in_buf[body_start + 5], s.in_buf[body_start + 6],
-        s.in_buf[body_start + 7], s.in_buf[body_start + 8],
+        s.in_buf[body_start + 1],
+        s.in_buf[body_start + 2],
+        s.in_buf[body_start + 3],
+        s.in_buf[body_start + 4],
+        s.in_buf[body_start + 5],
+        s.in_buf[body_start + 6],
+        s.in_buf[body_start + 7],
+        s.in_buf[body_start + 8],
     ]);
-    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else { return; };
+    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
+        return;
+    };
 
     // Will-message handling (MQTT 3.1.1 §3.1.2.5 / MQTT 5 §3.1.3.2):
     // any non-CLEAN reason — keep-alive timeout, forced admin
@@ -2901,23 +3484,34 @@ unsafe fn apply_qop_subscribe(
     body_start: usize,
     body_end: usize,
 ) {
-    if body_end < body_start { return; }
+    if body_end < body_start {
+        return;
+    }
     let body_len = body_end - body_start;
     // [req_qos:u8][stream_hash:u64 LE][topic_len:u16 BE][topic]
-    if body_len < 1 + 8 + 2 { return; }
+    if body_len < 1 + 8 + 2 {
+        return;
+    }
     let req_qos = s.in_buf[body_start];
     let stream_hash = u64::from_le_bytes([
-        s.in_buf[body_start + 1], s.in_buf[body_start + 2],
-        s.in_buf[body_start + 3], s.in_buf[body_start + 4],
-        s.in_buf[body_start + 5], s.in_buf[body_start + 6],
-        s.in_buf[body_start + 7], s.in_buf[body_start + 8],
+        s.in_buf[body_start + 1],
+        s.in_buf[body_start + 2],
+        s.in_buf[body_start + 3],
+        s.in_buf[body_start + 4],
+        s.in_buf[body_start + 5],
+        s.in_buf[body_start + 6],
+        s.in_buf[body_start + 7],
+        s.in_buf[body_start + 8],
     ]);
-    let topic_len = u16::from_be_bytes([
-        s.in_buf[body_start + 9], s.in_buf[body_start + 10],
-    ]) as usize;
-    if body_len < 11 + topic_len { return; }
+    let topic_len =
+        u16::from_be_bytes([s.in_buf[body_start + 9], s.in_buf[body_start + 10]]) as usize;
+    if body_len < 11 + topic_len {
+        return;
+    }
     let topic_off = body_start + 11;
-    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else { return; };
+    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
+        return;
+    };
     let session_slot = i as u32;
 
     // MSG_TOPIC_SUBSCRIBE body (matches the legacy propose-side shape):
@@ -2933,7 +3527,12 @@ unsafe fn apply_qop_subscribe(
         let src = s.in_buf.as_ptr().add(topic_off);
         let dst = s.out_buf.as_mut_ptr().add(12);
         core::ptr::copy_nonoverlapping(src, dst, topic_len);
-        try_emit(sys, s.out_topic, wire::MSG_TOPIC_SUBSCRIBE, &s.out_buf[..sub_len]);
+        try_emit(
+            sys,
+            s.out_topic,
+            wire::MSG_TOPIC_SUBSCRIBE,
+            &s.out_buf[..sub_len],
+        );
     }
 
     // Retained delivery: emit MSG_RETAINED_READ for the subscription
@@ -2960,7 +3559,12 @@ unsafe fn apply_qop_subscribe(
             s.out_buf.as_mut_ptr().add(11),
             topic_len,
         );
-        try_emit(sys, s.out_messaging, wire::MSG_RETAINED_READ, &s.out_buf[..rreq_len]);
+        try_emit(
+            sys,
+            s.out_messaging,
+            wire::MSG_RETAINED_READ,
+            &s.out_buf[..rreq_len],
+        );
     }
 
     s.applied = s.applied.wrapping_add(1);
@@ -2979,22 +3583,33 @@ unsafe fn apply_qop_unsubscribe(
     body_start: usize,
     body_end: usize,
 ) {
-    if body_end < body_start { return; }
+    if body_end < body_start {
+        return;
+    }
     let body_len = body_end - body_start;
     // [stream_hash:u64 LE][topic_len:u16 BE][topic]
-    if body_len < 8 + 2 { return; }
+    if body_len < 8 + 2 {
+        return;
+    }
     let stream_hash = u64::from_le_bytes([
-        s.in_buf[body_start],     s.in_buf[body_start + 1],
-        s.in_buf[body_start + 2], s.in_buf[body_start + 3],
-        s.in_buf[body_start + 4], s.in_buf[body_start + 5],
-        s.in_buf[body_start + 6], s.in_buf[body_start + 7],
+        s.in_buf[body_start],
+        s.in_buf[body_start + 1],
+        s.in_buf[body_start + 2],
+        s.in_buf[body_start + 3],
+        s.in_buf[body_start + 4],
+        s.in_buf[body_start + 5],
+        s.in_buf[body_start + 6],
+        s.in_buf[body_start + 7],
     ]);
-    let topic_len = u16::from_be_bytes([
-        s.in_buf[body_start + 8], s.in_buf[body_start + 9],
-    ]) as usize;
-    if body_len < 10 + topic_len { return; }
+    let topic_len =
+        u16::from_be_bytes([s.in_buf[body_start + 8], s.in_buf[body_start + 9]]) as usize;
+    if body_len < 10 + topic_len {
+        return;
+    }
     let topic_off = body_start + 10;
-    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else { return; };
+    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
+        return;
+    };
     let session_slot = i as u32;
 
     // MSG_TOPIC_UNSUBSCRIBE body (matches the legacy shape):
@@ -3007,7 +3622,12 @@ unsafe fn apply_qop_unsubscribe(
         let src = s.in_buf.as_ptr().add(topic_off);
         let dst = s.out_buf.as_mut_ptr().add(10);
         core::ptr::copy_nonoverlapping(src, dst, topic_len);
-        try_emit(sys, s.out_topic, wire::MSG_TOPIC_UNSUBSCRIBE, &s.out_buf[..unsub_len]);
+        try_emit(
+            sys,
+            s.out_topic,
+            wire::MSG_TOPIC_UNSUBSCRIBE,
+            &s.out_buf[..unsub_len],
+        );
     }
     s.applied = s.applied.wrapping_add(1);
 }
@@ -3029,20 +3649,28 @@ unsafe fn apply_qop_pubrel(
     body_start: usize,
     body_end: usize,
 ) {
-    if body_end < body_start { return; }
+    if body_end < body_start {
+        return;
+    }
     let body_len = body_end - body_start;
     // [packet_id:u16 BE][stream_hash:u64 LE]
-    if body_len < 10 { return; }
-    let packet_id = u16::from_be_bytes([
-        s.in_buf[body_start], s.in_buf[body_start + 1],
-    ]);
+    if body_len < 10 {
+        return;
+    }
+    let packet_id = u16::from_be_bytes([s.in_buf[body_start], s.in_buf[body_start + 1]]);
     let stream_hash = u64::from_le_bytes([
-        s.in_buf[body_start + 2], s.in_buf[body_start + 3],
-        s.in_buf[body_start + 4], s.in_buf[body_start + 5],
-        s.in_buf[body_start + 6], s.in_buf[body_start + 7],
-        s.in_buf[body_start + 8], s.in_buf[body_start + 9],
+        s.in_buf[body_start + 2],
+        s.in_buf[body_start + 3],
+        s.in_buf[body_start + 4],
+        s.in_buf[body_start + 5],
+        s.in_buf[body_start + 6],
+        s.in_buf[body_start + 7],
+        s.in_buf[body_start + 8],
+        s.in_buf[body_start + 9],
     ]);
-    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else { return; };
+    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
+        return;
+    };
     if let Some(ii) = sessions::inflight_find(&s.sessions, i, packet_id, INFLIGHT_PUB) {
         sessions::inflight_set_phase(&mut s.sessions, i, ii, QOS2_PUBREL);
     }
@@ -3073,29 +3701,38 @@ unsafe fn apply_qop_publish(
     body_end: usize,
     version: u8,
 ) {
-    if body_end < body_start { return; }
+    if body_end < body_start {
+        return;
+    }
     let body_len = body_end - body_start;
     // QOP_PUBLISH op-body: 18-byte fixed header + topic [+ V2 user_props block] + payload.
-    if body_len < 18 { return; }
+    if body_len < 18 {
+        return;
+    }
     let pub_qos = s.in_buf[body_start] & 0x03;
-    let packet_id = u16::from_be_bytes([
-        s.in_buf[body_start + 1], s.in_buf[body_start + 2],
-    ]);
+    let packet_id = u16::from_be_bytes([s.in_buf[body_start + 1], s.in_buf[body_start + 2]]);
     let stream_hash = u64::from_le_bytes([
-        s.in_buf[body_start + 3],  s.in_buf[body_start + 4],
-        s.in_buf[body_start + 5],  s.in_buf[body_start + 6],
-        s.in_buf[body_start + 7],  s.in_buf[body_start + 8],
-        s.in_buf[body_start + 9],  s.in_buf[body_start + 10],
+        s.in_buf[body_start + 3],
+        s.in_buf[body_start + 4],
+        s.in_buf[body_start + 5],
+        s.in_buf[body_start + 6],
+        s.in_buf[body_start + 7],
+        s.in_buf[body_start + 8],
+        s.in_buf[body_start + 9],
+        s.in_buf[body_start + 10],
     ]);
     let session_epoch = u32::from_le_bytes([
-        s.in_buf[body_start + 11], s.in_buf[body_start + 12],
-        s.in_buf[body_start + 13], s.in_buf[body_start + 14],
+        s.in_buf[body_start + 11],
+        s.in_buf[body_start + 12],
+        s.in_buf[body_start + 13],
+        s.in_buf[body_start + 14],
     ]);
     let retain = s.in_buf[body_start + 15] != 0;
-    let topic_len = u16::from_be_bytes([
-        s.in_buf[body_start + 16], s.in_buf[body_start + 17],
-    ]) as usize;
-    if body_len < 18 + topic_len { return; }
+    let topic_len =
+        u16::from_be_bytes([s.in_buf[body_start + 16], s.in_buf[body_start + 17]]) as usize;
+    if body_len < 18 + topic_len {
+        return;
+    }
     let topic_off = body_start + 18;
 
     // V2 interleaves a user_props block between topic and payload.
@@ -3104,15 +3741,21 @@ unsafe fn apply_qop_publish(
     let (up_off, up_len) = if version == wire::QPROP_VERSION_V2 {
         let up_off = topic_off + topic_len;
         let slice_end = body_start + body_len;
-        if up_off > slice_end { return; }
+        if up_off > slice_end {
+            return;
+        }
         let n = user_props_block_len(&s.in_buf[up_off..slice_end]).unwrap_or(0);
-        if n == 0 || up_off + n > slice_end { return; }
+        if n == 0 || up_off + n > slice_end {
+            return;
+        }
         (up_off, n)
     } else {
         (topic_off + topic_len, 0)
     };
     let payload_off = up_off + up_len;
-    if payload_off > body_start + body_len { return; }
+    if payload_off > body_start + body_len {
+        return;
+    }
     let payload_len = body_len - 18 - topic_len - up_len;
 
     // topic_hash is a u64 value — no s.in_buf borrow held after this
@@ -3179,7 +3822,12 @@ unsafe fn apply_qop_publish(
                 s.out_buf.as_mut_ptr().add(payload_dst),
                 payload_len,
             );
-            try_emit(sys, s.out_topic, wire::MSG_TOPIC_PUBLISH, &s.out_buf[..topic_pub_len]);
+            try_emit(
+                sys,
+                s.out_topic,
+                wire::MSG_TOPIC_PUBLISH,
+                &s.out_buf[..topic_pub_len],
+            );
         }
     } else {
         // QoS 1+ on the leader: stash op-body, mark durable, emit
@@ -3187,13 +3835,16 @@ unsafe fn apply_qop_publish(
         // dedup_result.
         let mut dkey = [0u8; 20];
         wire::encode_dedup_key(
-            &mut dkey, tenant, stream_hash, session_epoch, packet_id as u32,
+            &mut dkey,
+            tenant,
+            stream_hash,
+            session_epoch,
+            packet_id as u32,
         );
         if body_len <= MAX_STASH_ENV {
-            if let Some(stash_idx) = correlate::stash_alloc(&mut s.correlate, correlation_id, &dkey) {
-                let env = core::slice::from_raw_parts(
-                    s.in_buf.as_ptr().add(body_start), body_len,
-                );
+            if let Some(stash_idx) = correlate::stash_alloc(&mut s.correlate, correlation_id, &dkey)
+            {
+                let env = core::slice::from_raw_parts(s.in_buf.as_ptr().add(body_start), body_len);
                 correlate::stash_set_env(&mut s.correlate, stash_idx, env);
                 correlate::stash_mark_durable(&mut s.correlate, stash_idx);
                 try_emit(sys, s.out_messaging, wire::MSG_DEDUP_CHECK, &dkey);
@@ -3229,16 +3880,26 @@ unsafe fn apply_qop_publish(
                 s.out_buf.as_mut_ptr().add(payload_len_off + 4),
                 payload_len,
             );
-            try_emit(sys, s.out_messaging, wire::MSG_RETAINED_WRITE, &s.out_buf[..rwrite_len]);
+            try_emit(
+                sys,
+                s.out_messaging,
+                wire::MSG_RETAINED_WRITE,
+                &s.out_buf[..rwrite_len],
+            );
         }
     }
 
     s.applied = s.applied.wrapping_add(1);
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -3252,18 +3913,43 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_flow >= 0 {
             loop {
                 let poll = (sys.channel_poll)(s.in_flow, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_flow, &mut s.in_buf) };
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_flow, &mut s.in_buf)
+                };
                 match mt {
                     wire::MSG_THROTTLE_CREDITS if plen >= 8 => {
-                        s.pid_entry_credits = i32::from_le_bytes([s.in_buf[0], s.in_buf[1], s.in_buf[2], s.in_buf[3]]);
-                        s.pid_byte_credits = i32::from_le_bytes([s.in_buf[4], s.in_buf[5], s.in_buf[6], s.in_buf[7]]);
+                        s.pid_entry_credits = i32::from_le_bytes([
+                            s.in_buf[0],
+                            s.in_buf[1],
+                            s.in_buf[2],
+                            s.in_buf[3],
+                        ]);
+                        s.pid_byte_credits = i32::from_le_bytes([
+                            s.in_buf[4],
+                            s.in_buf[5],
+                            s.in_buf[6],
+                            s.in_buf[7],
+                        ]);
                     }
                     wire::MSG_BP_SIGNAL if plen >= 9 => {
                         // [reason:u8][entry_credits:i32 LE][byte_credits:i32 LE]
                         // Treat as a backpressure-flavoured credit update.
-                        s.pid_entry_credits = i32::from_le_bytes([s.in_buf[1], s.in_buf[2], s.in_buf[3], s.in_buf[4]]);
-                        s.pid_byte_credits = i32::from_le_bytes([s.in_buf[5], s.in_buf[6], s.in_buf[7], s.in_buf[8]]);
+                        s.pid_entry_credits = i32::from_le_bytes([
+                            s.in_buf[1],
+                            s.in_buf[2],
+                            s.in_buf[3],
+                            s.in_buf[4],
+                        ]);
+                        s.pid_byte_credits = i32::from_le_bytes([
+                            s.in_buf[5],
+                            s.in_buf[6],
+                            s.in_buf[7],
+                            s.in_buf[8],
+                        ]);
                     }
                     wire::MSG_PREFETCH_CREDIT if plen >= 8 => {
                         // [session_slot:u32 LE][credit:u32 LE]
@@ -3272,8 +3958,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // sub_outstanding here — that would defeat the
                         // backlog measurement; the consumer drains it via
                         // PUBACK as deliveries clear.
-                        let slot = u32::from_le_bytes([s.in_buf[0], s.in_buf[1], s.in_buf[2], s.in_buf[3]]) as usize;
-                        let credit = u32::from_le_bytes([s.in_buf[4], s.in_buf[5], s.in_buf[6], s.in_buf[7]]);
+                        let slot = u32::from_le_bytes([
+                            s.in_buf[0],
+                            s.in_buf[1],
+                            s.in_buf[2],
+                            s.in_buf[3],
+                        ]) as usize;
+                        let credit = u32::from_le_bytes([
+                            s.in_buf[4],
+                            s.in_buf[5],
+                            s.in_buf[6],
+                            s.in_buf[7],
+                        ]);
                         if slot < MAX_SESSIONS {
                             sessions::set_prefetch_credit(&mut s.sessions, slot, credit);
                         }
@@ -3299,9 +3995,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // capacity.
             for _ in 0..32 {
                 let poll = (sys.channel_poll)(s.in_codec, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
 
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_codec, &mut s.in_buf) };
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_codec, &mut s.in_buf)
+                };
 
                 // Transport connection-closed notice (payload `[conn_id]`,
                 // forwarded by any codec on socket close). Distinct from
@@ -3314,7 +4015,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     handle_conn_disconnect(s, s.in_buf[0]);
                     continue;
                 }
-                if plen < 4 { continue; } // conn + proto + pkt + flags
+                if plen < 4 {
+                    continue;
+                } // conn + proto + pkt + flags
 
                 let conn_id = s.in_buf[0];
                 let proto = s.in_buf[1];
@@ -3357,7 +4060,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let clean_start = if body.len() >= 2 { body[1] != 0 } else { true };
                         let cid_len = if body.len() >= 12 {
                             u16::from_be_bytes([body[10], body[11]]) as usize
-                        } else { 0 };
+                        } else {
+                            0
+                        };
                         let cid_present = cid_len > 0 && body.len() >= 12 + cid_len;
                         let stream_hash = if cid_present {
                             wire::fnv1a_64(&body[12..12 + cid_len])
@@ -3373,7 +4078,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // MQTT 3.1.1 §3.1.2.10.
                         let keep_alive_s = if body.len() >= 4 {
                             u16::from_be_bytes([body[2], body[3]]) as u32
-                        } else { 0 };
+                        } else {
+                            0
+                        };
                         // TENANCY GAP: CONNECT arrival — no session exists
                         // yet, so the tenant would have to come from the
                         // control plane. See docs/architecture/multi_tenancy.md.
@@ -3395,11 +4102,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // Durable counterpart (MSG_SESSION_DROP on
                                 // out_topic) lands at QOP_CONNECT apply.
                                 sessions::reset_delivery_state(&mut s.sessions, i);
-        sessions::clear_flow(&mut s.sessions, i);
+                                sessions::clear_flow(&mut s.sessions, i);
                             }
                             sessions::touch(&mut s.sessions, i, now);
                             sessions::rebind(
-                                &mut s.sessions, i, conn_id, proto, clean_start,
+                                &mut s.sessions,
+                                i,
+                                conn_id,
+                                proto,
+                                clean_start,
                                 keep_alive_s.saturating_mul(1000),
                             );
                             // Propose-side admission marker; apply flips
@@ -3410,14 +4121,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             // `active` flips at QOP_CONNECT apply; until
                             // then the slot is transient.
                             sessions::open_transient(
-                                &mut s.sessions, i, tenant, stream_hash, proto,
-                                conn_id, clean_start,
-                                keep_alive_s.saturating_mul(1000), now,
+                                &mut s.sessions,
+                                i,
+                                sessions::ConnectParams {
+                                    tenant,
+                                    stream_hash,
+                                    protocol: proto,
+                                    clean_start,
+                                    keep_alive_ms: keep_alive_s.saturating_mul(1000),
+                                },
+                                conn_id,
+                                now,
                             );
                             // session_count is the durable count of active
                             // sessions; apply-side increments it.
                             Some(i)
-                        } else { None };
+                        } else {
+                            None
+                        };
 
                         // CONNACK body = [session_present:u8][reason_code:u8].
                         // MQTT 3.1.1 §3.2.2.2 requires session_present=1
@@ -3427,7 +4148,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         if proto == PROTO_MQTT {
                             let connack_body =
                                 [if resurrecting_persisted { 1u8 } else { 0u8 }, 0u8];
-                            emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_CONNACK, 0, &connack_body);
+                            emit_codec_response(
+                                sys,
+                                s.out_codec,
+                                conn_id,
+                                PROTO_MQTT,
+                                PKT_CONNACK,
+                                0,
+                                &connack_body,
+                            );
                         }
 
                         // Locate the Will section in the codec envelope. After
@@ -3443,7 +4172,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let un_len_off = 12 + cid_len;
                         let un_len = if body.len() >= un_len_off + 2 {
                             u16::from_be_bytes([body[un_len_off], body[un_len_off + 1]]) as usize
-                        } else { 0 };
+                        } else {
+                            0
+                        };
                         let will_flag_off = un_len_off + 2 + un_len;
                         let will_present = body.len() > will_flag_off && body[will_flag_off] != 0;
                         let mut will_qos: u8 = 0;
@@ -3456,26 +4187,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let mut will_accept = will_present;
                         if will_present {
                             let q_off = will_flag_off + 1;
-                            if body.len() < q_off + 1 + 1 + 4 + 2 { will_accept = false; }
-                            else {
+                            if body.len() < q_off + 1 + 1 + 4 + 2 {
+                                will_accept = false;
+                            } else {
                                 will_qos = body[q_off];
                                 will_retain = body[q_off + 1];
                                 will_delay_s = u32::from_le_bytes([
-                                    body[q_off + 2], body[q_off + 3],
-                                    body[q_off + 4], body[q_off + 5],
+                                    body[q_off + 2],
+                                    body[q_off + 3],
+                                    body[q_off + 4],
+                                    body[q_off + 5],
                                 ]);
                                 let wt_len_off = q_off + 6;
-                                will_topic_len = u16::from_be_bytes([
-                                    body[wt_len_off], body[wt_len_off + 1],
-                                ]) as usize;
+                                will_topic_len =
+                                    u16::from_be_bytes([body[wt_len_off], body[wt_len_off + 1]])
+                                        as usize;
                                 will_topic_off = wt_len_off + 2;
                                 let wp_len_off = will_topic_off + will_topic_len;
-                                if body.len() < wp_len_off + 2 { will_accept = false; }
-                                else if will_topic_len > MAX_WILL_TOPIC { will_accept = false; }
-                                else {
+                                if body.len() < wp_len_off + 2 || will_topic_len > MAX_WILL_TOPIC {
+                                    will_accept = false;
+                                } else {
                                     will_payload_len = u16::from_be_bytes([
-                                        body[wp_len_off], body[wp_len_off + 1],
-                                    ]) as usize;
+                                        body[wp_len_off],
+                                        body[wp_len_off + 1],
+                                    ])
+                                        as usize;
                                     will_payload_off = wp_len_off + 2;
                                     if body.len() < will_payload_off + will_payload_len
                                         || will_payload_len > MAX_WILL_PAYLOAD
@@ -3498,7 +4234,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // outright on the clean path; pass through as-is.
                         let session_expiry_s = if body.len() >= 8 {
                             u32::from_le_bytes([body[4], body[5], body[6], body[7]])
-                        } else { 0 };
+                        } else {
+                            0
+                        };
                         let session_expiry_s = if proto == PROTO_MQTT
                             && body.first().copied().unwrap_or(0) < 5
                             && !clean_start
@@ -3516,7 +4254,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // unacked QoS 1+ deliveries to the subscriber.
                         let receive_maximum_s = if body.len() >= 10 {
                             u16::from_le_bytes([body[8], body[9]])
-                        } else { 0 };
+                        } else {
+                            0
+                        };
 
                         // Encode QOP_CONNECT canonical envelope and propose.
                         // Body shape (from wire::QOP_CONNECT docstring):
@@ -3528,13 +4268,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let session_slot = session_idx.unwrap_or(0) as u32;
                         let will_extra = if encode_will {
                             1 + 1 + 4 + 2 + will_topic_len + 2 + will_payload_len
-                        } else { 0 };
+                        } else {
+                            0
+                        };
                         let qbody_len = 1 + 2 + 8 + 2 + cid_len + 1 + 1 + will_extra + 4 + 2;
                         let prop_total = wire::QPROP_UNTAGGED_HDR_LEN + qbody_len;
                         if prop_total <= s.out_buf.len() {
                             wire::encode_qprop_header(
                                 &mut s.out_buf[0..wire::QPROP_HEADER_LEN],
-                                wire::QOP_CONNECT, tenant, session_slot,
+                                wire::QOP_CONNECT,
+                                tenant,
+                                session_slot,
                             );
                             let off = wire::QPROP_UNTAGGED_HDR_LEN;
                             s.out_buf[off] = clean_start as u8;
@@ -3582,7 +4326,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.out_buf[wpos + 4..wpos + 6]
                                 .copy_from_slice(&receive_maximum_s.to_le_bytes());
                             if try_emit(
-                                sys, s.out_proposals,
+                                sys,
+                                s.out_proposals,
                                 wire::MSG_CLIENT_PROPOSAL,
                                 &s.out_buf[..prop_total],
                             ) {
@@ -3621,19 +4366,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             if prop_total <= s.out_buf.len() {
                                 wire::encode_qprop_header(
                                     &mut s.out_buf[0..wire::QPROP_HEADER_LEN],
-                                    wire::QOP_DISCONNECT, tenant, session_slot,
+                                    wire::QOP_DISCONNECT,
+                                    tenant,
+                                    session_slot,
                                 );
                                 let off = wire::QPROP_UNTAGGED_HDR_LEN;
                                 s.out_buf[off] = wire::QDISC_REASON_CLEAN;
                                 s.out_buf[off + 1..off + 9]
                                     .copy_from_slice(&stream_hash.to_le_bytes());
                                 if try_emit(
-                                    sys, s.out_proposals,
+                                    sys,
+                                    s.out_proposals,
                                     wire::MSG_CLIENT_PROPOSAL,
                                     &s.out_buf[..prop_total],
                                 ) {
-                                    s.proposals_emitted =
-                                        s.proposals_emitted.wrapping_add(1);
+                                    s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
                                 }
                             }
                         }
@@ -3665,19 +4412,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // The user_props block is always present even
                                 // for MQTT 3.1.1 (count = 0). Item 6
                                 // bumps QOP_PUBLISH to V2 to carry it.
-                                if body.len() < 4 { continue; }
+                                if body.len() < 4 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 let topic_len = u16::from_be_bytes([body[2], body[3]]) as usize;
-                                if body.len() < 4 + topic_len + 1 { continue; }
+                                if body.len() < 4 + topic_len + 1 {
+                                    continue;
+                                }
                                 let up_off = 4 + topic_len;
                                 let Some(up_len) = user_props_block_len(&body[up_off..]) else {
-                                    s.publishes_throttled =
-                                        s.publishes_throttled.wrapping_add(1);
+                                    s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
                                     continue;
                                 };
                                 if up_len > MAX_USER_PROPS_BYTES {
-                                    s.publishes_throttled =
-                                        s.publishes_throttled.wrapping_add(1);
+                                    s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
                                     continue;
                                 }
                                 let payload_off = up_off + up_len;
@@ -3708,8 +4457,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                             s.publishes_throttled.wrapping_add(1);
                                         continue;
                                     };
-                                    if sessions::inflight_add(&mut s.sessions, si, packet_id, qos, INFLIGHT_PUB)
-                                        .is_none()
+                                    if sessions::inflight_add(
+                                        &mut s.sessions,
+                                        si,
+                                        packet_id,
+                                        qos,
+                                        INFLIGHT_PUB,
+                                    )
+                                    .is_none()
                                     {
                                         s.publishes_throttled =
                                             s.publishes_throttled.wrapping_add(1);
@@ -3735,7 +4490,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 //   [retain:u8][topic_len:u16 BE][topic]
                                 //   [user_props_count:u8][per prop ...]
                                 //   [payload]
-                                let qbody_len = 1 + 2 + 8 + 4 + 1 + 2 + topic_len + up_len + payload_len;
+                                let qbody_len =
+                                    1 + 2 + 8 + 4 + 1 + 2 + topic_len + up_len + payload_len;
                                 let prop_total = if qos > 0 {
                                     wire::QPROP_TAGGED_HDR_LEN + qbody_len
                                 } else {
@@ -3750,8 +4506,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 if prop_total > s.out_buf.len() || stash_oversize {
                                     if qos > 0 {
                                         if let Some(si) = session_idx {
-                                            if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_PUB)
-                                            {
+                                            if let Some(ii) = sessions::inflight_find(
+                                                &s.sessions,
+                                                si,
+                                                packet_id,
+                                                INFLIGHT_PUB,
+                                            ) {
                                                 sessions::inflight_release(&mut s.sessions, si, ii);
                                             }
                                         }
@@ -3761,12 +4521,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 }
 
                                 let cid: u64 = if qos > 0 {
-                                    let Some(cid) = correlate::allocate(&mut s.correlate, 
-                                        session_slot, packet_id, OP_PUBLISH, now,
+                                    let Some(cid) = correlate::allocate(
+                                        &mut s.correlate,
+                                        session_slot,
+                                        packet_id,
+                                        OP_PUBLISH,
+                                        now,
                                     ) else {
                                         if let Some(si) = session_idx {
-                                            if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_PUB)
-                                            {
+                                            if let Some(ii) = sessions::inflight_find(
+                                                &s.sessions,
+                                                si,
+                                                packet_id,
+                                                INFLIGHT_PUB,
+                                            ) {
                                                 sessions::inflight_release(&mut s.sessions, si, ii);
                                             }
                                         }
@@ -3780,9 +4548,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     // from stash) and MSG_ACK_EMIT (PUBACK fire)
                                     // can locate this publish.
                                     if let Some(si) = session_idx {
-                                        if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_PUB)
-                                        {
-                                            sessions::inflight_set_correlation(&mut s.sessions, si, ii, cid);
+                                        if let Some(ii) = sessions::inflight_find(
+                                            &s.sessions,
+                                            si,
+                                            packet_id,
+                                            INFLIGHT_PUB,
+                                        ) {
+                                            sessions::inflight_set_correlation(
+                                                &mut s.sessions,
+                                                si,
+                                                ii,
+                                                cid,
+                                            );
                                         }
                                     }
                                     cid
@@ -3796,23 +4573,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // QOP_PUBLISH uses V2 because the op-body
                                 // shape has changed (user_props block
                                 // interleaved between topic and payload).
-                                let hdr_end;
-                                if qos > 0 {
+                                let hdr_end = if qos > 0 {
                                     s.out_buf[0..8].copy_from_slice(&cid.to_le_bytes());
                                     wire::encode_qprop_header_v(
                                         &mut s.out_buf[8..8 + wire::QPROP_HEADER_LEN],
                                         wire::QPROP_VERSION_V2,
-                                        wire::QOP_PUBLISH, tenant, session_slot,
+                                        wire::QOP_PUBLISH,
+                                        tenant,
+                                        session_slot,
                                     );
-                                    hdr_end = wire::QPROP_TAGGED_HDR_LEN;
+                                    wire::QPROP_TAGGED_HDR_LEN
                                 } else {
                                     wire::encode_qprop_header_v(
                                         &mut s.out_buf[0..wire::QPROP_HEADER_LEN],
                                         wire::QPROP_VERSION_V2,
-                                        wire::QOP_PUBLISH, tenant, session_slot,
+                                        wire::QOP_PUBLISH,
+                                        tenant,
+                                        session_slot,
                                     );
-                                    hdr_end = wire::QPROP_UNTAGGED_HDR_LEN;
-                                }
+                                    wire::QPROP_UNTAGGED_HDR_LEN
+                                };
                                 let off = hdr_end;
                                 s.out_buf[off] = qos;
                                 s.out_buf[off + 1..off + 3]
@@ -3850,13 +4630,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     s.out_proposals
                                 };
                                 let emit_ok = try_emit(
-                                    sys, chan,
+                                    sys,
+                                    chan,
                                     wire::MSG_CLIENT_PROPOSAL,
                                     &s.out_buf[..prop_total],
                                 );
                                 if emit_ok {
-                                    s.proposals_emitted =
-                                        s.proposals_emitted.wrapping_add(1);
+                                    s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
                                 } else {
                                     // Proposal didn't reach raft (channel full /
                                     // overload). For QoS 1+ roll back the
@@ -3866,8 +4646,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     if qos > 0 {
                                         let _ = correlate::take(&mut s.correlate, cid);
                                         if let Some(si) = session_idx {
-                                            if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_PUB)
-                                            {
+                                            if let Some(ii) = sessions::inflight_find(
+                                                &s.sessions,
+                                                si,
+                                                packet_id,
+                                                INFLIGHT_PUB,
+                                            ) {
                                                 sessions::inflight_release(&mut s.sessions, si, ii);
                                             }
                                         }
@@ -3876,8 +4660,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     // including QoS 0, so offered != accepted
                                     // stays visible — the "no silent drops"
                                     // invariant.
-                                    s.publishes_throttled =
-                                        s.publishes_throttled.wrapping_add(1);
+                                    s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
                                 }
                             }
 
@@ -3892,11 +4675,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // emission, which is bounded by Raft commit
                                 // latency (typically sub-ms in single-node).
                                 dev_log(sys, 3, b"[sess] sub".as_ptr(), 10);
-                                if body.len() < 5 { continue; }
+                                if body.len() < 5 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 let req_qos = body[2];
                                 let topic_len = u16::from_be_bytes([body[3], body[4]]) as usize;
-                                if body.len() < 5 + topic_len { continue; }
+                                if body.len() < 5 + topic_len {
+                                    continue;
+                                }
 
                                 let session_idx = sessions::find_by_conn(&s.sessions, conn_id);
                                 let tenant = session_idx
@@ -3915,7 +4702,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 if prop_total <= s.out_buf.len() {
                                     wire::encode_qprop_header(
                                         &mut s.out_buf[0..wire::QPROP_HEADER_LEN],
-                                        wire::QOP_SUBSCRIBE, tenant, session_slot,
+                                        wire::QOP_SUBSCRIBE,
+                                        tenant,
+                                        session_slot,
                                     );
                                     let off = wire::QPROP_UNTAGGED_HDR_LEN;
                                     s.out_buf[off] = req_qos;
@@ -3929,12 +4718,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                         topic_len,
                                     );
                                     if try_emit(
-                                        sys, s.out_proposals,
+                                        sys,
+                                        s.out_proposals,
                                         wire::MSG_CLIENT_PROPOSAL,
                                         &s.out_buf[..prop_total],
                                     ) {
-                                        s.proposals_emitted =
-                                            s.proposals_emitted.wrapping_add(1);
+                                        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
                                     }
                                 }
 
@@ -3942,14 +4731,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let mut suback = [0u8; 3];
                                 suback[0..2].copy_from_slice(&packet_id.to_be_bytes());
                                 suback[2] = req_qos;
-                                emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_SUBACK, 0, &suback);
+                                emit_codec_response(
+                                    sys,
+                                    s.out_codec,
+                                    conn_id,
+                                    PROTO_MQTT,
+                                    PKT_SUBACK,
+                                    0,
+                                    &suback,
+                                );
                             }
 
                             PKT_UNSUBSCRIBE => {
-                                if body.len() < 5 { continue; }
+                                if body.len() < 5 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 let topic_len = u16::from_be_bytes([body[3], body[4]]) as usize;
-                                if body.len() < 5 + topic_len { continue; }
+                                if body.len() < 5 + topic_len {
+                                    continue;
+                                }
 
                                 let session_idx = sessions::find_by_conn(&s.sessions, conn_id);
                                 let tenant = session_idx
@@ -3967,7 +4768,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 if prop_total <= s.out_buf.len() {
                                     wire::encode_qprop_header(
                                         &mut s.out_buf[0..wire::QPROP_HEADER_LEN],
-                                        wire::QOP_UNSUBSCRIBE, tenant, session_slot,
+                                        wire::QOP_UNSUBSCRIBE,
+                                        tenant,
+                                        session_slot,
                                     );
                                     let off = wire::QPROP_UNTAGGED_HDR_LEN;
                                     s.out_buf[off..off + 8]
@@ -3980,35 +4783,63 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                         topic_len,
                                     );
                                     if try_emit(
-                                        sys, s.out_proposals,
+                                        sys,
+                                        s.out_proposals,
                                         wire::MSG_CLIENT_PROPOSAL,
                                         &s.out_buf[..prop_total],
                                     ) {
-                                        s.proposals_emitted =
-                                            s.proposals_emitted.wrapping_add(1);
+                                        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
                                     }
                                 }
 
                                 let mut unsuback = [0u8; 2];
                                 unsuback.copy_from_slice(&packet_id.to_be_bytes());
-                                emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_UNSUBACK, 0, &unsuback);
+                                emit_codec_response(
+                                    sys,
+                                    s.out_codec,
+                                    conn_id,
+                                    PROTO_MQTT,
+                                    PKT_UNSUBACK,
+                                    0,
+                                    &unsuback,
+                                );
                             }
 
                             PKT_PUBREC => {
                                 // Inbound PUBREC is the subscriber's QoS 2
                                 // phase-1 ack of a PUBLISH we delivered to them.
-                                if body.len() < 2 { continue; }
+                                if body.len() < 2 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 if let Some(si) = sessions::find_by_conn(&s.sessions, conn_id) {
-                                    if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_SUB) {
+                                    if let Some(ii) = sessions::inflight_find(
+                                        &s.sessions,
+                                        si,
+                                        packet_id,
+                                        INFLIGHT_SUB,
+                                    ) {
                                         if sessions::inflight_view(&s.sessions, si, ii)
                                             .is_some_and(|v| v.phase == QOS2_PUBLISH)
                                         {
-                                            sessions::inflight_set_phase(&mut s.sessions, si, ii, QOS2_PUBREL);
+                                            sessions::inflight_set_phase(
+                                                &mut s.sessions,
+                                                si,
+                                                ii,
+                                                QOS2_PUBREL,
+                                            );
                                             s.qos2_rec = s.qos2_rec.wrapping_add(1);
                                             let mut pubrel = [0u8; 2];
                                             pubrel.copy_from_slice(&packet_id.to_be_bytes());
-                                            emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_PUBREL, 0x02, &pubrel);
+                                            emit_codec_response(
+                                                sys,
+                                                s.out_codec,
+                                                conn_id,
+                                                PROTO_MQTT,
+                                                PKT_PUBREL,
+                                                0x02,
+                                                &pubrel,
+                                            );
                                         }
                                     }
                                 }
@@ -4024,24 +4855,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // then emits PUBCOMP and frees the publisher
                                 // inflight. Apply-side records the phase
                                 // transition durably (see apply_qop_pubrel).
-                                if body.len() < 2 { continue; }
+                                if body.len() < 2 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 s.qos2_rel = s.qos2_rel.wrapping_add(1);
 
-                                let Some(si) = sessions::find_by_conn(&s.sessions, conn_id) else { continue; };
+                                let Some(si) = sessions::find_by_conn(&s.sessions, conn_id) else {
+                                    continue;
+                                };
                                 // Mark publisher inflight as awaiting PUBREL
                                 // durability so a stray PUBCOMP attempt
                                 // doesn't fire twice.
-                                let inflight_idx = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_PUB);
+                                let inflight_idx = sessions::inflight_find(
+                                    &s.sessions,
+                                    si,
+                                    packet_id,
+                                    INFLIGHT_PUB,
+                                );
                                 if let Some(ii) = inflight_idx {
-                                    sessions::inflight_set_phase(&mut s.sessions, si, ii, QOS2_PUBREL);
+                                    sessions::inflight_set_phase(
+                                        &mut s.sessions,
+                                        si,
+                                        ii,
+                                        QOS2_PUBREL,
+                                    );
                                 }
 
                                 let tenant = sessions::tenant(&s.sessions, si);
                                 let session_slot = si as u32;
                                 let stream_hash = sessions::stream_hash(&s.sessions, si);
-                                let Some(cid) = correlate::allocate(&mut s.correlate, 
-                                    session_slot, packet_id, OP_PUBREL, now,
+                                let Some(cid) = correlate::allocate(
+                                    &mut s.correlate,
+                                    session_slot,
+                                    packet_id,
+                                    OP_PUBREL,
+                                    now,
                                 ) else {
                                     correlate::note_dropped(&mut s.correlate);
                                     continue;
@@ -4052,7 +4901,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // a PUBREL retry without consulting the
                                 // (already-released) PUBLISH stash.
                                 if let Some(ii) = inflight_idx {
-                                    sessions::inflight_set_correlation(&mut s.sessions, si, ii, cid);
+                                    sessions::inflight_set_correlation(
+                                        &mut s.sessions,
+                                        si,
+                                        ii,
+                                        cid,
+                                    );
                                 }
 
                                 // QOP_PUBREL body:
@@ -4064,7 +4918,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     s.out_buf[0..8].copy_from_slice(&cid.to_le_bytes());
                                     wire::encode_qprop_header(
                                         &mut s.out_buf[8..8 + wire::QPROP_HEADER_LEN],
-                                        wire::QOP_PUBREL, tenant, session_slot,
+                                        wire::QOP_PUBREL,
+                                        tenant,
+                                        session_slot,
                                     );
                                     let off = wire::QPROP_TAGGED_HDR_LEN;
                                     s.out_buf[off..off + 2]
@@ -4072,12 +4928,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     s.out_buf[off + 2..off + 10]
                                         .copy_from_slice(&stream_hash.to_le_bytes());
                                     if try_emit(
-                                        sys, s.out_proposals_tagged,
+                                        sys,
+                                        s.out_proposals_tagged,
                                         wire::MSG_CLIENT_PROPOSAL,
                                         &s.out_buf[..prop_total],
                                     ) {
-                                        s.proposals_emitted =
-                                            s.proposals_emitted.wrapping_add(1);
+                                        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
                                         emit_ok = true;
                                     }
                                 }
@@ -4089,7 +4945,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                     // this branch.
                                     let _ = correlate::take(&mut s.correlate, cid);
                                     if let Some(ii) = inflight_idx {
-                                        sessions::inflight_set_correlation(&mut s.sessions, si, ii, 0);
+                                        sessions::inflight_set_correlation(
+                                            &mut s.sessions,
+                                            si,
+                                            ii,
+                                            0,
+                                        );
                                     }
                                     correlate::note_dropped(&mut s.correlate);
                                 }
@@ -4102,18 +4963,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // the inflight slot and the subscriber's
                                 // prefetch credit so further deliveries can
                                 // flow.
-                                if body.len() < 2 { continue; }
+                                if body.len() < 2 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 s.qos2_comp = s.qos2_comp.wrapping_add(1);
                                 if let Some(si) = sessions::find_by_conn(&s.sessions, conn_id) {
-                                    if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_SUB) {
+                                    if let Some(ii) = sessions::inflight_find(
+                                        &s.sessions,
+                                        si,
+                                        packet_id,
+                                        INFLIGHT_SUB,
+                                    ) {
                                         sessions::inflight_release(&mut s.sessions, si, ii);
                                         if sessions::sub_outstanding(&s.sessions, si) > 0 {
                                             sessions::note_ack(&mut s.sessions, si);
                                             let mut lag_msg = [0u8; 8];
-                                            lag_msg[0..4].copy_from_slice(&(si as u32).to_le_bytes());
-                                            lag_msg[4..8].copy_from_slice(&sessions::sub_outstanding(&s.sessions, si).to_le_bytes());
-                                            try_emit(sys, s.out_forward, wire::MSG_LAG_SIGNAL, &lag_msg);
+                                            lag_msg[0..4]
+                                                .copy_from_slice(&(si as u32).to_le_bytes());
+                                            lag_msg[4..8].copy_from_slice(
+                                                &sessions::sub_outstanding(&s.sessions, si)
+                                                    .to_le_bytes(),
+                                            );
+                                            try_emit(
+                                                sys,
+                                                s.out_forward,
+                                                wire::MSG_LAG_SIGNAL,
+                                                &lag_msg,
+                                            );
                                         }
                                     }
                                 }
@@ -4122,18 +4999,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             PKT_PUBACK => {
                                 // Inbound PUBACK is the subscriber draining
                                 // a QoS 1 delivery we pushed.
-                                if body.len() < 2 { continue; }
+                                if body.len() < 2 {
+                                    continue;
+                                }
                                 let packet_id = u16::from_be_bytes([body[0], body[1]]);
                                 if let Some(si) = sessions::find_by_conn(&s.sessions, conn_id) {
-                                    if let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_SUB) {
+                                    if let Some(ii) = sessions::inflight_find(
+                                        &s.sessions,
+                                        si,
+                                        packet_id,
+                                        INFLIGHT_SUB,
+                                    ) {
                                         sessions::inflight_release(&mut s.sessions, si, ii);
                                         s.acks_emitted = s.acks_emitted.wrapping_add(1);
                                         if sessions::sub_outstanding(&s.sessions, si) > 0 {
                                             sessions::note_ack(&mut s.sessions, si);
                                             let mut lag_msg = [0u8; 8];
-                                            lag_msg[0..4].copy_from_slice(&(si as u32).to_le_bytes());
-                                            lag_msg[4..8].copy_from_slice(&sessions::sub_outstanding(&s.sessions, si).to_le_bytes());
-                                            try_emit(sys, s.out_forward, wire::MSG_LAG_SIGNAL, &lag_msg);
+                                            lag_msg[0..4]
+                                                .copy_from_slice(&(si as u32).to_le_bytes());
+                                            lag_msg[4..8].copy_from_slice(
+                                                &sessions::sub_outstanding(&s.sessions, si)
+                                                    .to_le_bytes(),
+                                            );
+                                            try_emit(
+                                                sys,
+                                                s.out_forward,
+                                                wire::MSG_LAG_SIGNAL,
+                                                &lag_msg,
+                                            );
                                         }
                                     }
                                 }
@@ -4162,9 +5055,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                                 8 => handle_kafka_offset_commit(s, sys, plen as usize),
                                 9 => handle_kafka_offset_fetch(s, sys, plen as usize),
                                 11 => handle_kafka_join_group(s, sys, plen as usize),
-                                12 | 13 => handle_kafka_heartbeat_leave(
-                                    s, sys, plen as usize, api_key,
-                                ),
+                                12 | 13 => {
+                                    handle_kafka_heartbeat_leave(s, sys, plen as usize, api_key)
+                                }
                                 14 => handle_kafka_sync_group(s, sys, plen as usize),
                                 _ => {}
                             }
@@ -4218,11 +5111,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_committed >= 0 {
             for _ in 0..16 {
                 let poll = (sys.channel_poll)(s.in_committed, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_committed, &mut s.in_buf) };
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_committed, &mut s.in_buf)
+                };
                 if mt == wire::MSG_COMMITTED_ENTRY && plen >= 16 {
-                    s.committed_entries_observed =
-                        s.committed_entries_observed.wrapping_add(1);
+                    s.committed_entries_observed = s.committed_entries_observed.wrapping_add(1);
                     let entry_end = plen as usize;
                     // MSG_COMMITTED_ENTRY body: [term:u64][index:u64][entry_body].
                     // Strip the 16-byte prefix and peel the Quantum
@@ -4231,8 +5128,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // proposal handler strips any leading correlation_id
                     // upstream).
                     let entry_index = u64::from_le_bytes([
-                        s.in_buf[8],  s.in_buf[9],  s.in_buf[10], s.in_buf[11],
-                        s.in_buf[12], s.in_buf[13], s.in_buf[14], s.in_buf[15],
+                        s.in_buf[8],
+                        s.in_buf[9],
+                        s.in_buf[10],
+                        s.in_buf[11],
+                        s.in_buf[12],
+                        s.in_buf[13],
+                        s.in_buf[14],
+                        s.in_buf[15],
                     ]);
 
                     // Index sequencing (docs/architecture/apply_path.md §Apply-pipeline reset):
@@ -4248,7 +5151,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // index 1. That's intentional and harmless: state is
                     // already empty on a fresh boot, so the reset is a no-op
                     // beyond resyncing apply_index.
-                    if entry_index <= s.apply_index { continue; }
+                    if entry_index <= s.apply_index {
+                        continue;
+                    }
                     if entry_index > s.apply_index + 1 && s.apply_index > 0 {
                         apply_reset(s, sys, entry_index);
                     }
@@ -4273,21 +5178,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // the ack component via MSG_ACK_REGISTER so it can disambiguate the
         // same wal_index arriving from different partitions —
         // ack-on-durability matches by `(partition_id, wal_index)`,
-        // not just `wal_index`. Replaces the legacy `wal_index = 0`
-        // placeholder + the ack component heuristic.
+        // not just `wal_index`.
         if s.in_assigned >= 0 {
             // 32/tick, matching the proposal-side burst capacity — every
             // tagged proposal produces exactly one assignment.
             for _ in 0..32 {
                 let poll = (sys.channel_poll)(s.in_assigned, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_assigned, &mut s.in_buf) };
-                if mt != wire::MSG_PROPOSAL_ASSIGNED || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN {
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_assigned, &mut s.in_buf)
+                };
+                if mt != wire::MSG_PROPOSAL_ASSIGNED
+                    || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN
+                {
                     continue;
                 }
                 let (cid, partition_id, wal_index) =
                     wire::decode_proposal_assigned(&s.in_buf[..wire::PROPOSAL_ASSIGNED_LEN]);
-                if let Some((session_slot, packet_id, _op)) = correlate::take(&mut s.correlate, cid) {
+                if let Some((session_slot, packet_id, _op)) = correlate::take(&mut s.correlate, cid)
+                {
                     // MSG_ACK_REGISTER (18 bytes):
                     //   [session_slot:u32 LE][packet_id:u32 LE]
                     //   [partition_id:u16 LE][wal_index:u64 LE]
@@ -4307,7 +5219,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // edge is momentarily saturated.
                     let ssize = session_slot as usize;
                     if ssize < MAX_SESSIONS {
-                        if let Some(ii) = sessions::inflight_find(&s.sessions, ssize, packet_id, INFLIGHT_PUB)
+                        if let Some(ii) =
+                            sessions::inflight_find(&s.sessions, ssize, packet_id, INFLIGHT_PUB)
                         {
                             sessions::inflight_set_wal_index(&mut s.sessions, ssize, ii, wal_index);
                         }
@@ -4325,7 +5238,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             && pidx < KIN_MAX_PARTS
                             && store::inflight_valid(&s.store, ki, epoch)
                         {
-                            store::inflight_set_part_offset(&mut s.store, ki, pidx, wal_index as i64);
+                            store::inflight_set_part_offset(
+                                &mut s.store,
+                                ki,
+                                pidx,
+                                wal_index as i64,
+                            );
                         }
                     }
 
@@ -4374,11 +5292,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // by a tick per 8 acks.
             for _ in 0..32 {
                 let poll = (sys.channel_poll)(s.in_ack, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_ack, &mut s.in_buf) };
-                if plen < 8 { continue; }
-                let session_slot = u32::from_le_bytes([s.in_buf[0], s.in_buf[1], s.in_buf[2], s.in_buf[3]]) as usize;
-                let packet_id = u32::from_le_bytes([s.in_buf[4], s.in_buf[5], s.in_buf[6], s.in_buf[7]]) as u16;
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_ack, &mut s.in_buf)
+                };
+                if plen < 8 {
+                    continue;
+                }
+                let session_slot =
+                    u32::from_le_bytes([s.in_buf[0], s.in_buf[1], s.in_buf[2], s.in_buf[3]])
+                        as usize;
+                let packet_id =
+                    u32::from_le_bytes([s.in_buf[4], s.in_buf[5], s.in_buf[6], s.in_buf[7]]) as u16;
 
                 // Kafka produce inflights live in a reserved session_slot
                 // namespace (see KAFKA_SLOT_BASE). Quorum durability landed
@@ -4387,7 +5315,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // request timeout drives the retry; the stale-entry sweep in
                 // the metrics tick reclaims the slot.
                 if session_slot >= KAFKA_SLOT_BASE as usize {
-                    if mt != wire::MSG_ACK_EMIT { continue; }
+                    if mt != wire::MSG_ACK_EMIT {
+                        continue;
+                    }
                     // Decode slot + epoch from session_slot; partition from
                     // packet_id. An epoch mismatch means this durability
                     // landed for a slot that has since been freed and
@@ -4414,11 +5344,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let mut rest = [0u8; 9];
                             rest[0..8].copy_from_slice(&e.delivery_tag.to_le_bytes());
                             rest[8] = 0;
-                            if emit_amqp_response(
-                                sys, s.out_codec, e.conn_id, 1, e.channel, &rest,
-                            ) {
-                                s.amqp_publish_acked =
-                                    s.amqp_publish_acked.wrapping_add(1);
+                            if emit_amqp_response(sys, s.out_codec, e.conn_id, 1, e.channel, &rest)
+                            {
+                                s.amqp_publish_acked = s.amqp_publish_acked.wrapping_add(1);
                                 store::inflight_free(&mut s.store, ki);
                                 s.acks_emitted = s.acks_emitted.wrapping_add(1);
                             }
@@ -4430,20 +5358,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     #[cfg(feature = "kafka")]
                     {
-                            // One partition of the request reached quorum
-                            // durability. Respond once ALL have resolved.
-                            if store::inflight_complete_part(&mut s.store, ki)
-                                && emit_kafka_produce_response_multi(s, sys, ki)
-                            {
-                                s.kafka_produce_acked =
-                                    s.kafka_produce_acked.wrapping_add(1);
-                                store::inflight_free(&mut s.store, ki);
-                                s.acks_emitted = s.acks_emitted.wrapping_add(1);
-                            }
+                        // One partition of the request reached quorum
+                        // durability. Respond once ALL have resolved.
+                        if store::inflight_complete_part(&mut s.store, ki)
+                            && emit_kafka_produce_response_multi(s, sys, ki)
+                        {
+                            s.kafka_produce_acked = s.kafka_produce_acked.wrapping_add(1);
+                            store::inflight_free(&mut s.store, ki);
+                            s.acks_emitted = s.acks_emitted.wrapping_add(1);
+                        }
                     }
                     continue;
                 }
-                if session_slot >= MAX_SESSIONS { continue; }
+                if session_slot >= MAX_SESSIONS {
+                    continue;
+                }
 
                 match mt {
                     wire::MSG_ACK_EMIT => {
@@ -4460,8 +5389,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             continue;
                         }
                         let conn_id = sessions::conn_id(&s.sessions, session_slot);
-                        let Some(ii) = sessions::inflight_find(&s.sessions, session_slot, packet_id, INFLIGHT_PUB)
-                        else { continue; };
+                        let Some(ii) = sessions::inflight_find(
+                            &s.sessions,
+                            session_slot,
+                            packet_id,
+                            INFLIGHT_PUB,
+                        ) else {
+                            continue;
+                        };
                         let iv = sessions::inflight_view(&s.sessions, session_slot, ii);
                         let qos = iv.map(|v| v.qos).unwrap_or(0);
                         let phase = iv.map(|v| v.phase).unwrap_or(0);
@@ -4470,9 +5405,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // Stash bookkeeping for PUBLISH ops — mark durable
                         // and finalise if dedup already resolved.
                         if correlation_id != 0 {
-                            if let Some(stash_idx) = correlate::stash_by_correlation(&s.correlate, correlation_id) {
+                            if let Some(stash_idx) =
+                                correlate::stash_by_correlation(&s.correlate, correlation_id)
+                            {
                                 correlate::stash_mark_durable(&mut s.correlate, stash_idx);
-                                if correlate::stash_dedup_state(&s.correlate, stash_idx) != STASH_DEDUP_PENDING {
+                                if correlate::stash_dedup_state(&s.correlate, stash_idx)
+                                    != STASH_DEDUP_PENDING
+                                {
                                     finalise_stash(s, sys, stash_idx);
                                 }
                             }
@@ -4481,17 +5420,41 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let body = packet_id.to_be_bytes();
                         if qos == 1 {
                             sessions::inflight_release(&mut s.sessions, session_slot, ii);
-                            emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_PUBACK, 0, &body);
+                            emit_codec_response(
+                                sys,
+                                s.out_codec,
+                                conn_id,
+                                PROTO_MQTT,
+                                PKT_PUBACK,
+                                0,
+                                &body,
+                            );
                         } else if qos == 2 {
                             if phase == QOS2_PUBLISH {
                                 // PUBLISH commit landed; emit PUBREC and
                                 // keep inflight alive to await PUBREL.
-                                emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_PUBREC, 0, &body);
+                                emit_codec_response(
+                                    sys,
+                                    s.out_codec,
+                                    conn_id,
+                                    PROTO_MQTT,
+                                    PKT_PUBREC,
+                                    0,
+                                    &body,
+                                );
                             } else if phase == QOS2_PUBREL {
                                 // PUBREL commit landed; emit PUBCOMP and
                                 // release the publisher inflight.
                                 sessions::inflight_release(&mut s.sessions, session_slot, ii);
-                                emit_codec_response(sys, s.out_codec, conn_id, PROTO_MQTT, PKT_PUBCOMP, 0, &body);
+                                emit_codec_response(
+                                    sys,
+                                    s.out_codec,
+                                    conn_id,
+                                    PROTO_MQTT,
+                                    PKT_PUBCOMP,
+                                    0,
+                                    &body,
+                                );
                                 s.qos2_comp = s.qos2_comp.wrapping_add(1);
                             }
                         }
@@ -4499,14 +5462,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     wire::MSG_ACK_REDELIVER => {
                         s.redeliver_signals = s.redeliver_signals.wrapping_add(1);
-                        if !sessions::is_active(&s.sessions, session_slot) { continue; }
-                        let Some(ii) = sessions::inflight_find(&s.sessions, session_slot, packet_id, INFLIGHT_PUB)
-                        else { continue; };
+                        if !sessions::is_active(&s.sessions, session_slot) {
+                            continue;
+                        }
+                        let Some(ii) = sessions::inflight_find(
+                            &s.sessions,
+                            session_slot,
+                            packet_id,
+                            INFLIGHT_PUB,
+                        ) else {
+                            continue;
+                        };
                         let correlation_id = sessions::inflight_view(&s.sessions, session_slot, ii)
-                            .map(|v| v.correlation_id).unwrap_or(0);
-                        if correlation_id == 0 { continue; }
+                            .map(|v| v.correlation_id)
+                            .unwrap_or(0);
+                        if correlation_id == 0 {
+                            continue;
+                        }
                         let phase = sessions::inflight_view(&s.sessions, session_slot, ii)
-                            .map(|v| v.phase).unwrap_or(0);
+                            .map(|v| v.phase)
+                            .unwrap_or(0);
 
                         // For PUBREL-phase inflight, the stash has already
                         // been released after the PUBLISH commit. Resend a
@@ -4519,24 +5494,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             let qbody_len = 2 + 8;
                             let prop_total = wire::QPROP_TAGGED_HDR_LEN + qbody_len;
                             if prop_total <= s.out_buf.len() {
-                                s.out_buf[0..8]
-                                    .copy_from_slice(&correlation_id.to_le_bytes());
+                                s.out_buf[0..8].copy_from_slice(&correlation_id.to_le_bytes());
                                 wire::encode_qprop_header(
                                     &mut s.out_buf[8..8 + wire::QPROP_HEADER_LEN],
-                                    wire::QOP_PUBREL, tenant, session_slot as u32,
+                                    wire::QOP_PUBREL,
+                                    tenant,
+                                    session_slot as u32,
                                 );
                                 let off = wire::QPROP_TAGGED_HDR_LEN;
-                                s.out_buf[off..off + 2]
-                                    .copy_from_slice(&packet_id.to_be_bytes());
+                                s.out_buf[off..off + 2].copy_from_slice(&packet_id.to_be_bytes());
                                 s.out_buf[off + 2..off + 10]
                                     .copy_from_slice(&stream_hash.to_le_bytes());
                                 if try_emit(
-                                    sys, s.out_proposals_tagged,
+                                    sys,
+                                    s.out_proposals_tagged,
                                     wire::MSG_CLIENT_PROPOSAL,
                                     &s.out_buf[..prop_total],
                                 ) {
-                                    s.proposals_emitted =
-                                        s.proposals_emitted.wrapping_add(1);
+                                    s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
                                 }
                             }
                             continue;
@@ -4546,29 +5521,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // envelope from the still-active stash. The stash
                         // holds the QOP_PUBLISH op-body verbatim; wrap it in
                         // a fresh tagged envelope and repropose.
-                        let Some(stash_idx) = correlate::stash_by_correlation(&s.correlate, correlation_id) else { continue; };
+                        let Some(stash_idx) =
+                            correlate::stash_by_correlation(&s.correlate, correlation_id)
+                        else {
+                            continue;
+                        };
                         let env_len = correlate::stash_env_len(&s.correlate, stash_idx);
-                        if env_len < 18 || env_len > MAX_STASH_ENV { continue; }
+                        if !(18..=MAX_STASH_ENV).contains(&env_len) {
+                            continue;
+                        }
                         // TENANCY GAP: keyed by correlation, not session.
                         // See docs/architecture/multi_tenancy.md.
                         let tenant: TenantId = 0;
                         let prop_total = wire::QPROP_TAGGED_HDR_LEN + env_len;
-                        if prop_total > s.out_buf.len() { continue; }
+                        if prop_total > s.out_buf.len() {
+                            continue;
+                        }
                         s.out_buf[0..8].copy_from_slice(&correlation_id.to_le_bytes());
                         wire::encode_qprop_header(
                             &mut s.out_buf[8..8 + wire::QPROP_HEADER_LEN],
-                            wire::QOP_PUBLISH, tenant, session_slot as u32,
+                            wire::QOP_PUBLISH,
+                            tenant,
+                            session_slot as u32,
                         );
                         let off = wire::QPROP_TAGGED_HDR_LEN;
                         let stash_ptr = correlate::stash_env(&s.correlate, stash_idx).as_ptr();
                         let out_ptr = s.out_buf.as_mut_ptr();
-                        core::ptr::copy_nonoverlapping(
-                            stash_ptr,
-                            out_ptr.add(off),
-                            env_len,
-                        );
+                        core::ptr::copy_nonoverlapping(stash_ptr, out_ptr.add(off), env_len);
                         if try_emit(
-                            sys, s.out_proposals_tagged,
+                            sys,
+                            s.out_proposals_tagged,
                             wire::MSG_CLIENT_PROPOSAL,
                             &s.out_buf[..prop_total],
                         ) {
@@ -4595,7 +5577,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // deferred by out_forward backpressure (see PROPOSAL_ASSIGNED
         // handler).
         for i in 0..PENDING_ACK_SLOTS {
-            let Some(payload) = correlate::ack_get(&s.correlate, i) else { continue; };
+            let Some(payload) = correlate::ack_get(&s.correlate, i) else {
+                continue;
+            };
             if try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &payload) {
                 correlate::ack_free(&mut s.correlate, i);
             }
@@ -4614,7 +5598,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 5a-pre: drain deferred deliveries.
         for s_idx in 0..PENDING_DLV_SLOTS {
-            if !correlate::dlv_is_active(&s.correlate, s_idx) { continue; }
+            if !correlate::dlv_is_active(&s.correlate, s_idx) {
+                continue;
+            }
             let env_len = correlate::dlv_len(&s.correlate, s_idx);
             let mut buf = [0u8; MAX_PENDING_DLV];
             if !correlate::dlv_copy_out(&s.correlate, s_idx, &mut buf) {
@@ -4635,10 +5621,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_deliver >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_deliver, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_deliver, &mut s.in_buf) };
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_deliver, &mut s.in_buf)
+                };
                 dev_log(sys, 3, b"[sess] deliver rx".as_ptr(), 17);
-                if mt != wire::MSG_TOPIC_DELIVER || plen < 14 { continue; }
+                if mt != wire::MSG_TOPIC_DELIVER || plen < 14 {
+                    continue;
+                }
                 let plen = plen as usize;
 
                 let mut buf = [0u8; MAX_PENDING_DLV];
@@ -4656,8 +5649,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     DeliverResult::Backpressured => {
                         // Park rather than drop.
                         if !correlate::dlv_park(&mut s.correlate, &buf[..plen]) {
-                            s.deliveries_throttled =
-                                s.deliveries_throttled.wrapping_add(1);
+                            s.deliveries_throttled = s.deliveries_throttled.wrapping_add(1);
                         }
                     }
                 }
@@ -4672,8 +5664,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_messaging >= 0 {
             for _ in 0..16 {
                 let poll = (sys.channel_poll)(s.in_messaging, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (mt, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_messaging, &mut s.in_buf) };
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (mt, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_messaging, &mut s.in_buf)
+                };
                 let plen = plen as usize;
                 match mt {
                     wire::MSG_DEDUP_RESULT if plen >= 21 => {
@@ -4684,7 +5681,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             correlate::stash_set_dedup_state(
                                 &mut s.correlate,
                                 stash_idx,
-                                if duplicate != 0 { STASH_DEDUP_DUPLICATE } else { STASH_DEDUP_OK },
+                                if duplicate != 0 {
+                                    STASH_DEDUP_DUPLICATE
+                                } else {
+                                    STASH_DEDUP_OK
+                                },
                             );
                             if correlate::stash_is_durable(&s.correlate, stash_idx) {
                                 finalise_stash(s, sys, stash_idx);
@@ -4702,17 +5703,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         //   [session_slot:u32][sub_qos:u8][_pad:u8;3]
                         //   [tenant:u32][topic_len:u16 LE][topic][payload]
                         let tenant = u32::from_le_bytes([
-                            s.in_buf[0], s.in_buf[1], s.in_buf[2], s.in_buf[3],
+                            s.in_buf[0],
+                            s.in_buf[1],
+                            s.in_buf[2],
+                            s.in_buf[3],
                         ]);
                         // bytes 4..12 are topic_hash — not needed for delivery.
                         let session_slot = u32::from_le_bytes([
-                            s.in_buf[12], s.in_buf[13], s.in_buf[14], s.in_buf[15],
+                            s.in_buf[12],
+                            s.in_buf[13],
+                            s.in_buf[14],
+                            s.in_buf[15],
                         ]);
                         let sub_qos = s.in_buf[16];
-                        let topic_len = u16::from_le_bytes([
-                            s.in_buf[17], s.in_buf[18],
-                        ]) as usize;
-                        if 19 + topic_len + 4 > plen { continue; }
+                        let topic_len = u16::from_le_bytes([s.in_buf[17], s.in_buf[18]]) as usize;
+                        if 19 + topic_len + 4 > plen {
+                            continue;
+                        }
                         let payload_len_off = 19 + topic_len;
                         let payload_len = u32::from_le_bytes([
                             s.in_buf[payload_len_off],
@@ -4721,7 +5728,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.in_buf[payload_len_off + 3],
                         ]) as usize;
                         let payload_off = payload_len_off + 4;
-                        if payload_off + payload_len > plen { continue; }
+                        if payload_off + payload_len > plen {
+                            continue;
+                        }
 
                         // MSG_TOPIC_DELIVER includes a (possibly empty)
                         // user_props block between topic and payload —
@@ -4730,7 +5739,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // store them today), so the block is a single
                         // zero-count byte.
                         let dlv_total = 14 + topic_len + 1 + payload_len;
-                        if dlv_total > MAX_PENDING_DLV { continue; }
+                        if dlv_total > MAX_PENDING_DLV {
+                            continue;
+                        }
                         let mut buf = [0u8; MAX_PENDING_DLV];
                         buf[0..4].copy_from_slice(&session_slot.to_le_bytes());
                         buf[4] = sub_qos;
@@ -4752,8 +5763,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             DeliverResult::Delivered | DeliverResult::Dropped => {}
                             DeliverResult::Backpressured => {
                                 if !correlate::dlv_park(&mut s.correlate, &buf[..dlv_total]) {
-                                    s.deliveries_throttled =
-                                        s.deliveries_throttled.wrapping_add(1);
+                                    s.deliveries_throttled = s.deliveries_throttled.wrapping_add(1);
                                 }
                             }
                         }
@@ -4764,12 +5774,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // path so it picks up flow control + the codec
                         // emit path. Failure parks back in pending_dlv as
                         // with any other backpressured delivery.
-                        let env_len = u16::from_le_bytes([
-                            s.in_buf[4], s.in_buf[5],
-                        ]) as usize;
-                        if 6 + env_len > plen { continue; }
+                        let env_len = u16::from_le_bytes([s.in_buf[4], s.in_buf[5]]) as usize;
+                        if 6 + env_len > plen {
+                            continue;
+                        }
                         let mut buf = [0u8; MAX_PENDING_DLV];
-                        if env_len > buf.len() { continue; }
+                        if env_len > buf.len() {
+                            continue;
+                        }
                         // Copy the embedded envelope (no session/env_len
                         // prefix) into a local buffer so try_deliver can
                         // operate without holding a borrow on s.in_buf.
@@ -4780,8 +5792,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             DeliverResult::Delivered | DeliverResult::Dropped => {}
                             DeliverResult::Backpressured => {
                                 if !correlate::dlv_park(&mut s.correlate, &buf[..env_len]) {
-                                    s.deliveries_throttled =
-                                        s.deliveries_throttled.wrapping_add(1);
+                                    s.deliveries_throttled = s.deliveries_throttled.wrapping_add(1);
                                 }
                             }
                         }
@@ -4794,8 +5805,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_cp >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_cp, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (_, _) = { worked += 1; wire::channel_read_msg(sys, s.in_cp, &mut s.in_buf) };
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (_, _) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_cp, &mut s.in_buf)
+                };
             }
         }
 
@@ -4834,9 +5850,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let mut rest = [0u8; 9];
                         rest[0..8].copy_from_slice(&e.delivery_tag.to_le_bytes());
                         rest[8] = 1;
-                        emit_amqp_response(
-                            sys, s.out_codec, e.conn_id, 1, e.channel, &rest,
-                        );
+                        emit_amqp_response(sys, s.out_codec, e.conn_id, 1, e.channel, &rest);
                     }
                     // Free the slot. The NEXT allocation bumps its epoch,
                     // so any durability round-trip still outstanding for
@@ -4854,12 +5868,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // MQTT, Kafka, AND AMQP at once.
             correlate::expire(&mut s.correlate, now, CORRELATION_TIMEOUT_MS);
             for i in 0..MAX_SESSIONS {
-                if !sessions::is_active(&s.sessions, i) { continue; }
-                let kalive = sessions::view(&s.sessions, i).map(|v| v.keep_alive_ms).unwrap_or(0);
-                if kalive == 0 { continue; }
+                if !sessions::is_active(&s.sessions, i) {
+                    continue;
+                }
+                let kalive = sessions::view(&s.sessions, i)
+                    .map(|v| v.keep_alive_ms)
+                    .unwrap_or(0);
+                if kalive == 0 {
+                    continue;
+                }
                 let deadline = (kalive as u64).saturating_mul(3) / 2;
-                let age = now.wrapping_sub(sessions::view(&s.sessions, i).map(|v| v.last_activity_ms).unwrap_or(0));
-                if age <= deadline { continue; }
+                let age = now.wrapping_sub(
+                    sessions::view(&s.sessions, i)
+                        .map(|v| v.last_activity_ms)
+                        .unwrap_or(0),
+                );
+                if age <= deadline {
+                    continue;
+                }
 
                 s.disconnects = s.disconnects.wrapping_add(1);
                 let tenant = sessions::tenant(&s.sessions, i);
@@ -4873,14 +5899,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if prop_total <= s.out_buf.len() {
                     wire::encode_qprop_header(
                         &mut s.out_buf[0..wire::QPROP_HEADER_LEN],
-                        wire::QOP_DISCONNECT, tenant, session_slot,
+                        wire::QOP_DISCONNECT,
+                        tenant,
+                        session_slot,
                     );
                     let off = wire::QPROP_UNTAGGED_HDR_LEN;
                     s.out_buf[off] = wire::QDISC_REASON_KEEPALIVE;
-                    s.out_buf[off + 1..off + 9]
-                        .copy_from_slice(&stream_hash.to_le_bytes());
+                    s.out_buf[off + 1..off + 9].copy_from_slice(&stream_hash.to_le_bytes());
                     if try_emit(
-                        sys, s.out_proposals,
+                        sys,
+                        s.out_proposals,
                         wire::MSG_CLIENT_PROPOSAL,
                         &s.out_buf[..prop_total],
                     ) {
@@ -4908,16 +5936,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // sentinel (also covers MQTT 3.1.1 clean_session=0 thanks
             // to the propose-side normalisation).
             for i in 0..MAX_SESSIONS {
-                if !sessions::is_persisted(&s.sessions, i) { continue; }
-                if sessions::is_active(&s.sessions, i) { continue; }
+                if !sessions::is_persisted(&s.sessions, i) {
+                    continue;
+                }
+                if sessions::is_active(&s.sessions, i) {
+                    continue;
+                }
                 let expiry_s = sessions::session_expiry_s(&s.sessions, i);
-                if expiry_s == 0 || expiry_s == u32::MAX { continue; }
+                if expiry_s == 0 || expiry_s == u32::MAX {
+                    continue;
+                }
                 let deadline_ms = (expiry_s as u64).saturating_mul(1000);
-                let elapsed = now.wrapping_sub(sessions::view(&s.sessions, i).map(|v| v.disconnected_at_ms).unwrap_or(0));
-                if elapsed < deadline_ms { continue; }
+                let elapsed = now.wrapping_sub(
+                    sessions::view(&s.sessions, i)
+                        .map(|v| v.disconnected_at_ms)
+                        .unwrap_or(0),
+                );
+                if elapsed < deadline_ms {
+                    continue;
+                }
 
                 // Purge.
-        sessions::clear_flow(&mut s.sessions, i);
+                sessions::clear_flow(&mut s.sessions, i);
                 let drop_body = (i as u32).to_le_bytes();
                 try_emit(sys, s.out_topic, wire::MSG_SESSION_DROP, &drop_body);
                 sessions::clear(&mut s.sessions, i);
@@ -4936,8 +5976,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // sweep runs the fire when the deadline elapses.
             for i in 0..MAX_SESSIONS {
                 let fire_at = sessions::will_deadline(&s.sessions, i);
-                if fire_at == 0 { continue; }
-                if now < fire_at { continue; }
+                if fire_at == 0 {
+                    continue;
+                }
+                if now < fire_at {
+                    continue;
+                }
                 if sessions::will_present(&s.sessions, i) {
                     let t = sessions::tenant(&s.sessions, i);
                     fire_will(s, sys, t, i);
@@ -4965,6 +6009,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             try_emit(sys, s.out_metrics, wire::MSG_METRICS, &m);
         }
 
-        if worked > 0 { STEP_BURST } else { 0 }
+        if worked > 0 {
+            STEP_BURST
+        } else {
+            0
+        }
     }
 }

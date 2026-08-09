@@ -42,8 +42,10 @@ struct ConnState {
 impl ConnState {
     const fn zero() -> Self {
         Self {
-            conn_id: 0, protocol: PROTO_UNKNOWN,
-            sniff_buf_len: 0, sniff_buf: [0; 16],
+            conn_id: 0,
+            protocol: PROTO_UNKNOWN,
+            sniff_buf_len: 0,
+            sniff_buf: [0; 16],
             active: 0,
         }
     }
@@ -73,8 +75,10 @@ impl Router {
         for i in 0..MAX_CONNS {
             if self.conns[i].active == 0 {
                 self.conns[i] = ConnState {
-                    conn_id, protocol: PROTO_UNKNOWN,
-                    sniff_buf_len: 0, sniff_buf: [0; 16],
+                    conn_id,
+                    protocol: PROTO_UNKNOWN,
+                    sniff_buf_len: 0,
+                    sniff_buf: [0; 16],
                     active: 1,
                 };
                 return i;
@@ -82,8 +86,10 @@ impl Router {
         }
         // Table full: reuse slot 0 (LRU would be nicer)
         self.conns[0] = ConnState {
-            conn_id, protocol: PROTO_UNKNOWN,
-            sniff_buf_len: 0, sniff_buf: [0; 16],
+            conn_id,
+            protocol: PROTO_UNKNOWN,
+            sniff_buf_len: 0,
+            sniff_buf: [0; 16],
             active: 1,
         };
         0
@@ -94,25 +100,19 @@ impl Router {
 /// `bytes_consumed` indicates how much of the sniff buffer was used for
 /// classification (meaningful only for UNSUPPORTED / deep checks).
 fn classify(bytes: &[u8]) -> u8 {
-    if bytes.is_empty() { return PROTO_UNKNOWN; }
+    if bytes.is_empty() {
+        return PROTO_UNKNOWN;
+    }
 
     // MQTT: CONNECT packet type nibble = 0x1, flags nibble = 0x0.
     // Full signature check: [0x10][varint len][0x00 0x04 'M' 'Q' 'T' 'T'] for MQTT 3.1.1/5
     // or [0x10][varint len][0x00 0x06 'M' 'Q' 'I' 's' 'd' 'p'] for MQTT 3.1.
     // Accept bare 0x10 + varint if protocol name not yet arrived (partial packet).
     if bytes[0] == 0x10 {
-        if bytes.len() >= 8
-            && bytes[2] == 0x00
-            && bytes[3] == 0x04
-            && &bytes[4..8] == b"MQTT"
-        {
+        if bytes.len() >= 8 && bytes[2] == 0x00 && bytes[3] == 0x04 && &bytes[4..8] == b"MQTT" {
             return PROTO_MQTT;
         }
-        if bytes.len() >= 10
-            && bytes[2] == 0x00
-            && bytes[3] == 0x06
-            && &bytes[4..10] == b"MQIsdp"
-        {
+        if bytes.len() >= 10 && bytes[2] == 0x00 && bytes[3] == 0x06 && &bytes[4..10] == b"MQIsdp" {
             return PROTO_MQTT;
         }
         // First byte matches CONNECT; let it through as MQTT even if we
@@ -150,7 +150,7 @@ fn classify(bytes: &[u8]) -> u8 {
     if bytes.len() >= 6 {
         let size = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let api_key = i16::from_be_bytes([bytes[4], bytes[5]]);
-        if size > 0 && size < 16 * 1024 * 1024 && api_key >= 0 && api_key <= 67 {
+        if size > 0 && size < 16 * 1024 * 1024 && (0..=67).contains(&api_key) {
             return PROTO_KAFKA;
         }
     }
@@ -158,16 +158,15 @@ fn classify(bytes: &[u8]) -> u8 {
     PROTO_UNKNOWN
 }
 
-
-
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
 pub fn init(s: &mut Router) {
     s.default_protocol = PROTO_MQTT;
-    s.strict_classification = 0;  // if 1, unclassified → dropped; else → default
-    for i in 0..MAX_CONNS { s.conns[i] = ConnState::zero(); }
+    s.strict_classification = 0; // if 1, unclassified → dropped; else → default
+    for i in 0..MAX_CONNS {
+        s.conns[i] = ConnState::zero();
+    }
 }
-
 
 /// Classify one client record and name the protocol that owns it.
 ///
@@ -200,9 +199,7 @@ pub fn route(s: &mut Router, conn_id: u8, mtype: u8, data: &[u8]) -> u8 {
     if s.conns[idx].protocol == PROTO_UNKNOWN {
         let sniff_have = s.conns[idx].sniff_buf_len as usize;
         let take = core::cmp::min(16 - sniff_have, data.len());
-        for i in 0..take {
-            s.conns[idx].sniff_buf[sniff_have + i] = data[i];
-        }
+        s.conns[idx].sniff_buf[sniff_have..(take + sniff_have)].copy_from_slice(&data[..take]);
         s.conns[idx].sniff_buf_len = (sniff_have + take) as u8;
 
         let sniff_len = s.conns[idx].sniff_buf_len as usize;

@@ -33,7 +33,11 @@
 
 use core::ffi::c_void;
 
-#[allow(unused_imports, dead_code, reason = "shared SDK surface across modules")]
+#[allow(
+    unused_imports,
+    dead_code,
+    reason = "shared SDK surface across modules"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -160,22 +164,41 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<KafkaState>() as u32
 }
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: drain any work queued for this instance without
+/// admitting new input.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_drain"]
-pub extern "C" fn module_drain(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
     unsafe {
         (*(state as *mut KafkaState)).draining = 1;
         0
     }
 }
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -245,13 +268,26 @@ unsafe fn send_request(s: &mut KafkaState, api_key: i16, body: &[u8], now: u64) 
 }
 
 /// Stage a framed request at an explicit API version (Produce needs v7).
-unsafe fn send_request_v(s: &mut KafkaState, api_key: i16, api_version: i16, body: &[u8], now: u64) {
+unsafe fn send_request_v(
+    s: &mut KafkaState,
+    api_key: i16,
+    api_version: i16,
+    body: &[u8],
+    now: u64,
+) {
     s.corr = s.corr.wrapping_add(1);
     let cid_len = s.client_id_len as usize;
     let mut cid = [0u8; NAME_BUF];
     cid[..cid_len].copy_from_slice(&s.client_id[..cid_len]);
     let mut out = [0u8; REQ_BUF];
-    match kafka_request(api_key, api_version, s.corr, &cid[..cid_len], body, &mut out) {
+    match kafka_request(
+        api_key,
+        api_version,
+        s.corr,
+        &cid[..cid_len],
+        body,
+        &mut out,
+    ) {
         Some(n) => {
             s.req[..n].copy_from_slice(&out[..n]);
             s.req_len = n as u16;
@@ -305,7 +341,15 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
             payload[5] = port[0];
             payload[6] = port[1];
             payload[7] = s.tag;
-            net_write_frame(sys, s.net_out, NET_CMD_CONNECT, payload.as_ptr(), 8, s.nbuf.as_mut_ptr(), NET_BUF);
+            net_write_frame(
+                sys,
+                s.net_out,
+                NET_CMD_CONNECT,
+                payload.as_ptr(),
+                8,
+                s.nbuf.as_mut_ptr(),
+                NET_BUF,
+            );
             s.started_ms = now;
         }
         KAct::SendApiVersions => send_request(s, api::API_VERSIONS, &[], now),
@@ -350,7 +394,15 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
         KAct::Fail => {
             if s.conn_id != 0 {
                 let close = [s.conn_id];
-                net_write_frame(sys, s.net_out, NET_CMD_CLOSE, close.as_ptr(), 1, s.nbuf.as_mut_ptr(), NET_BUF);
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CLOSE,
+                    close.as_ptr(),
+                    1,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
             }
             s.conn_id = 0;
             s.acc_len = 0;
@@ -434,9 +486,14 @@ unsafe fn on_response(s: &mut KafkaState, body: &[u8], now: u64) {
     feed(s, sys, ev, now);
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut KafkaState);
         let sys = &*s.syscalls;
@@ -464,7 +521,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     topic[..tl].copy_from_slice(&s.produce_topic[..tl]);
                     let ts = dev_unix_millis(sys) as i64;
                     let mut body = [0u8; REQ_BUF];
-                    if let Some(bn) = kafka_produce_body(&topic[..tl], &msg[..n as usize], ts, &mut body)
+                    if let Some(bn) =
+                        kafka_produce_body(&topic[..tl], &msg[..n as usize], ts, &mut body)
                     {
                         send_request_v(s, api::PRODUCE, 7, &body[..bn], now);
                         s.phase = KPhase::ProduceWait;
@@ -510,8 +568,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.acc_len += take as u32;
                             // One size-prefixed response at a time.
                             if let Some(total) = kafka_response_len(&s.acc[..s.acc_len as usize]) {
-                                if let Some((_corr, boff)) =
-                                    kafka_response_header(&s.acc[..total])
+                                if let Some((_corr, boff)) = kafka_response_header(&s.acc[..total])
                                 {
                                     let mut body = [0u8; 1024];
                                     let blen = (total - boff).min(body.len());
@@ -538,7 +595,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let ours = (s.phase == KPhase::Connecting
                             && plen >= 3
                             && *payload.add(2) == s.tag)
-                            || (s.phase != KPhase::Disconnected && plen >= 1 && *payload == s.conn_id);
+                            || (s.phase != KPhase::Disconnected
+                                && plen >= 1
+                                && *payload == s.conn_id);
                         if ours {
                             feed(s, sys, KEv::NetError, now);
                         }
@@ -557,7 +616,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     break;
                 }
                 let remaining = (s.req_len - s.req_sent) as usize;
-                let chunk = if remaining < max_chunk { remaining } else { max_chunk };
+                let chunk = if remaining < max_chunk {
+                    remaining
+                } else {
+                    max_chunk
+                };
                 let total_payload = chunk + 1;
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
@@ -589,7 +652,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.draining == 1 && matches!(s.phase, KPhase::Disconnected | KPhase::Stable) {
             if s.conn_id != 0 {
                 let close = [s.conn_id];
-                net_write_frame(sys, s.net_out, NET_CMD_CLOSE, close.as_ptr(), 1, s.nbuf.as_mut_ptr(), NET_BUF);
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CLOSE,
+                    close.as_ptr(),
+                    1,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
                 s.conn_id = 0;
             }
             return 1;

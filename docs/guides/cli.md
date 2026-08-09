@@ -15,9 +15,9 @@ There is no `quantum` binary. Quantum ships a graph of `.fmod` modules that the 
 ### Validate a graph YAML
 
 ```sh
-fluxor validate configs/quantum-*.yaml
-# or, for a single config:
-fluxor validate configs/quantum-linux.yaml
+fluxor build --check configs/quantum-linux.yaml
+# one config per invocation — loop to check them all:
+for c in configs/quantum-*.yaml; do fluxor build --check "$c" || break; done
 ```
 
 Checks the YAML against current module manifests: domain assignments, port connectivity, arena sizing, scheduler tier compatibility, and `MAX_MODULES` / `MAX_GRAPH_EDGES` budgets.
@@ -121,5 +121,5 @@ script invoked directly:
 | `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
 | `tests/integration/module_graph_mqtt.sh` | Multi-protocol E2E against a running graph |
 | `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
-| `fluxor validate configs/quantum-*.yaml` | Validate every shipped graph YAML |
+| `fluxor build --check configs/<one>.yaml` | Validate a graph YAML (one per invocation) |
 | `make help` | Print the lifecycle plus the CLI commands/scripts that are deliberately not targets |

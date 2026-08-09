@@ -7,8 +7,8 @@
 //!
 //! Latency is **coordinated-omission corrected**: each PUBLISH's latency is
 //! measured from its *intended* send time, so a stalled broker shows a growing
-//! tail instead of pacing our loop. The RFC §2.4 headroom verdict flags a run
-//! the generator (not the DUT) bottlenecked as `HARNESS_BOUND`.
+//! tail instead of pacing our loop. The headroom verdict flags a run the
+//! generator (not the DUT) bottlenecked as `HARNESS_BOUND`.
 //!
 //! QoS 1: send PUBLISH, await matching PUBACK, record the round-trip.
 //! QoS 0: fire-and-forget; latency is the send-call cost only, and

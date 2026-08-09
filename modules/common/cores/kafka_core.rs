@@ -137,7 +137,7 @@ pub fn kafka_produce_body(
     kput_i32(out, &mut p, 0)?; // partition index
     let rec_len_pos = p;
     kput_i32(out, &mut p, 0)?; // records length (patched)
-    // ---- RecordBatch v2 ----
+                               // ---- RecordBatch v2 ----
     kput_i64(out, &mut p, 0)?; // baseOffset
     let batch_len_pos = p;
     kput_i32(out, &mut p, 0)?; // batchLength (patched)
@@ -154,8 +154,8 @@ pub fn kafka_produce_body(
     kput_i16(out, &mut p, -1)?; // producerEpoch
     kput_i32(out, &mut p, -1)?; // baseSequence
     kput_i32(out, &mut p, 1)?; // record count
-    // One record, varint-length-prefixed. Build it into scratch to know its
-    // length before writing the prefix.
+                               // One record, varint-length-prefixed. Build it into scratch to know its
+                               // length before writing the prefix.
     let mut rec = [0u8; 512];
     let mut rp = 0usize;
     kput_i8(&mut rec, &mut rp, 0)?; // attributes
@@ -379,7 +379,12 @@ pub fn kafka_parse_find_coordinator(body: &[u8]) -> Option<Coordinator<'_>> {
     let node_id = r.i32()?;
     let host = r.string()?;
     let port = r.i32()?;
-    Some(Coordinator { error_code, node_id, host, port })
+    Some(Coordinator {
+        error_code,
+        node_id,
+        host,
+        port,
+    })
 }
 
 /// JoinGroup v0 response: `error_code, generation_id, group_protocol, leader_id,

@@ -66,23 +66,23 @@ modules:
   - name: admission
   - name: operations
 
-  # ── Quantum: protocol routing & codecs (4 modules) ──────
+  # ── Quantum: protocol routing & codecs (1 module) ──────
   - name: protocol
 
   # ── Quantum: session core (1 module) ────────────────────
   - name: session_processor
 
-  # ── Quantum: flow/ack (3 modules) ───────────────────────
+  # ── Quantum: flow/ack (1 module) ───────────────────────
   - name: flow
 
-  # ── Quantum: topic & messaging (4 modules) ──────────────
+  # ── Quantum: topic & messaging (2 modules) ──────────────
   - name: topic_engine
   - name: messaging
 
   # ── Quantum: forwarding (1 module) ──────────────────────
   - name: forward_coordinator
 
-  # ── Quantum: control plane + ops (4 modules) ────────────
+  # ── Quantum: control plane + ops (1 module) ────────────
   - name: governance
 
 wiring:
@@ -147,15 +147,11 @@ wiring:
     to: gateway.credit_supply
   - from: admission.credits
     to: session_processor.flow_in
-  - from: admission.envelope
-    to: flow.envelope_in
   - from: consensus.lag_signal
     to: admission.lag
 
   - from: flow.flow_out
     to: session_processor.flow_in
-  - from: flow.status
-    to: gateway.throttle_status
 
   - from: session_processor.forward_out
     to: flow.forward_in

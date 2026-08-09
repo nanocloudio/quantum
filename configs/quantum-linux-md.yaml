@@ -6,7 +6,7 @@
 # Quantum: Pi 5 Kafka produce bench (rig DUT at 192.168.1.9, port 9092).
 #
 # LEAN graph: the produce-path module set from quantum-linux-minimal.yaml
-# (20 modules) mapped onto the Pi 5 4-domain layout. The full 26-module
+# (13 modules) mapped onto the Pi 5 4-domain layout. The full 15-module
 # production graph exceeds the kernel's MAX_GRAPH_EDGES=128 budget once
 # tee/merge expansion runs ("channel limit for tee" at prepare_graph), so
 # a bench derived from it cannot boot; this graph carries every module the
@@ -260,8 +260,6 @@ wiring:
     to: gateway.credit_supply
   - from: admission.credits
     to: session_processor.flow_in
-  - from: admission.envelope
-    to: flow.envelope_in
   - from: consensus.lag_signal
     to: admission.lag
   - from: gateway.rejected

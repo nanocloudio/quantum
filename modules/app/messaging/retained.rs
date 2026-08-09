@@ -215,11 +215,7 @@ pub unsafe fn on_read(r: &mut Retained, sys: &SyscallTable, payload: &[u8]) {
     let mut pattern = [0u8; MAX_RETAINED_TOPIC];
     // SAFETY: `pattern_len <= MAX_RETAINED_TOPIC` and `11 + pattern_len <= plen`.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            payload.as_ptr().add(11),
-            pattern.as_mut_ptr(),
-            pattern_len,
-        );
+        core::ptr::copy_nonoverlapping(payload.as_ptr().add(11), pattern.as_mut_ptr(), pattern_len);
     }
     r.reads = r.reads.wrapping_add(1);
 

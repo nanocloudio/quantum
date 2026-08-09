@@ -11,7 +11,7 @@ Quantum is a multi-protocol message broker (MQTT 3.1/3.1.1/5.0, Kafka, AMQP 0-9-
 - **Exactly-once QoS inside the broker** — Session records, dedupe tables, offline queues, retained payloads, consumer groups, and transaction state are committed through Clustor's WAL → fsync → quorum proof pipeline. PUBACK / PUBREC / PUBREL / PUBCOMP, Kafka `ProduceResponse`, and AMQP `Basic.Ack` are gated on durability proofs, not on local apply.
 - **Multi-tenant isolation** — Each tenant owns a ring of PRGs (Partition Raft Groups); routing is fenced by CP-Raft epochs; per-tenant quotas, ACLs, and certificates live in the CP manifest. `governance`'s tenants component enforces token-bucket quotas with noisy-neighbour disconnect.
 - **Multi-protocol on one substrate** — `protocol` ALPN-demuxes inbound traffic into its per-protocol codecs (mqtt, kafka, amqp), which all funnel into a unified `session_processor` and `topic_engine`. The same Raft pipeline serves all three.
-- **Deterministic backpressure** — `admission` runs a PID loop on replication lag for proposal admission; `flow`'s prefetch component runs per-session consumer credits; `flow`'s backpressure component translates substrate envelopes into protocol-native signals (MQTT `0x97`, Kafka `THROTTLING_QUOTA_EXCEEDED`, AMQP `drain=true`).
+- **Deterministic backpressure** — `admission` runs a PID loop on replication lag for proposal admission; `flow`'s prefetch component runs per-session consumer credits; `flow`'s backpressure component translates gateway rejects and queue depths into protocol-native signals (MQTT `0x97`, Kafka `THROTTLING_QUOTA_EXCEEDED`, AMQP `drain=true`).
 - **Operational determinism** — `operations` exposes `/readyz`, `/why`, `/metrics`, `/raft`, `/admin`. `governance`'s dr component orchestrates checkpoint export and fenced promotion; `governance`'s audit component emits Ed25519-signed compliance events; `governance`'s telemetry component handles high-cardinality per-(tenant, protocol, prg) rollups.
 - **Composable, not monolithic** — Every module has a fixed step function, explicit input/output ports, a bounded state arena, and a manifest declaring its scheduling tier. The graph is a YAML file. Modules can be swapped, the graph can be reshaped per deployment, and the runtime enforces the contract.
 
@@ -44,40 +44,46 @@ graph TD
     subgraph Messaging["Messaging domain (250µs, Core 0/4)"]
         Msg["messaging<br/>dedup · offline · retained"]
     end
-    subgraph Ops["Ops domain (1ms, Core 0)"]
+    subgraph OpsDomain["Ops domain (1ms, Core 0)"]
         CP["control_plane"]
         Gov["governance<br/>tenants · dr · audit · telemetry"]
-        Ops["operations"]
+        Oper["operations"]
     end
 
     IP --> TLS --> Peer
-    Peer -->|client cleartext| Router
-    Peer -->|peer traffic| Cons
-    Router --> MQTT
-    Router --> Kafka
-    Router --> AMQP
-    MQTT --> Session
-    Kafka --> Session
-    AMQP --> Session
-    Session --> Topic
-    Topic --> Fwd
-    Topic --> Session
-    Session --> Dedup
-    Session --> Offline
-    Session --> Retained
-    Session --> Groups
-    Session --> Txn
-    Session --> Cons
-    Cons --> Dur --> Cons --> Session
-    Dur --> Ack
-    Ack --> Session
-    Adm --> Gate
-    Adm --> Session
-    CP --> Tenant
-    CP --> Session
-    CP --> Gate
-    Session --> Metrics --> Ops
-    Audit --> Ops
+    Peer -->|client cleartext| Proto
+    Peer -->|admin / HTTP| Gate
+    Peer <-->|peer traffic| Cons
+
+    Proto -->|proposals| Session
+    Session -->|responses| Proto
+    Proto -->|frames| Peer
+
+    Session -->|topic ops| Topic
+    Topic -->|deliveries| Session
+    Topic -->|cross-PRG| Fwd
+    Fwd --> Cons
+
+    Session <-->|dedup · offline · retained| Msg
+
+    Session -->|proposals| Cons
+    Cons -->|assigned · committed| Session
+    Cons <--> Dur
+
+    Dur -->|quorum proofs| Flow
+    Flow -->|ACKs| Session
+    Gate -->|rejects| Flow
+    Adm -->|credits| Gate
+    Adm -->|credits| Session
+    Cons -->|lag| Adm
+
+    Gate --> Cons
+    CP --> Adm
+    CP -->|capabilities| Session
+    CP -->|tenant records| Gov
+    Msg & Flow & Topic & Fwd --> Gov
+    Gov -->|rollups| Oper
+    Cons & Dur & Adm --> Oper
 ```
 
 - **Edge** terminates TLS 1.3 (mTLS, SNI/ALPN) and ALPN-demuxes into protocol codecs.
@@ -93,10 +99,12 @@ The full module reference and message graph live in [docs/architecture.md](docs/
 ## Setup
 
 Quantum depends on `fluxor` and `clustor`. Both resolve through
-the local Fluxor registry under `~/.fluxor/registry/` (the contract
-is captured in `standards/dependencies.md`); for active cross-repo
-iteration, list the colocated checkouts in
-`~/.fluxor/workspace.toml` and the CLI reads them in place.
+the local Fluxor OCI store (`$FLUXOR_STORE`, default
+`~/.local/share/fluxor/store`; the contract is captured in
+`standards/dependencies.md`), pinned by digest in `fluxor.lock`;
+for active cross-repo iteration, list the colocated checkouts in
+`~/.fluxor/workspace.toml` and sync tracks each member's most
+recently published artefacts.
 
 First-time setup on a fresh machine:
 
@@ -107,17 +115,14 @@ git clone git@github.com:nanocloudio/fluxor.git
 git clone git@github.com:nanocloudio/clustor.git
 git clone git@github.com:nanocloudio/quantum.git
 
-# 2. Install the fluxor CLI from fluxor's tools crate (once per machine).
-cd quantum && cargo install --locked --path ../fluxor/tools
+# 2. Bootstrap the fluxor CLI (once per machine; thereafter the
+#    installed launcher resolves the CLI from the store).
+make -C fluxor install
 
-# 3. Bootstrap the local registry + cargo registry alias.
-fluxor registry init
-fluxor registry setup-cargo
-
-# 4. Either: publish from fluxor + clustor into the registry
-#    (canonical mode) — see fluxor/docs/guides/publishing.md and
-#    clustor/docs/consuming_fluxor.md — or set up live workspace
-#    mode for cross-repo iteration:
+# 3. Publish from fluxor + clustor into the store — see
+#    fluxor/docs/guides/publishing.md and
+#    clustor/docs/consuming_fluxor.md — and, for cross-repo
+#    iteration, set up live workspace mode:
 cat > ~/.fluxor/workspace.toml <<'EOF'
 [workspace]
 members = [
@@ -134,21 +139,23 @@ active mode and the resolved member set.
 ### Resolving and syncing dependencies
 
 ```sh
-fluxor update             # resolve fluxor.lock against the registry
-fluxor sync               # install lockfile-resolved fmods + runtime into target/
+fluxor sync               # resolve fluxor.lock against the store; materialise fmods + runtime into target/
+fluxor update             # (when adopting new upstream publishes) advance pins to the latest digests
 ```
 
-`fluxor.lock` is committed. In live workspace mode the lockfile is
-bypassed for workspace members and live sources are read directly;
-an advisory prints once per `sync` invocation.
+`fluxor.lock` is committed and always the resolver. In live
+workspace mode members resolve `:latest` (the most recently
+published digest) and sync writes the resolved digests through the
+lockfile; a per-artifact advisory prints when a member's inputs
+changed since its last publish.
 
 ### Bumping the fluxor or clustor pin
 
 ```sh
-# After upstream publishes a new version:
+# After upstream publishes:
 cd ../fluxor && make publish
 cd ../quantum
-fluxor update             # rewrites fluxor.lock with the new versions
+fluxor update             # advances fluxor.lock to the latest published digests
 fluxor sync               # re-materialises lockfile-resolved artefacts
 git add fluxor.lock
 git commit -m "Bump fluxor / clustor"
@@ -174,7 +181,7 @@ else is the `fluxor` CLI or a script invoked directly:
 | `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
 | `tests/integration/module_graph_mqtt.sh` | E2E: spin up the graph, run MQTT/AMQP/Kafka smoke against it |
 | `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
-| `fluxor validate configs/quantum-*.yaml` | Validate the shipped graph YAMLs against current module manifests |
+| `fluxor build --check configs/quantum-*.yaml` | Validate the shipped graph YAMLs against current module manifests |
 ---
 
 ## Run
@@ -183,11 +190,17 @@ Graph configs live under [configs/](configs/):
 
 | Config | Topology |
 |---|---|
-| `quantum-linux-minimal.yaml` | 24-module MQTT-only single-node graph (smallest smoke target) |
-| `quantum-linux.yaml` | Full 14-module single-node graph |
-| `quantum-linux-2p.yaml` | 2-partition WAL test config |
-| `quantum-node0.yaml` / `node1.yaml` / `node2.yaml` | 3-node Raft cluster |
-| `quantum-pi5.yaml` | Production Pi 5 4-core layout |
+| `quantum-linux.yaml` | Full single-node graph (14 modules) |
+| `quantum-linux-minimal.yaml` | MQTT-only single-node graph (13) — smallest smoke target |
+| `quantum-linux-quic.yaml` | MQTT-over-QUIC ingress (15) |
+| `quantum-linux-2p.yaml` | 2-partition WAL test config (15) |
+| `quantum-linux-md.yaml` | Multi-domain Kafka bench, local proxy for the Pi 5 layout (13) |
+| `quantum-node0.yaml` / `node1.yaml` / `node2.yaml` | 3-node Raft cluster (12 each) |
+| `quantum-pi5.yaml` | Production Pi 5 4-core layout (15) |
+| `quantum-pi5-bench.yaml` | Pi 5 graph plus the in-graph load injector (16) |
+| `quantum-pi5-kafka-bench.yaml` | Kafka produce bench for the rig (13) |
+| `quantum-pi5-smoke.yaml` | Empty graph — exercises bring-up through kernel handoff |
+| `consensus-bench-pi5.yaml` | Consensus/WAL bench, no protocol surface (8) |
 
 Launch the runtime:
 
@@ -269,10 +282,10 @@ See [docs/guides/deployment.md](docs/guides/deployment.md) for the full deployme
 
 | Path | Type | Description |
 |---|---|---|
-| `modules/` | Module source | Quantum `.fmod` source trees (one per module, each with `mod.rs` + optional `manifest.toml`) plus `modules/common/` (helpers shared across modules and exposed as the `quantum-common` crate via the `crates/quantum-common/common` symlink) |
-| `crates/quantum-common/` | Cargo crate | Host-consumable façade over `modules/common/*.rs`, depended on by downstream consumers of quantum |
+| `modules/` | Module source | Quantum `.fmod` source trees (one per module, each with `mod.rs` + optional `manifest.toml`) plus `modules/common/` — helpers `#[path]`-mounted by the modules that use them, and published to the store as the `quantum/src/quantum-common` source artefact |
+| `tools/` | Host crates + scripts | Standalone Cargo crates (`telemetry_guard`, `wire_lint`, `quantum-bench`) and the CI gate scripts |
 | `configs/` | Graph YAML | Fluxor graph definitions for every supported deployment topology |
-| `fluxor.toml` + `fluxor.lock` | Project manifest + lockfile | `[project]`, `[dependencies] fluxor / clustor`, `[ci]`, `[required]`. Lockfile records the SHA-256-hashed resolution against the local registry. |
+| `fluxor.toml` + `fluxor.lock` | Project manifest + lockfile | `[project]`, `[dependencies] fluxor / clustor`, `[ci]`, `[required]`. Lockfile records the digest-pinned resolution against the local store. |
 | `.fluxor-rig.toml` | Rig build recipe | `[build.pi5]` orchestrates firmware + module + kernel-image construction for `fluxor rig test` against `tests/hardware/` scenarios |
 | `ops/scripts/` | Operator tooling | `install.sh` (systemd install), `chaos.sh` (fault injection) |
 | `ops/systemd/` | Unit files | `quantum.service` |
@@ -284,7 +297,7 @@ See [docs/guides/deployment.md](docs/guides/deployment.md) for the full deployme
 | `certs/` | Dev TLS | Development certificate material (do not ship in production) |
 | `data/` | Runtime | WAL segments, snapshots, CP storage (gitignored except for seed material) |
 
-A Cargo workspace at the repo root carries the lint baseline and the host-side toolchain crates under `tools/` plus `crates/quantum-common/`. Each module under `modules/app/` builds as a standalone PIC object and is packed into a `.fmod` artefact by `fluxor modules build`.
+There is no root Cargo workspace and no `crates/`. Each module under `modules/app/` builds as a standalone PIC object packed into a `.fmod` by `fluxor modules build`, and shared source in `modules/common/` is `#[path]`-mounted rather than linked. The host crates under `tools/` stand alone, each carrying the `standards/lints.md` baseline inline; `tools/host_crates_e2e.sh` builds, lints, and tests them as a `fluxor ci` gate.
 
 ---
 

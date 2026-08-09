@@ -11,8 +11,7 @@
 //! table owns the inbound record budget.
 
 use super::abi::SyscallTable;
-use super::{dev_log, dev_millis, dev_channel_port, wire};
-
+use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 // MQTT packet types
 const PKT_CONNECT: u8 = 1;
@@ -52,7 +51,12 @@ struct TopicAlias {
 
 impl TopicAlias {
     const fn zero() -> Self {
-        Self { alias: 0, topic_len: 0, topic: [0; ALIAS_TOPIC_MAX], active: 0 }
+        Self {
+            alias: 0,
+            topic_len: 0,
+            topic: [0; ALIAS_TOPIC_MAX],
+            active: 0,
+        }
     }
 }
 
@@ -92,7 +96,8 @@ struct ConnCtx {
 impl ConnCtx {
     const fn zero() -> Self {
         Self {
-            conn_id: 0, protocol_version: 0,
+            conn_id: 0,
+            protocol_version: 0,
             aliases: [TopicAlias::zero(); MAX_TOPIC_ALIASES_PER_CONN],
             sub_aliases: [TopicAlias::zero(); MAX_TOPIC_ALIASES_PER_CONN],
             sub_topic_alias_max: 0,
@@ -136,7 +141,11 @@ impl Mqtt {
         }
         for i in 0..MAX_CONNS {
             if self.conns[i].active == 0 {
-                self.conns[i] = ConnCtx { conn_id, active: 1, ..ConnCtx::zero() };
+                self.conns[i] = ConnCtx {
+                    conn_id,
+                    active: 1,
+                    ..ConnCtx::zero()
+                };
                 return i;
             }
         }
@@ -154,7 +163,9 @@ fn decode_varint(buf: &[u8]) -> (u32, usize) {
         let b = buf[i];
         val = val.wrapping_add((b & 0x7F) as u32 * mult);
         i += 1;
-        if (b & 0x80) == 0 { return (val, i); }
+        if (b & 0x80) == 0 {
+            return (val, i);
+        }
         mult = mult.wrapping_mul(128);
     }
     (0, 0)
@@ -163,21 +174,31 @@ fn decode_varint(buf: &[u8]) -> (u32, usize) {
 fn encode_varint(buf: &mut [u8], mut val: u32) -> usize {
     let mut i = 0;
     loop {
-        if i >= buf.len() { return 0; }
+        if i >= buf.len() {
+            return 0;
+        }
         let mut b = (val & 0x7F) as u8;
         val >>= 7;
-        if val > 0 { b |= 0x80; }
+        if val > 0 {
+            b |= 0x80;
+        }
         buf[i] = b;
         i += 1;
-        if val == 0 { break; }
+        if val == 0 {
+            break;
+        }
     }
     i
 }
 
 fn read_utf8_string(buf: &[u8]) -> (&[u8], usize) {
-    if buf.len() < 2 { return (&[], 0); }
+    if buf.len() < 2 {
+        return (&[], 0);
+    }
     let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-    if buf.len() < 2 + len { return (&[], 0); }
+    if buf.len() < 2 + len {
+        return (&[], 0);
+    }
     (&buf[2..2 + len], 2 + len)
 }
 
@@ -210,28 +231,44 @@ struct Mqtt5Props {
 fn parse_properties(buf: &[u8]) -> (Mqtt5Props, usize) {
     let mut props = Mqtt5Props::default();
     let (prop_len, vlen) = decode_varint(buf);
-    if vlen == 0 { return (props, 0); }
+    if vlen == 0 {
+        return (props, 0);
+    }
     let end = vlen + prop_len as usize;
-    if end > buf.len() { return (props, 0); }
+    if end > buf.len() {
+        return (props, 0);
+    }
     let mut pos = vlen;
     while pos < end {
         let id = buf[pos];
         pos += 1;
         match id {
-            PROP_MESSAGE_EXPIRY_INTERVAL | PROP_SESSION_EXPIRY_INTERVAL | PROP_WILL_DELAY_INTERVAL => {
-                if pos + 4 > end { break; }
-                let v = u32::from_be_bytes([buf[pos], buf[pos+1], buf[pos+2], buf[pos+3]]);
+            PROP_MESSAGE_EXPIRY_INTERVAL
+            | PROP_SESSION_EXPIRY_INTERVAL
+            | PROP_WILL_DELAY_INTERVAL => {
+                if pos + 4 > end {
+                    break;
+                }
+                let v = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]);
                 match id {
                     PROP_MESSAGE_EXPIRY_INTERVAL => props.message_expiry_s = v,
                     PROP_SESSION_EXPIRY_INTERVAL => props.session_expiry_s = v,
-                    PROP_WILL_DELAY_INTERVAL => { props.will_delay_s = v; props.has_will_delay = true; }
+                    PROP_WILL_DELAY_INTERVAL => {
+                        props.will_delay_s = v;
+                        props.has_will_delay = true;
+                    }
                     _ => {}
                 }
                 pos += 4;
             }
-            PROP_RECEIVE_MAXIMUM | PROP_TOPIC_ALIAS_MAXIMUM | PROP_TOPIC_ALIAS | PROP_SERVER_KEEP_ALIVE => {
-                if pos + 2 > end { break; }
-                let v = u16::from_be_bytes([buf[pos], buf[pos+1]]);
+            PROP_RECEIVE_MAXIMUM
+            | PROP_TOPIC_ALIAS_MAXIMUM
+            | PROP_TOPIC_ALIAS
+            | PROP_SERVER_KEEP_ALIVE => {
+                if pos + 2 > end {
+                    break;
+                }
+                let v = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
                 match id {
                     PROP_RECEIVE_MAXIMUM => props.receive_maximum = v,
                     PROP_TOPIC_ALIAS => props.topic_alias = v,
@@ -242,24 +279,34 @@ fn parse_properties(buf: &[u8]) -> (Mqtt5Props, usize) {
             }
             PROP_SUBSCRIPTION_IDENTIFIER => {
                 let (v, vlen) = decode_varint(&buf[pos..end]);
-                if vlen == 0 { break; }
+                if vlen == 0 {
+                    break;
+                }
                 props.subscription_id = v;
                 pos += vlen;
             }
             PROP_USER_PROPERTY => {
-                if pos + 2 > end { break; }
-                let klen = u16::from_be_bytes([buf[pos], buf[pos+1]]) as usize;
-                if pos + 2 + klen > end { break; }
+                if pos + 2 > end {
+                    break;
+                }
+                let klen = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+                if pos + 2 + klen > end {
+                    break;
+                }
                 let vpos = pos + 2 + klen;
-                if vpos + 2 > end { break; }
-                let vlen = u16::from_be_bytes([buf[vpos], buf[vpos+1]]) as usize;
-                if vpos + 2 + vlen > end { break; }
+                if vpos + 2 > end {
+                    break;
+                }
+                let vlen = u16::from_be_bytes([buf[vpos], buf[vpos + 1]]) as usize;
+                if vpos + 2 + vlen > end {
+                    break;
+                }
                 pos = vpos + 2 + vlen;
             }
             _ => {
                 // Unknown property: for safety, skip to end of block
                 if pos + 2 <= end {
-                    let slen = u16::from_be_bytes([buf[pos], buf[pos+1]]) as usize;
+                    let slen = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
                     if pos + 2 + slen <= end {
                         pos += 2 + slen;
                         continue;
@@ -292,11 +339,19 @@ const MAX_USER_PROP_VAL_LEN: usize = 128;
 /// key/value pairs) are dropped silently — admission control rather
 /// than apply-side state corruption.
 fn extract_user_props_block(buf: &[u8], out: &mut [u8]) -> usize {
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     let (prop_len, vlen) = decode_varint(buf);
-    if vlen == 0 { out[0] = 0; return 1; }
+    if vlen == 0 {
+        out[0] = 0;
+        return 1;
+    }
     let end = vlen + prop_len as usize;
-    if end > buf.len() { out[0] = 0; return 1; }
+    if end > buf.len() {
+        out[0] = 0;
+        return 1;
+    }
 
     let count_off = 0usize;
     let mut write_off = 1usize;
@@ -307,31 +362,60 @@ fn extract_user_props_block(buf: &[u8], out: &mut [u8]) -> usize {
         let id = buf[pos];
         pos += 1;
         match id {
-            PROP_MESSAGE_EXPIRY_INTERVAL | PROP_SESSION_EXPIRY_INTERVAL
-            | PROP_WILL_DELAY_INTERVAL => { if pos + 4 > end { break; } pos += 4; }
-            PROP_RECEIVE_MAXIMUM | PROP_TOPIC_ALIAS_MAXIMUM
-            | PROP_TOPIC_ALIAS | PROP_SERVER_KEEP_ALIVE => { if pos + 2 > end { break; } pos += 2; }
+            PROP_MESSAGE_EXPIRY_INTERVAL
+            | PROP_SESSION_EXPIRY_INTERVAL
+            | PROP_WILL_DELAY_INTERVAL => {
+                if pos + 4 > end {
+                    break;
+                }
+                pos += 4;
+            }
+            PROP_RECEIVE_MAXIMUM
+            | PROP_TOPIC_ALIAS_MAXIMUM
+            | PROP_TOPIC_ALIAS
+            | PROP_SERVER_KEEP_ALIVE => {
+                if pos + 2 > end {
+                    break;
+                }
+                pos += 2;
+            }
             PROP_SUBSCRIPTION_IDENTIFIER => {
                 let (_, sv) = decode_varint(&buf[pos..end]);
-                if sv == 0 { break; }
+                if sv == 0 {
+                    break;
+                }
                 pos += sv;
             }
             PROP_USER_PROPERTY => {
-                if pos + 2 > end { break; }
-                let klen = u16::from_be_bytes([buf[pos], buf[pos+1]]) as usize;
-                if pos + 2 + klen > end { break; }
+                if pos + 2 > end {
+                    break;
+                }
+                let klen = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+                if pos + 2 + klen > end {
+                    break;
+                }
                 let kstart = pos + 2;
                 let vpos = kstart + klen;
-                if vpos + 2 > end { break; }
-                let vlenv = u16::from_be_bytes([buf[vpos], buf[vpos+1]]) as usize;
-                if vpos + 2 + vlenv > end { break; }
+                if vpos + 2 > end {
+                    break;
+                }
+                let vlenv = u16::from_be_bytes([buf[vpos], buf[vpos + 1]]) as usize;
+                if vpos + 2 + vlenv > end {
+                    break;
+                }
                 let vstart = vpos + 2;
                 pos = vstart + vlenv;
                 // Admission control: drop overcap entries.
-                if (written_count as usize) >= MAX_USER_PROPS_COUNT { continue; }
-                if klen > MAX_USER_PROP_KEY_LEN || vlenv > MAX_USER_PROP_VAL_LEN { continue; }
+                if (written_count as usize) >= MAX_USER_PROPS_COUNT {
+                    continue;
+                }
+                if klen > MAX_USER_PROP_KEY_LEN || vlenv > MAX_USER_PROP_VAL_LEN {
+                    continue;
+                }
                 let need = 2 + klen + 2 + vlenv;
-                if write_off + need > out.len() { break; }
+                if write_off + need > out.len() {
+                    break;
+                }
                 out[write_off..write_off + 2].copy_from_slice(&(klen as u16).to_be_bytes());
                 out[write_off + 2..write_off + 2 + klen]
                     .copy_from_slice(&buf[kstart..kstart + klen]);
@@ -344,8 +428,11 @@ fn extract_user_props_block(buf: &[u8], out: &mut [u8]) -> usize {
             }
             _ => {
                 if pos + 2 <= end {
-                    let slen = u16::from_be_bytes([buf[pos], buf[pos+1]]) as usize;
-                    if pos + 2 + slen <= end { pos += 2 + slen; continue; }
+                    let slen = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+                    if pos + 2 + slen <= end {
+                        pos += 2 + slen;
+                        continue;
+                    }
                 }
                 break;
             }
@@ -386,12 +473,22 @@ struct WillInfo<'a> {
 fn parse_connect(body: &[u8]) -> ConnectInfo<'_> {
     let mut info = ConnectInfo::default();
     let (_name, pn_len) = read_utf8_string(body);
-    if pn_len == 0 { return info; }
+    if pn_len == 0 {
+        return info;
+    }
     let mut cur = pn_len;
-    if cur + 4 > body.len() { return info; }
-    info.protocol_version = body[cur]; cur += 1;
-    let flags = body[cur]; cur += 1;
-    info.clean_start = if (flags & CONNECT_FLAG_CLEAN_START) != 0 { 1 } else { 0 };
+    if cur + 4 > body.len() {
+        return info;
+    }
+    info.protocol_version = body[cur];
+    cur += 1;
+    let flags = body[cur];
+    cur += 1;
+    info.clean_start = if (flags & CONNECT_FLAG_CLEAN_START) != 0 {
+        1
+    } else {
+        0
+    };
     info.keep_alive = u16::from_be_bytes([body[cur], body[cur + 1]]);
     cur += 2;
 
@@ -406,9 +503,11 @@ fn parse_connect(body: &[u8]) -> ConnectInfo<'_> {
     cur += cid_len;
 
     if (flags & CONNECT_FLAG_WILL_FLAG) != 0 && cur < body.len() {
-        let mut will = WillInfo::default();
-        will.qos = (flags & CONNECT_FLAG_WILL_QOS_MASK) >> 3;
-        will.retain = if (flags & CONNECT_FLAG_WILL_RETAIN) != 0 { 1 } else { 0 };
+        let mut will = WillInfo {
+            qos: (flags & CONNECT_FLAG_WILL_QOS_MASK) >> 3,
+            retain: u8::from((flags & CONNECT_FLAG_WILL_RETAIN) != 0),
+            ..Default::default()
+        };
         if info.protocol_version >= 5 {
             let (wprops, wlen) = parse_properties(&body[cur..]);
             will.delay_s = wprops.will_delay_s;
@@ -439,12 +538,12 @@ fn parse_connect(body: &[u8]) -> ConnectInfo<'_> {
 
 // ── Module entrypoints ────────────────────────────────────────────────────
 
-
-
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
 pub fn init(s: &mut Mqtt) {
-    for i in 0..MAX_CONNS { s.conns[i] = ConnCtx::zero(); }
+    for i in 0..MAX_CONNS {
+        s.conns[i] = ConnCtx::zero();
+    }
 }
 
 /// Emit a `[conn_id][bytes]` payload as a `MSG_CLIENT_FRAME`
@@ -455,10 +554,14 @@ pub fn init(s: &mut Mqtt) {
 /// pattern as the `codec_in` fan-in fix already shipped.
 /// # Safety
 unsafe fn write_conn_frame(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     const FRAME_BUF: usize = MAX_PACKET + 1;
     let total = 1 + bytes.len();
-    if total > FRAME_BUF { return false; }
+    if total > FRAME_BUF {
+        return false;
+    }
     let mut out = [0u8; FRAME_BUF];
     out[0] = conn_id;
     out[1..total].copy_from_slice(bytes);
@@ -468,12 +571,18 @@ unsafe fn write_conn_frame(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[
 
 /// Encode an MQTT packet: [type|flags] [varint len] [body].
 fn encode_mqtt_frame(out: &mut [u8], pkt_type: u8, flags: u8, body: &[u8]) -> usize {
-    if out.is_empty() { return 0; }
+    if out.is_empty() {
+        return 0;
+    }
     let mut vbuf = [0u8; 4];
     let vlen = encode_varint(&mut vbuf, body.len() as u32);
-    if vlen == 0 { return 0; }
+    if vlen == 0 {
+        return 0;
+    }
     let total = 1 + vlen + body.len();
-    if total > out.len() { return 0; }
+    if total > out.len() {
+        return 0;
+    }
     out[0] = (pkt_type << 4) | (flags & 0x0F);
     out[1..1 + vlen].copy_from_slice(&vbuf[..vlen]);
     out[1 + vlen..total].copy_from_slice(body);
@@ -488,11 +597,15 @@ fn encode_mqtt_frame(out: &mut [u8], pkt_type: u8, flags: u8, body: &[u8]) -> us
 /// UNSUBACK that the 3.1.1 wire shape doesn't have. Returns the bytes
 /// written to `out`, or 0 on overflow / bad body.
 fn splice_mqtt5_ack(out: &mut [u8], pkt_type: u8, body: &[u8]) -> usize {
-    if body.len() < 2 { return 0; }
+    if body.len() < 2 {
+        return 0;
+    }
     // Common splice for CONNACK / SUBACK: insert `0x00` (props varint)
     // at body offset 2, shift the rest right.
     let total = body.len() + 1;
-    if total + 1 > out.len() { return 0; }
+    if total + 1 > out.len() {
+        return 0;
+    }
     out[0..2].copy_from_slice(&body[..2]);
     out[2] = 0;
     if body.len() > 2 {
@@ -517,17 +630,25 @@ fn splice_mqtt5_ack(out: &mut [u8], pkt_type: u8, body: &[u8]) -> usize {
 /// `None` on malformed bytes; the encoder treats malformed as
 /// "no user_props".
 fn user_props_block_len(buf: &[u8]) -> Option<usize> {
-    if buf.is_empty() { return None; }
+    if buf.is_empty() {
+        return None;
+    }
     let count = buf[0] as usize;
     let mut off = 1usize;
     for _ in 0..count {
-        if off + 2 > buf.len() { return None; }
+        if off + 2 > buf.len() {
+            return None;
+        }
         let klen = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
         off += 2 + klen;
-        if off + 2 > buf.len() { return None; }
+        if off + 2 > buf.len() {
+            return None;
+        }
         let vlen = u16::from_be_bytes([buf[off], buf[off + 1]]) as usize;
         off += 2 + vlen;
-        if off > buf.len() { return None; }
+        if off > buf.len() {
+            return None;
+        }
     }
     Some(off)
 }
@@ -549,7 +670,9 @@ fn user_props_block_len(buf: &[u8]) -> Option<usize> {
 /// MQTT 5 PUBLISH (empty property block). Returns 0 on overflow / bad
 /// body — caller then skips the emit.
 fn encode_mqtt5_publish_with_alias(
-    out: &mut [u8], flags: u8, body: &[u8],
+    out: &mut [u8],
+    flags: u8,
+    body: &[u8],
     sub_aliases: &mut [TopicAlias],
     sub_topic_alias_max: u16,
     sub_alias_next: &mut u16,
@@ -557,22 +680,32 @@ fn encode_mqtt5_publish_with_alias(
     // Parse out the body components. session_processor's emit_codec_
     // response payload shape (PUBLISH only) is:
     //   `[topic_len BE][topic][packet_id BE if qos>0][user_props_block][payload]`
-    if body.len() < 2 { return 0; }
+    if body.len() < 2 {
+        return 0;
+    }
     let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
-    if 2 + topic_len > body.len() { return 0; }
+    if 2 + topic_len > body.len() {
+        return 0;
+    }
     let topic_off = 2;
     let mut cur = topic_off + topic_len;
     let qos = (flags >> 1) & 0x03;
     let packet_id_bytes: &[u8] = if qos > 0 {
-        if cur + 2 > body.len() { return 0; }
+        if cur + 2 > body.len() {
+            return 0;
+        }
         let s = &body[cur..cur + 2];
         cur += 2;
         s
-    } else { &[] };
+    } else {
+        &[]
+    };
     let up_off = cur;
     let up_len = user_props_block_len(&body[up_off..]).unwrap_or(0);
     let payload_off = up_off + up_len;
-    if payload_off > body.len() { return 0; }
+    if payload_off > body.len() {
+        return 0;
+    }
     let payload_len = body.len() - payload_off;
     let up_count = if up_len > 0 { body[up_off] as usize } else { 0 };
 
@@ -585,7 +718,7 @@ fn encode_mqtt5_publish_with_alias(
         for a in sub_aliases.iter() {
             if a.active == 1
                 && a.topic_len as usize == topic_len
-                && &a.topic[..topic_len] == &body[topic_off..topic_off + topic_len]
+                && a.topic[..topic_len] == body[topic_off..topic_off + topic_len]
             {
                 found = Some(a.alias);
                 break;
@@ -595,9 +728,7 @@ fn encode_mqtt5_publish_with_alias(
             Some(id) => (id, false),
             None => {
                 // Allocate a new alias if we can.
-                if *sub_alias_next < sub_topic_alias_max
-                    && topic_len <= ALIAS_TOPIC_MAX
-                {
+                if *sub_alias_next < sub_topic_alias_max && topic_len <= ALIAS_TOPIC_MAX {
                     let id = *sub_alias_next + 1; // alias ids start at 1
                     let mut placed = false;
                     for a in sub_aliases.iter_mut() {
@@ -634,7 +765,9 @@ fn encode_mqtt5_publish_with_alias(
         // up_len includes the 1-byte count; properties bytes = up_len - 1.
         // Plus 1 extra id byte (0x26) per pair.
         (up_len - 1) + up_count
-    } else { 0 };
+    } else {
+        0
+    };
 
     // Properties block: optional TopicAlias property (id=0x23, u16 BE)
     // + zero or more UserProperty entries (id=0x26).
@@ -642,7 +775,9 @@ fn encode_mqtt5_publish_with_alias(
     let props_len = alias_bytes_total + user_prop_bytes_total;
     let mut props_vbuf = [0u8; 4];
     let props_vlen = encode_varint(&mut props_vbuf, props_len as u32);
-    if props_vlen == 0 { return 0; }
+    if props_vlen == 0 {
+        return 0;
+    }
 
     let emit_topic_len = if send_full_topic { topic_len } else { 0 };
     let body_total = 2                  // topic_len BE
@@ -654,14 +789,21 @@ fn encode_mqtt5_publish_with_alias(
 
     let mut fb_vbuf = [0u8; 4];
     let fb_vlen = encode_varint(&mut fb_vbuf, body_total as u32);
-    if fb_vlen == 0 { return 0; }
+    if fb_vlen == 0 {
+        return 0;
+    }
     let total = 1 + fb_vlen + body_total;
-    if total > out.len() { return 0; }
+    if total > out.len() {
+        return 0;
+    }
 
     let mut p = 0usize;
-    out[p] = (PKT_PUBLISH << 4) | (flags & 0x0F); p += 1;
-    out[p..p + fb_vlen].copy_from_slice(&fb_vbuf[..fb_vlen]); p += fb_vlen;
-    out[p..p + 2].copy_from_slice(&(emit_topic_len as u16).to_be_bytes()); p += 2;
+    out[p] = (PKT_PUBLISH << 4) | (flags & 0x0F);
+    p += 1;
+    out[p..p + fb_vlen].copy_from_slice(&fb_vbuf[..fb_vlen]);
+    p += fb_vlen;
+    out[p..p + 2].copy_from_slice(&(emit_topic_len as u16).to_be_bytes());
+    p += 2;
     if send_full_topic && topic_len > 0 {
         out[p..p + topic_len].copy_from_slice(&body[topic_off..topic_off + topic_len]);
         p += topic_len;
@@ -689,9 +831,9 @@ fn encode_mqtt5_publish_with_alias(
             let vlen_off = up_cur + 2 + klen;
             let vlen = u16::from_be_bytes([body[vlen_off], body[vlen_off + 1]]) as usize;
             let pair_total = 2 + klen + 2 + vlen;
-            out[p] = 0x26; p += 1;
-            out[p..p + pair_total]
-                .copy_from_slice(&body[up_cur..up_cur + pair_total]);
+            out[p] = 0x26;
+            p += 1;
+            out[p..p + pair_total].copy_from_slice(&body[up_cur..up_cur + pair_total]);
             p += pair_total;
             up_cur += pair_total;
         }
@@ -711,23 +853,35 @@ fn encode_mqtt5_publish_with_alias(
 /// using a caller-provided scratch buffer. Returns 0 on overflow / bad
 /// body.
 fn strip_user_props_for_v311(out: &mut [u8], flags: u8, body: &[u8]) -> usize {
-    if body.len() < 2 { return 0; }
+    if body.len() < 2 {
+        return 0;
+    }
     let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
-    if 2 + topic_len > body.len() { return 0; }
+    if 2 + topic_len > body.len() {
+        return 0;
+    }
     let mut cur = 2 + topic_len;
     let qos = (flags >> 1) & 0x03;
     let packet_id_bytes: &[u8] = if qos > 0 {
-        if cur + 2 > body.len() { return 0; }
+        if cur + 2 > body.len() {
+            return 0;
+        }
         let s = &body[cur..cur + 2];
         cur += 2;
         s
-    } else { &[] };
+    } else {
+        &[]
+    };
     let up_len = user_props_block_len(&body[cur..]).unwrap_or(0);
     let payload_off = cur + up_len;
-    if payload_off > body.len() { return 0; }
+    if payload_off > body.len() {
+        return 0;
+    }
     let payload_len = body.len() - payload_off;
     let total = 2 + topic_len + packet_id_bytes.len() + payload_len;
-    if total > out.len() { return 0; }
+    if total > out.len() {
+        return 0;
+    }
     out[0..2 + topic_len].copy_from_slice(&body[0..2 + topic_len]);
     let mut p = 2 + topic_len;
     if !packet_id_bytes.is_empty() {
@@ -761,7 +915,6 @@ fn strip_user_props_for_v311(out: &mut [u8], flags: u8, body: &[u8]) -> usize {
 pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u8]) {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-
         // the router component frames each client record as a MSG_CLIENT_FRAME
         // envelope so records from different conn_ids don't coalesce on the
         // byte FIFO. Read one envelope per iteration; payload is `[conn_id]
@@ -769,9 +922,13 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
         // Stage the record into the conn reassembly path exactly as the
         // channel read did: `in_buf` holds `[conn_id][tcp chunk]`.
         let n = payload.len() as i32;
-        if n as usize > s.in_buf.len() { return; }
+        if n as usize > s.in_buf.len() {
+            return;
+        }
         s.in_buf[..payload.len()].copy_from_slice(payload);
-        if n < 1 { return; }
+        if n < 1 {
+            return;
+        }
 
         let conn_id = s.in_buf[0];
 
@@ -788,10 +945,14 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
             }
             return;
         }
-        if n < 2 { return; }
+        if n < 2 {
+            return;
+        }
 
         let chunk_len = (n as usize) - 1;
-        if chunk_len == 0 { return; }
+        if chunk_len == 0 {
+            return;
+        }
         let ci = s.find_or_create_conn(conn_id);
 
         // Append this chunk to the conn's reassembly buffer; bail if it
@@ -816,10 +977,11 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
         // `pkt_bytes` unchanged.
         loop {
             let avail = s.conns[ci].reass_len as usize;
-            if avail < 2 { break; }
+            if avail < 2 {
+                break;
+            }
             let probe_end = (1 + 4).min(avail);
-            let (rem_len_probe, vlen_probe) =
-                decode_varint(&s.conns[ci].reass_buf[1..probe_end]);
+            let (rem_len_probe, vlen_probe) = decode_varint(&s.conns[ci].reass_buf[1..probe_end]);
             if vlen_probe == 0 {
                 // Either malformed (varint > 4 bytes) or incomplete.
                 if avail >= 5 {
@@ -834,7 +996,9 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
                 s.conns[ci].reass_len = 0;
                 break;
             }
-            if pkt_size > avail { break; }
+            if pkt_size > avail {
+                break;
+            }
 
             // Stage one full packet at in_buf[1..1+pkt_size] with
             // conn_id at in_buf[0].
@@ -865,8 +1029,12 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
             let pkt_type = s.in_buf[pkt_start] >> 4;
             let flags = s.in_buf[pkt_start] & 0x0F;
             let qos = (flags >> 1) & 0x03;
-            let (rem_len, vlen) = decode_varint(&s.in_buf[pkt_start + 1 .. pkt_start + pkt_bytes.min(5)]);
-            if vlen == 0 { s.parse_errors += 1; continue; }
+            let (rem_len, vlen) =
+                decode_varint(&s.in_buf[pkt_start + 1..pkt_start + pkt_bytes.min(5)]);
+            if vlen == 0 {
+                s.parse_errors += 1;
+                continue;
+            }
             let body_start = pkt_start + 1 + vlen;
             if body_start + rem_len as usize > pkt_start + pkt_bytes {
                 s.parse_errors += 1;
@@ -875,246 +1043,339 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
             let body_ptr = s.in_buf.as_ptr().add(body_start);
             let body = core::slice::from_raw_parts(body_ptr, rem_len as usize);
 
-        let ci = s.find_or_create_conn(conn_id);
+            let ci = s.find_or_create_conn(conn_id);
 
-        // Build session envelope: [proto=MQTT=0][pkt_type][flags][fields][body]
-        let mut pos = 0usize;
-        s.envelope[pos] = 0; pos += 1;   // PROTO_MQTT
-        s.envelope[pos] = pkt_type; pos += 1;
-        s.envelope[pos] = flags; pos += 1;
+            // Build session envelope: [proto=MQTT=0][pkt_type][flags][fields][body]
+            let mut pos = 0usize;
+            s.envelope[pos] = 0;
+            pos += 1; // PROTO_MQTT
+            s.envelope[pos] = pkt_type;
+            pos += 1;
+            s.envelope[pos] = flags;
+            pos += 1;
 
-        let session_msg_type = match pkt_type {
-            PKT_CONNECT => wire::MSG_SESSION_CONNECT,
-            PKT_DISCONNECT => wire::MSG_SESSION_DISCONNECT,
-            _ => wire::MSG_SESSION_PROPOSAL,
-        };
+            let session_msg_type = match pkt_type {
+                PKT_CONNECT => wire::MSG_SESSION_CONNECT,
+                PKT_DISCONNECT => wire::MSG_SESSION_DISCONNECT,
+                _ => wire::MSG_SESSION_PROPOSAL,
+            };
 
-        match pkt_type {
-            PKT_CONNECT => {
-                let info = parse_connect(body);
-                s.conns[ci].protocol_version = info.protocol_version;
-                // Cap the outbound alias table at both the CONNECT-
-                // advertised TopicAliasMaximum and the per-conn
-                // table size — we never issue more aliases than
-                // the slot count regardless of what the client
-                // asked for.
-                s.conns[ci].sub_topic_alias_max = if info.protocol_version >= 5 {
-                    let cap = MAX_TOPIC_ALIASES_PER_CONN as u16;
-                    info.props.topic_alias_maximum.min(cap)
-                } else { 0 };
-                s.conns[ci].sub_alias_next = 0;
-                for a in s.conns[ci].sub_aliases.iter_mut() {
-                    *a = TopicAlias::zero();
-                }
-
-                // Envelope: [proto_ver][clean_start][keep_alive BE][session_expiry LE]
-                //           [recv_max LE][cid_len BE][cid][un_len BE][un]
-                //           [will_flag][if will: qos,retain,delay LE,topic,payload]
-                if pos + 12 > s.envelope.len() { continue; }
-                s.envelope[pos] = info.protocol_version; pos += 1;
-                s.envelope[pos] = info.clean_start; pos += 1;
-                s.envelope[pos..pos + 2].copy_from_slice(&info.keep_alive.to_be_bytes()); pos += 2;
-                s.envelope[pos..pos + 4].copy_from_slice(&info.props.session_expiry_s.to_le_bytes()); pos += 4;
-                s.envelope[pos..pos + 2].copy_from_slice(&info.props.receive_maximum.to_le_bytes()); pos += 2;
-                let cid_len = info.client_id.len().min(256);
-                if pos + 2 + cid_len > s.envelope.len() { continue; }
-                s.envelope[pos..pos + 2].copy_from_slice(&(cid_len as u16).to_be_bytes()); pos += 2;
-                s.envelope[pos..pos + cid_len].copy_from_slice(&info.client_id[..cid_len]);
-                pos += cid_len;
-                let un_len = info.username.len().min(256);
-                if pos + 2 + un_len > s.envelope.len() { continue; }
-                s.envelope[pos..pos + 2].copy_from_slice(&(un_len as u16).to_be_bytes()); pos += 2;
-                s.envelope[pos..pos + un_len].copy_from_slice(&info.username[..un_len]);
-                pos += un_len;
-                match info.will {
-                    Some(w) => {
-                        if pos + 7 > s.envelope.len() { continue; }
-                        s.envelope[pos] = 1; pos += 1;
-                        s.envelope[pos] = w.qos; pos += 1;
-                        s.envelope[pos] = w.retain; pos += 1;
-                        s.envelope[pos..pos + 4].copy_from_slice(&w.delay_s.to_le_bytes()); pos += 4;
-                        let wt_len = w.topic.len().min(512);
-                        if pos + 2 + wt_len > s.envelope.len() { continue; }
-                        s.envelope[pos..pos + 2].copy_from_slice(&(wt_len as u16).to_be_bytes()); pos += 2;
-                        s.envelope[pos..pos + wt_len].copy_from_slice(&w.topic[..wt_len]);
-                        pos += wt_len;
-                        let wp_len = w.payload.len().min(2048);
-                        if pos + 2 + wp_len > s.envelope.len() { continue; }
-                        s.envelope[pos..pos + 2].copy_from_slice(&(wp_len as u16).to_be_bytes()); pos += 2;
-                        s.envelope[pos..pos + wp_len].copy_from_slice(&w.payload[..wp_len]);
-                        pos += wp_len;
-                    }
-                    None => { s.envelope[pos] = 0; pos += 1; }
-                }
-            }
-
-            PKT_PUBLISH => {
-                // [topic_str][if qos>0: packet_id BE][if v5: properties][payload]
-                let (topic_field, tn_len) = read_utf8_string(body);
-                if tn_len == 0 { s.parse_errors += 1; continue; }
-                let mut cur = tn_len;
-                let packet_id = if qos > 0 && cur + 2 <= body.len() {
-                    let pid = u16::from_be_bytes([body[cur], body[cur + 1]]);
-                    cur += 2;
-                    pid
-                } else { 0 };
-
-                let mut mprops = Mqtt5Props::default();
-                let props_start = cur;
-                if s.conns[ci].protocol_version >= 5 && cur <= body.len() {
-                    let (props, plen) = parse_properties(&body[cur..]);
-                    mprops = props;
-                    cur += plen;
-                }
-                // Capture User Property pairs into a self-delimiting
-                // block that gets appended to the codec envelope.
-                // MQTT 3.1.1 has no properties — `up_buf[0] = 0` and
-                // the apply path sees no user_props (item 6's
-                // wire-format contract).
-                let mut up_buf = [0u8; 1
-                    + MAX_USER_PROPS_COUNT * (2 + MAX_USER_PROP_KEY_LEN + 2 + MAX_USER_PROP_VAL_LEN)];
-                let up_len = if s.conns[ci].protocol_version >= 5 && cur <= body.len() {
-                    extract_user_props_block(&body[props_start..cur], &mut up_buf)
-                } else {
-                    up_buf[0] = 0;
-                    1
-                };
-
-                // Topic alias resolution (MQTT 5)
-                let topic_slice: &[u8] = if mprops.topic_alias != 0 {
-                    if !topic_field.is_empty() {
-                        // New binding: cache the mapping
-                        let mut placed = false;
-                        for ai in 0..MAX_TOPIC_ALIASES_PER_CONN {
-                            if s.conns[ci].aliases[ai].active == 0 {
-                                s.conns[ci].aliases[ai].alias = mprops.topic_alias;
-                                let tl = topic_field.len().min(ALIAS_TOPIC_MAX);
-                                s.conns[ci].aliases[ai].topic_len = tl as u16;
-                                s.conns[ci].aliases[ai].topic[..tl].copy_from_slice(&topic_field[..tl]);
-                                s.conns[ci].aliases[ai].active = 1;
-                                placed = true;
-                                break;
-                            } else if s.conns[ci].aliases[ai].alias == mprops.topic_alias {
-                                let tl = topic_field.len().min(ALIAS_TOPIC_MAX);
-                                s.conns[ci].aliases[ai].topic_len = tl as u16;
-                                s.conns[ci].aliases[ai].topic[..tl].copy_from_slice(&topic_field[..tl]);
-                                placed = true;
-                                break;
-                            }
-                        }
-                        let _ = placed;
-                        topic_field
+            match pkt_type {
+                PKT_CONNECT => {
+                    let info = parse_connect(body);
+                    s.conns[ci].protocol_version = info.protocol_version;
+                    // Cap the outbound alias table at both the CONNECT-
+                    // advertised TopicAliasMaximum and the per-conn
+                    // table size — we never issue more aliases than
+                    // the slot count regardless of what the client
+                    // asked for.
+                    s.conns[ci].sub_topic_alias_max = if info.protocol_version >= 5 {
+                        let cap = MAX_TOPIC_ALIASES_PER_CONN as u16;
+                        info.props.topic_alias_maximum.min(cap)
                     } else {
-                        // Lookup
-                        let mut resolved: &[u8] = &[];
-                        for ai in 0..MAX_TOPIC_ALIASES_PER_CONN {
-                            if s.conns[ci].aliases[ai].active == 1
-                                && s.conns[ci].aliases[ai].alias == mprops.topic_alias
-                            {
-                                let tl = s.conns[ci].aliases[ai].topic_len as usize;
-                                let tp = s.conns[ci].aliases[ai].topic.as_ptr();
-                                resolved = core::slice::from_raw_parts(tp, tl);
-                                s.topic_alias_hits = s.topic_alias_hits.wrapping_add(1);
-                                break;
-                            }
-                        }
-                        resolved
+                        0
+                    };
+                    s.conns[ci].sub_alias_next = 0;
+                    for a in s.conns[ci].sub_aliases.iter_mut() {
+                        *a = TopicAlias::zero();
                     }
-                } else {
-                    topic_field
-                };
 
-                // Envelope: [packet_id BE][topic_len BE][topic]
-                //           [user_props_block][payload]
-                // user_props_block is `[count:u8][per prop: key_len BE,
-                // key, val_len BE, val]`; the apply-side parses it
-                // back out before payload starts.
-                if pos + 4 + topic_slice.len() + up_len > s.envelope.len() { continue; }
-                s.envelope[pos..pos + 2].copy_from_slice(&packet_id.to_be_bytes()); pos += 2;
-                let tl = topic_slice.len().min(1024);
-                s.envelope[pos..pos + 2].copy_from_slice(&(tl as u16).to_be_bytes()); pos += 2;
-                s.envelope[pos..pos + tl].copy_from_slice(&topic_slice[..tl]);
-                pos += tl;
-                s.envelope[pos..pos + up_len].copy_from_slice(&up_buf[..up_len]);
-                pos += up_len;
-                let payload = if cur < body.len() { &body[cur..] } else { &[][..] };
-                let pe = pos + payload.len();
-                if pe > s.envelope.len() { continue; }
-                s.envelope[pos..pe].copy_from_slice(payload);
-                pos = pe;
-                if qos == 2 { s.qos2_packets = s.qos2_packets.wrapping_add(1); }
-                if s.conns[ci].protocol_version >= 5 {
-                    s.mqtt5_publishes = s.mqtt5_publishes.wrapping_add(1);
+                    // Envelope: [proto_ver][clean_start][keep_alive BE][session_expiry LE]
+                    //           [recv_max LE][cid_len BE][cid][un_len BE][un]
+                    //           [will_flag][if will: qos,retain,delay LE,topic,payload]
+                    if pos + 12 > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos] = info.protocol_version;
+                    pos += 1;
+                    s.envelope[pos] = info.clean_start;
+                    pos += 1;
+                    s.envelope[pos..pos + 2].copy_from_slice(&info.keep_alive.to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos..pos + 4]
+                        .copy_from_slice(&info.props.session_expiry_s.to_le_bytes());
+                    pos += 4;
+                    s.envelope[pos..pos + 2]
+                        .copy_from_slice(&info.props.receive_maximum.to_le_bytes());
+                    pos += 2;
+                    let cid_len = info.client_id.len().min(256);
+                    if pos + 2 + cid_len > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..pos + 2].copy_from_slice(&(cid_len as u16).to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos..pos + cid_len].copy_from_slice(&info.client_id[..cid_len]);
+                    pos += cid_len;
+                    let un_len = info.username.len().min(256);
+                    if pos + 2 + un_len > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..pos + 2].copy_from_slice(&(un_len as u16).to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos..pos + un_len].copy_from_slice(&info.username[..un_len]);
+                    pos += un_len;
+                    match info.will {
+                        Some(w) => {
+                            if pos + 7 > s.envelope.len() {
+                                continue;
+                            }
+                            s.envelope[pos] = 1;
+                            pos += 1;
+                            s.envelope[pos] = w.qos;
+                            pos += 1;
+                            s.envelope[pos] = w.retain;
+                            pos += 1;
+                            s.envelope[pos..pos + 4].copy_from_slice(&w.delay_s.to_le_bytes());
+                            pos += 4;
+                            let wt_len = w.topic.len().min(512);
+                            if pos + 2 + wt_len > s.envelope.len() {
+                                continue;
+                            }
+                            s.envelope[pos..pos + 2]
+                                .copy_from_slice(&(wt_len as u16).to_be_bytes());
+                            pos += 2;
+                            s.envelope[pos..pos + wt_len].copy_from_slice(&w.topic[..wt_len]);
+                            pos += wt_len;
+                            let wp_len = w.payload.len().min(2048);
+                            if pos + 2 + wp_len > s.envelope.len() {
+                                continue;
+                            }
+                            s.envelope[pos..pos + 2]
+                                .copy_from_slice(&(wp_len as u16).to_be_bytes());
+                            pos += 2;
+                            s.envelope[pos..pos + wp_len].copy_from_slice(&w.payload[..wp_len]);
+                            pos += wp_len;
+                        }
+                        None => {
+                            s.envelope[pos] = 0;
+                            pos += 1;
+                        }
+                    }
+                }
+
+                PKT_PUBLISH => {
+                    // [topic_str][if qos>0: packet_id BE][if v5: properties][payload]
+                    let (topic_field, tn_len) = read_utf8_string(body);
+                    if tn_len == 0 {
+                        s.parse_errors += 1;
+                        continue;
+                    }
+                    let mut cur = tn_len;
+                    let packet_id = if qos > 0 && cur + 2 <= body.len() {
+                        let pid = u16::from_be_bytes([body[cur], body[cur + 1]]);
+                        cur += 2;
+                        pid
+                    } else {
+                        0
+                    };
+
+                    let mut mprops = Mqtt5Props::default();
+                    let props_start = cur;
+                    if s.conns[ci].protocol_version >= 5 && cur <= body.len() {
+                        let (props, plen) = parse_properties(&body[cur..]);
+                        mprops = props;
+                        cur += plen;
+                    }
+                    // Capture User Property pairs into a self-delimiting
+                    // block that gets appended to the codec envelope.
+                    // MQTT 3.1.1 has no properties — `up_buf[0] = 0` and
+                    // the apply path sees no user_props (item 6's
+                    // wire-format contract).
+                    let mut up_buf = [0u8; 1 + MAX_USER_PROPS_COUNT
+                        * (2 + MAX_USER_PROP_KEY_LEN + 2 + MAX_USER_PROP_VAL_LEN)];
+                    let up_len = if s.conns[ci].protocol_version >= 5 && cur <= body.len() {
+                        extract_user_props_block(&body[props_start..cur], &mut up_buf)
+                    } else {
+                        up_buf[0] = 0;
+                        1
+                    };
+
+                    // Topic alias resolution (MQTT 5)
+                    let topic_slice: &[u8] = if mprops.topic_alias != 0 {
+                        if !topic_field.is_empty() {
+                            // New binding: cache the mapping
+                            let mut placed = false;
+                            for ai in 0..MAX_TOPIC_ALIASES_PER_CONN {
+                                if s.conns[ci].aliases[ai].active == 0 {
+                                    s.conns[ci].aliases[ai].alias = mprops.topic_alias;
+                                    let tl = topic_field.len().min(ALIAS_TOPIC_MAX);
+                                    s.conns[ci].aliases[ai].topic_len = tl as u16;
+                                    s.conns[ci].aliases[ai].topic[..tl]
+                                        .copy_from_slice(&topic_field[..tl]);
+                                    s.conns[ci].aliases[ai].active = 1;
+                                    placed = true;
+                                    break;
+                                } else if s.conns[ci].aliases[ai].alias == mprops.topic_alias {
+                                    let tl = topic_field.len().min(ALIAS_TOPIC_MAX);
+                                    s.conns[ci].aliases[ai].topic_len = tl as u16;
+                                    s.conns[ci].aliases[ai].topic[..tl]
+                                        .copy_from_slice(&topic_field[..tl]);
+                                    placed = true;
+                                    break;
+                                }
+                            }
+                            let _ = placed;
+                            topic_field
+                        } else {
+                            // Lookup
+                            let mut resolved: &[u8] = &[];
+                            for ai in 0..MAX_TOPIC_ALIASES_PER_CONN {
+                                if s.conns[ci].aliases[ai].active == 1
+                                    && s.conns[ci].aliases[ai].alias == mprops.topic_alias
+                                {
+                                    let tl = s.conns[ci].aliases[ai].topic_len as usize;
+                                    let tp = s.conns[ci].aliases[ai].topic.as_ptr();
+                                    resolved = core::slice::from_raw_parts(tp, tl);
+                                    s.topic_alias_hits = s.topic_alias_hits.wrapping_add(1);
+                                    break;
+                                }
+                            }
+                            resolved
+                        }
+                    } else {
+                        topic_field
+                    };
+
+                    // Envelope: [packet_id BE][topic_len BE][topic]
+                    //           [user_props_block][payload]
+                    // user_props_block is `[count:u8][per prop: key_len BE,
+                    // key, val_len BE, val]`; the apply-side parses it
+                    // back out before payload starts.
+                    if pos + 4 + topic_slice.len() + up_len > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..pos + 2].copy_from_slice(&packet_id.to_be_bytes());
+                    pos += 2;
+                    let tl = topic_slice.len().min(1024);
+                    s.envelope[pos..pos + 2].copy_from_slice(&(tl as u16).to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos..pos + tl].copy_from_slice(&topic_slice[..tl]);
+                    pos += tl;
+                    s.envelope[pos..pos + up_len].copy_from_slice(&up_buf[..up_len]);
+                    pos += up_len;
+                    let payload = if cur < body.len() {
+                        &body[cur..]
+                    } else {
+                        &[][..]
+                    };
+                    let pe = pos + payload.len();
+                    if pe > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..pe].copy_from_slice(payload);
+                    pos = pe;
+                    if qos == 2 {
+                        s.qos2_packets = s.qos2_packets.wrapping_add(1);
+                    }
+                    if s.conns[ci].protocol_version >= 5 {
+                        s.mqtt5_publishes = s.mqtt5_publishes.wrapping_add(1);
+                    }
+                }
+
+                PKT_SUBSCRIBE => {
+                    if body.len() < 2 {
+                        continue;
+                    }
+                    let packet_id = u16::from_be_bytes([body[0], body[1]]);
+                    let mut cur = 2usize;
+                    if s.conns[ci].protocol_version >= 5 {
+                        let (_, plen) = parse_properties(&body[cur..]);
+                        if plen == 0 {
+                            s.parse_errors += 1;
+                            continue;
+                        }
+                        cur += plen;
+                    }
+                    let (topic, tn_len) = read_utf8_string(&body[cur..]);
+                    if tn_len == 0 {
+                        continue;
+                    }
+                    cur += tn_len;
+                    if cur >= body.len() {
+                        continue;
+                    }
+                    let req_qos = body[cur] & 0x03;
+                    if pos + 5 + topic.len() > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..pos + 2].copy_from_slice(&packet_id.to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos] = req_qos;
+                    pos += 1;
+                    let tl = topic.len().min(1024);
+                    s.envelope[pos..pos + 2].copy_from_slice(&(tl as u16).to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos..pos + tl].copy_from_slice(&topic[..tl]);
+                    pos += tl;
+                }
+
+                PKT_UNSUBSCRIBE => {
+                    if body.len() < 2 {
+                        continue;
+                    }
+                    let packet_id = u16::from_be_bytes([body[0], body[1]]);
+                    let mut cur = 2usize;
+                    if s.conns[ci].protocol_version >= 5 {
+                        let (_, plen) = parse_properties(&body[cur..]);
+                        if plen == 0 {
+                            s.parse_errors += 1;
+                            continue;
+                        }
+                        cur += plen;
+                    }
+                    let (topic, tn_len) = read_utf8_string(&body[cur..]);
+                    if tn_len == 0 {
+                        continue;
+                    }
+                    if pos + 5 + topic.len() > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..pos + 2].copy_from_slice(&packet_id.to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos] = 0;
+                    pos += 1;
+                    let tl = topic.len().min(1024);
+                    s.envelope[pos..pos + 2].copy_from_slice(&(tl as u16).to_be_bytes());
+                    pos += 2;
+                    s.envelope[pos..pos + tl].copy_from_slice(&topic[..tl]);
+                    pos += tl;
+                }
+
+                PKT_PUBACK | PKT_PUBREC | PKT_PUBREL | PKT_PUBCOMP => {
+                    if body.len() < 2 {
+                        continue;
+                    }
+                    s.envelope[pos..pos + 2].copy_from_slice(&body[..2]);
+                    pos += 2;
+                }
+
+                PKT_PINGREQ => {
+                    // Synthesize PINGRESP immediately — no session processor involvement
+                    let ping = [(PKT_PINGRESP << 4), 0u8];
+                    write_conn_frame(sys, s.out_frames, conn_id, &ping);
+                    s.packets_encoded += 1;
+                    continue;
+                }
+
+                _ => {
+                    // Forward raw body for other packet types
+                    let end = pos + body.len();
+                    if end > s.envelope.len() {
+                        continue;
+                    }
+                    s.envelope[pos..end].copy_from_slice(body);
+                    pos = end;
                 }
             }
 
-            PKT_SUBSCRIBE => {
-                if body.len() < 2 { continue; }
-                let packet_id = u16::from_be_bytes([body[0], body[1]]);
-                let mut cur = 2usize;
-                if s.conns[ci].protocol_version >= 5 {
-                    let (_, plen) = parse_properties(&body[cur..]);
-                    if plen == 0 { s.parse_errors += 1; continue; }
-                    cur += plen;
-                }
-                let (topic, tn_len) = read_utf8_string(&body[cur..]);
-                if tn_len == 0 { continue; }
-                cur += tn_len;
-                if cur >= body.len() { continue; }
-                let req_qos = body[cur] & 0x03;
-                if pos + 5 + topic.len() > s.envelope.len() { continue; }
-                s.envelope[pos..pos + 2].copy_from_slice(&packet_id.to_be_bytes()); pos += 2;
-                s.envelope[pos] = req_qos; pos += 1;
-                let tl = topic.len().min(1024);
-                s.envelope[pos..pos + 2].copy_from_slice(&(tl as u16).to_be_bytes()); pos += 2;
-                s.envelope[pos..pos + tl].copy_from_slice(&topic[..tl]);
-                pos += tl;
-            }
-
-            PKT_UNSUBSCRIBE => {
-                if body.len() < 2 { continue; }
-                let packet_id = u16::from_be_bytes([body[0], body[1]]);
-                let mut cur = 2usize;
-                if s.conns[ci].protocol_version >= 5 {
-                    let (_, plen) = parse_properties(&body[cur..]);
-                    if plen == 0 { s.parse_errors += 1; continue; }
-                    cur += plen;
-                }
-                let (topic, tn_len) = read_utf8_string(&body[cur..]);
-                if tn_len == 0 { continue; }
-                if pos + 5 + topic.len() > s.envelope.len() { continue; }
-                s.envelope[pos..pos + 2].copy_from_slice(&packet_id.to_be_bytes()); pos += 2;
-                s.envelope[pos] = 0; pos += 1;
-                let tl = topic.len().min(1024);
-                s.envelope[pos..pos + 2].copy_from_slice(&(tl as u16).to_be_bytes()); pos += 2;
-                s.envelope[pos..pos + tl].copy_from_slice(&topic[..tl]);
-                pos += tl;
-            }
-
-            PKT_PUBACK | PKT_PUBREC | PKT_PUBREL | PKT_PUBCOMP => {
-                if body.len() < 2 { continue; }
-                s.envelope[pos..pos + 2].copy_from_slice(&body[..2]); pos += 2;
-            }
-
-            PKT_PINGREQ => {
-                // Synthesize PINGRESP immediately — no session processor involvement
-                let ping = [(PKT_PINGRESP << 4), 0u8];
-                write_conn_frame(sys, s.out_frames, conn_id, &ping);
-                s.packets_encoded += 1;
-                continue;
-            }
-
-            _ => {
-                // Forward raw body for other packet types
-                let end = pos + body.len();
-                if end > s.envelope.len() { continue; }
-                s.envelope[pos..end].copy_from_slice(body);
-                pos = end;
-            }
-        }
-
-        write_conn_frame_with_mtype(sys, s.out_proposals, conn_id, session_msg_type, &s.envelope[..pos]);
-        s.packets_decoded += 1;
+            write_conn_frame_with_mtype(
+                sys,
+                s.out_proposals,
+                conn_id,
+                session_msg_type,
+                &s.envelope[..pos],
+            );
+            s.packets_decoded += 1;
         } // end inner reassembly-drain loop
     }
 }
@@ -1128,14 +1389,17 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
 pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-
         // Stage the record exactly as the channel read did.
         let plen = payload.len();
-        if plen > s.resp_buf.len() { return; }
+        if plen > s.resp_buf.len() {
+            return;
+        }
         s.resp_buf[..plen].copy_from_slice(payload);
         dev_log(sys, 3, b"[mqtt] resp rx".as_ptr(), 14);
-        if plen < 4 { return; }
-        let n = plen as usize;
+        if plen < 4 {
+            return;
+        }
+        let n = plen;
         let conn_id = s.resp_buf[0];
         let pkt_type = s.resp_buf[2];
         let flags = s.resp_buf[3];
@@ -1154,13 +1418,14 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
         // encoder unchanged.
         let ci_resp = s.find_or_create_conn(conn_id);
         let proto_v = s.conns[ci_resp].protocol_version;
-        let needs_v5_props_splice = proto_v >= 5 && matches!(
-            pkt_type, PKT_CONNACK | PKT_SUBACK | PKT_UNSUBACK,
-        );
+        let needs_v5_props_splice =
+            proto_v >= 5 && matches!(pkt_type, PKT_CONNACK | PKT_SUBACK | PKT_UNSUBACK,);
         let frame_len = if pkt_type == PKT_PUBLISH && proto_v >= 5 {
             let alias_max = s.conns[ci_resp].sub_topic_alias_max;
             encode_mqtt5_publish_with_alias(
-                &mut s.frame, flags, body,
+                &mut s.frame,
+                flags,
+                body,
                 &mut s.conns[ci_resp].sub_aliases,
                 alias_max,
                 &mut s.conns[ci_resp].sub_alias_next,
@@ -1168,22 +1433,30 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
         } else if pkt_type == PKT_PUBLISH {
             let mut stripped = [0u8; RESP_BUF];
             let n = strip_user_props_for_v311(&mut stripped, flags, body);
-            if n == 0 { 0 } else {
+            if n == 0 {
+                0
+            } else {
                 encode_mqtt_frame(&mut s.frame, pkt_type, flags, &stripped[..n])
             }
         } else if needs_v5_props_splice {
             let mut spliced = [0u8; RESP_BUF];
             let n = splice_mqtt5_ack(&mut spliced, pkt_type, body);
-            if n == 0 { 0 } else {
+            if n == 0 {
+                0
+            } else {
                 encode_mqtt_frame(&mut s.frame, pkt_type, flags, &spliced[..n])
             }
         } else {
             encode_mqtt_frame(&mut s.frame, pkt_type, flags, body)
         };
-        if frame_len == 0 { return; }
+        if frame_len == 0 {
+            return;
+        }
 
         let ok = write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..frame_len]);
-        if ok { dev_log(sys, 3, b"[mqtt] resp -> peer".as_ptr(), 19); }
+        if ok {
+            dev_log(sys, 3, b"[mqtt] resp -> peer".as_ptr(), 19);
+        }
         s.packets_encoded += 1;
     }
 }
@@ -1202,13 +1475,20 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
 ///
 /// # Safety
 unsafe fn write_conn_frame_with_mtype(
-    sys: &SyscallTable, chan: i32,
-    conn_id: u8, msg_type: u8, bytes: &[u8],
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: u8,
+    msg_type: u8,
+    bytes: &[u8],
 ) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     const PAYLOAD_BUF: usize = MAX_PACKET + 1;
     let total = 1 + bytes.len();
-    if total > PAYLOAD_BUF { return false; }
+    if total > PAYLOAD_BUF {
+        return false;
+    }
     let mut out = [0u8; PAYLOAD_BUF];
     out[0] = conn_id;
     out[1..total].copy_from_slice(bytes);

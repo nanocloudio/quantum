@@ -22,8 +22,8 @@
 //! entries per call, the bound the standalone path already carried.
 
 use super::{
-    KAFKA_INFLIGHT, KAFKA_MAX_TOPIC, KAFKA_SLOT_BASE, KIN_EPOCH_MASK, KIN_EPOCH_SHIFT,
-    KIN_KI_MASK, KIN_MAX_PARTS, KSTORE_BYTES, KENTRY_HDR, KFLAG_BATCH, KSTORE_PARTS, KWRAP,
+    KAFKA_INFLIGHT, KAFKA_MAX_TOPIC, KAFKA_SLOT_BASE, KENTRY_HDR, KFLAG_BATCH, KIN_EPOCH_MASK,
+    KIN_EPOCH_SHIFT, KIN_KI_MASK, KIN_MAX_PARTS, KSTORE_BYTES, KSTORE_PARTS, KWRAP,
 };
 
 /// Component state. Owned exclusively by this subtree; the dispatch
@@ -90,10 +90,12 @@ pub fn inflight_open(s: &mut Store, ki: usize, o: InflightOpen, topic: &[u8]) {
         e.part_errs[i] = 0;
         e.part_ids[i] = 0;
     }
-    let n = if topic.len() > KAFKA_MAX_TOPIC { KAFKA_MAX_TOPIC } else { topic.len() };
-    for i in 0..n {
-        e.topic[i] = topic[i];
-    }
+    let n = if topic.len() > KAFKA_MAX_TOPIC {
+        KAFKA_MAX_TOPIC
+    } else {
+        topic.len()
+    };
+    e.topic[..n].copy_from_slice(&topic[..n]);
 }
 
 /// Seed one partition slot of a multi-partition produce: its Kafka
@@ -122,7 +124,11 @@ pub fn inflight_free(s: &mut Store, ki: usize) {
 }
 
 pub fn inflight_proto(s: &Store, ki: usize) -> u8 {
-    if ki < KAFKA_INFLIGHT { s.inflight[ki].proto } else { 0 }
+    if ki < KAFKA_INFLIGHT {
+        s.inflight[ki].proto
+    } else {
+        0
+    }
 }
 
 /// Record the assigned WAL index for one partition of a multi-partition
@@ -213,8 +219,8 @@ pub fn next_raw_entry(s: &Store, pi: usize, cursor: u64) -> Option<(u32, u16, u6
         } else {
             pos
         };
-        let consumed = (data_pos + len as u32) - start
-            + if start == 0 && pos != 0 { cap - pos } else { 0 };
+        let consumed =
+            (data_pos + len as u32) - start + if start == 0 && pos != 0 { cap - pos } else { 0 };
         if flags & KFLAG_BATCH == 0 && offset >= cursor {
             if found.is_none() {
                 found = Some((data_pos, len, offset));
@@ -240,24 +246,34 @@ pub fn copy_entry_into(s: &Store, pi: usize, pos: usize, len: usize, dst: &mut [
     if pi >= KSTORE_PARTS || pos + len > KSTORE_BYTES || len > dst.len() {
         return false;
     }
-    for i in 0..len {
-        dst[i] = s.parts[pi].ring[pos + i];
-    }
+    dst[..len].copy_from_slice(&s.parts[pi].ring[pos..(len + pos)]);
     true
 }
 
 // ── Log accessors ───────────────────────────────────────────────────
 
 pub fn next_offset(s: &Store, pi: usize) -> u64 {
-    if pi < KSTORE_PARTS { s.parts[pi].next_offset } else { 0 }
+    if pi < KSTORE_PARTS {
+        s.parts[pi].next_offset
+    } else {
+        0
+    }
 }
 
 pub fn log_start(s: &Store, pi: usize) -> u64 {
-    if pi < KSTORE_PARTS { s.parts[pi].log_start } else { 0 }
+    if pi < KSTORE_PARTS {
+        s.parts[pi].log_start
+    } else {
+        0
+    }
 }
 
 pub fn get_cursor(s: &Store, pi: usize) -> u64 {
-    if pi < KSTORE_PARTS { s.parts[pi].get_cursor } else { 0 }
+    if pi < KSTORE_PARTS {
+        s.parts[pi].get_cursor
+    } else {
+        0
+    }
 }
 
 pub fn set_get_cursor(s: &mut Store, pi: usize, v: u64) {
@@ -303,7 +319,10 @@ pub fn kin_encode_slot(ki: usize, epoch: u32) -> u32 {
 
 #[inline]
 pub fn kin_decode_slot(ss: u32) -> (usize, u32) {
-    ((ss & KIN_KI_MASK) as usize, (ss >> KIN_EPOCH_SHIFT) & KIN_EPOCH_MASK)
+    (
+        (ss & KIN_KI_MASK) as usize,
+        (ss >> KIN_EPOCH_SHIFT) & KIN_EPOCH_MASK,
+    )
 }
 
 #[repr(C)]
@@ -341,9 +360,19 @@ pub struct KafkaInflight {
 impl KafkaInflight {
     pub const fn zero() -> Self {
         Self {
-            active: 0, conn_id: 0, topic_len: 0, proto: 0, epoch: 0,
-            n_parts: 0, n_done: 0, api_ver: 0, acks: 0, kafka_corr: 0,
-            channel: 0, delivery_tag: 0, ts_ms: 0,
+            active: 0,
+            conn_id: 0,
+            topic_len: 0,
+            proto: 0,
+            epoch: 0,
+            n_parts: 0,
+            n_done: 0,
+            api_ver: 0,
+            acks: 0,
+            kafka_corr: 0,
+            channel: 0,
+            delivery_tag: 0,
+            ts_ms: 0,
             part_ids: [0; KIN_MAX_PARTS],
             part_offs: [-1; KIN_MAX_PARTS],
             part_errs: [0; KIN_MAX_PARTS],
@@ -377,9 +406,15 @@ pub struct KPart {
 impl KPart {
     pub const fn zero() -> Self {
         Self {
-            active: 0, topic_len: 0, partition: 0,
-            next_offset: 0, log_start: 0, get_cursor: 0,
-            head: 0, tail: 0, used: 0,
+            active: 0,
+            topic_len: 0,
+            partition: 0,
+            next_offset: 0,
+            log_start: 0,
+            get_cursor: 0,
+            head: 0,
+            tail: 0,
+            used: 0,
             topic: [0; KAFKA_MAX_TOPIC],
             ring: [0; KSTORE_BYTES],
         }
@@ -389,10 +424,7 @@ impl KPart {
 pub fn find(s: &Store, topic: &[u8], partition: u16) -> Option<usize> {
     for i in 0..KSTORE_PARTS {
         let p = &s.parts[i];
-        if p.active == 1
-            && p.partition == partition
-            && &p.topic[..p.topic_len as usize] == topic
-        {
+        if p.active == 1 && p.partition == partition && &p.topic[..p.topic_len as usize] == topic {
             return Some(i);
         }
     }
@@ -400,8 +432,12 @@ pub fn find(s: &Store, topic: &[u8], partition: u16) -> Option<usize> {
 }
 
 pub fn find_or_create(s: &mut Store, topic: &[u8], partition: u16) -> Option<usize> {
-    if topic.is_empty() || topic.len() > KAFKA_MAX_TOPIC { return None; }
-    if let Some(i) = find(s, topic, partition) { return Some(i); }
+    if topic.is_empty() || topic.len() > KAFKA_MAX_TOPIC {
+        return None;
+    }
+    if let Some(i) = find(s, topic, partition) {
+        return Some(i);
+    }
     for i in 0..KSTORE_PARTS {
         if s.parts[i].active == 0 {
             let p = &mut s.parts[i];
@@ -436,10 +472,21 @@ pub fn entry_at(p: &KPart, mut pos: u32) -> (u32, u16, u8, u64, u32) {
     let len = u16::from_le_bytes([p.ring[b], p.ring[b + 1]]);
     let flags = p.ring[b + 2];
     let offset = u64::from_le_bytes([
-        p.ring[b + 3], p.ring[b + 4], p.ring[b + 5], p.ring[b + 6],
-        p.ring[b + 7], p.ring[b + 8], p.ring[b + 9], p.ring[b + 10],
+        p.ring[b + 3],
+        p.ring[b + 4],
+        p.ring[b + 5],
+        p.ring[b + 6],
+        p.ring[b + 7],
+        p.ring[b + 8],
+        p.ring[b + 9],
+        p.ring[b + 10],
     ]);
-    let nrec = u32::from_le_bytes([p.ring[b + 11], p.ring[b + 12], p.ring[b + 13], p.ring[b + 14]]);
+    let nrec = u32::from_le_bytes([
+        p.ring[b + 11],
+        p.ring[b + 12],
+        p.ring[b + 13],
+        p.ring[b + 14],
+    ]);
     (pos + KENTRY_HDR as u32, len, flags, offset, nrec)
 }
 
@@ -451,7 +498,9 @@ pub fn entry_end(p: &KPart, pos: u32) -> u32 {
 
 /// Evict the oldest entry; updates tail/used/log_start.
 fn evict_tail(p: &mut KPart) {
-    if p.used == 0 { return; }
+    if p.used == 0 {
+        return;
+    }
     let cap = KSTORE_BYTES as u32;
     let mut tail = p.tail;
     // Resolve a wrap sentinel: account the dead bytes to the end of ring.
@@ -461,7 +510,11 @@ fn evict_tail(p: &mut KPart) {
         p.used = p.used.saturating_sub(cap - tail);
         tail = 0;
         p.tail = 0;
-        if p.used == 0 { p.head = 0; p.log_start = p.next_offset; return; }
+        if p.used == 0 {
+            p.head = 0;
+            p.log_start = p.next_offset;
+            return;
+        }
     }
     let end = entry_end(p, tail);
     p.used = p.used.saturating_sub(end - tail);
@@ -481,18 +534,26 @@ fn evict_tail(p: &mut KPart) {
 /// advanced by `nrec`). For Kafka batches the caller patches the stored
 /// batch's baseOffset field afterwards via the returned data position.
 pub fn push(
-    s: &mut Store, part_idx: usize, flags: u8, nrec: u32, data: &[u8],
+    s: &mut Store,
+    part_idx: usize,
+    flags: u8,
+    nrec: u32,
+    data: &[u8],
 ) -> Option<(u64, usize)> {
     let need = (KENTRY_HDR + data.len()) as u32;
     let cap = KSTORE_BYTES as u32;
-    if need > cap / 2 { return None; }
+    if need > cap / 2 {
+        return None;
+    }
     let evictions_before = {
         let p = &mut s.parts[part_idx];
         // Wrap if the entry doesn't fit contiguously at head.
         if p.head + need > cap {
             let waste = cap - p.head;
             // Free enough space to account the wrap waste.
-            while p.used + waste > cap { evict_tail(p); }
+            while p.used + waste > cap {
+                evict_tail(p);
+            }
             if p.head + 2 <= cap {
                 let w = KWRAP.to_le_bytes();
                 p.ring[p.head as usize] = w[0];
@@ -502,7 +563,10 @@ pub fn push(
             p.head = 0;
         }
         let mut ev = 0u32;
-        while p.used + need > cap { evict_tail(p); ev += 1; }
+        while p.used + need > cap {
+            evict_tail(p);
+            ev += 1;
+        }
         ev
     };
     s.evictions = s.evictions.wrapping_add(evictions_before);
@@ -519,7 +583,9 @@ pub fn push(
         p.log_start = offset;
     }
     p.head += need;
-    if p.head >= cap { p.head = 0; }
+    if p.head >= cap {
+        p.head = 0;
+    }
     p.used += need;
     p.next_offset = offset + nrec as u64;
     Some((offset, b + KENTRY_HDR))
@@ -537,11 +603,17 @@ pub fn push(
 ///
 /// # Safety
 pub fn fetch_into(
-    s: &Store, pi: usize, fetch_offset: i64,
-    out: &mut [u8], dst: usize, budget_end: usize,
+    s: &Store,
+    pi: usize,
+    fetch_offset: i64,
+    out: &mut [u8],
+    dst: usize,
+    budget_end: usize,
 ) -> usize {
     let mut written = 0usize;
-    if s.parts[pi].used == 0 { return 0; }
+    if s.parts[pi].used == 0 {
+        return 0;
+    }
     let part = &s.parts[pi];
     let mut pos = part.tail;
     let mut walked = 0u32;
@@ -551,12 +623,22 @@ pub fn fetch_into(
         let (data_pos, len, flags, offset, nrec) = entry_at(part, pos);
         let start = if pos + 2 > KSTORE_BYTES as u32
             || u16::from_le_bytes([part.ring[pos as usize], part.ring[pos as usize + 1]]) == KWRAP
-        { 0 } else { pos };
+        {
+            0
+        } else {
+            pos
+        };
         let consumed = (data_pos + len as u32) - start
-            + if start == 0 && pos != 0 { KSTORE_BYTES as u32 - pos } else { 0 };
+            + if start == 0 && pos != 0 {
+                KSTORE_BYTES as u32 - pos
+            } else {
+                0
+            };
         if flags & KFLAG_BATCH != 0 && (offset as i64 + nrec as i64) > fetch_offset {
             let l = len as usize;
-            if dst + written + l > budget_end { break; }
+            if dst + written + l > budget_end {
+                break;
+            }
             out[dst + written..dst + written + l]
                 .copy_from_slice(&part.ring[data_pos as usize..data_pos as usize + l]);
             written += l;

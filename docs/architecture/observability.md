@@ -82,65 +82,21 @@ that, `governance`'s telemetry component aggregates excess dimensions into an
 | Is one tenant hot? | `quantum_publish_total` by tenant; `quantum_quota_exceeded_total` by tenant |
 | Is CP stale? | `clustor_cp_cache_state == Fresh`; `clustor_cp_cache_age_ms` < `refresh_fresh_ms` |
 
-## Export id-table budget
+## Export name resolution
 
-`fluxor validate` warns that the OTLP id-table exceeds its cap on the
-larger graphs:
+Telemetry leaves the device id-interned: the `otel` export engine
+drains the kernel ring and emits `fxtl-compact` batches whose samples
+carry a numeric `(module, id)` pair — there is no on-device name
+table, and no size cap tied to graph scale. The host collector
+resolves names from the build-time instrument table the config tool
+generates (one `module_idx:instrument_id=name;` entry per declared
+instrument across the graph).
 
-```
-warning: observability id-table is 2696 bytes (> 2048 cap); names beyond
-the 2030-byte boundary won't resolve in otlp_http
-```
-
-The table is built by the config tool as one `module_idx:instrument_id=name;`
-entry per declared instrument across every module in the graph, and the
-`otlp_http` exporter parses it into a fixed `IDTABLE_MAX = 2048` buffer.
-Past that boundary an instrument still *emits* — the sample carries a
-numeric `(module, id)` pair and is exported — but it resolves to no name
-on the collector side. So the failure is silent and cosmetic-looking,
-and it lands on whichever modules sort last by graph index.
-
-Attribution for `quantum-pi5.yaml` (2626 B by this accounting; the tool
-reports 2696 B including instruments this table omits):
-
-| module | instruments | bytes |
-|---|---:|---:|
-| `consensus` (substrate) | 32 | 616 |
-| `operations` (substrate) | 21 | 430 |
-| `durability` (substrate) | 18 | 372 |
-| `governance` | 10 | 211 |
-| `flow` | 10 | 169 |
-| `protocol` | 8 | 155 |
-| `messaging` | 11 | 144 |
-| `topic_engine` | 6 | 114 |
-| `forward_coordinator` | 6 | 105 |
-| `session_processor` | 6 | 98 |
-| everything else | 11 | 212 |
-
-**The three Clustor substrate modules are 54% of the table.** Quantum's
-own application modules total 679 B, and their declared lists match what
-the code emits — there is no padding to trim. Deleting every Quantum
-application instrument would barely clear the 578 B overflow, at the
-cost of the entire application-metrics surface.
-
-So this is not a Quantum-side problem to fix by trimming. The options,
-in order of preference:
-
-1. **Raise `IDTABLE_MAX`** in fluxor
-   (`tools/src/config/builder.rs`, and the matching exporter buffer).
-   The graph has outgrown a 2 KiB table; 4 KiB restores headroom for
-   both the substrate and the application tier. This is a Fluxor change
-   and is the right one.
-2. **Shorten instrument names.** Entry overhead is ~5 B plus the name,
-   so the ~39 Quantum instruments at ~12 characters average would save
-   roughly 150 B if cut to 8. Not enough alone, and it degrades
-   readability at the collector.
-3. **Drop instruments.** Only worth considering for the substrate,
-   which is where the bytes are — and that is a Clustor decision.
-
-Until (1) lands, treat any missing metric *name* at the collector on a
-large graph as this cap rather than a broken emitter: check whether the
-instrument's module sorts late in the graph's module list.
+A missing metric *name* at the collector therefore means the
+collector's table is stale for the deployed graph — regenerate it from
+the same config build — not that the device dropped or truncated
+anything. Missing *samples* are a different symptom entirely (emitter
+gating, ring overflow, or transport loss).
 
 ## Tracing
 

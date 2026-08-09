@@ -10,8 +10,7 @@
 //! sweeps the tenant table at most once per tick.
 
 use super::abi::SyscallTable;
-use super::{dev_log, dev_millis, dev_channel_port, wire};
-
+use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 const MAX_TENANTS: usize = 256;
 
@@ -19,10 +18,10 @@ const MAX_TENANTS: usize = 256;
 #[derive(Clone, Copy)]
 struct TenantState {
     tenant_id: u32,
-    max_publish_rate: u32,   // msgs/sec
+    max_publish_rate: u32, // msgs/sec
     current_tokens: i32,
     token_cap: i32,
-    overage_started_ms: u64,  // 0 if not in overage
+    overage_started_ms: u64, // 0 if not in overage
     last_refill_ms: u64,
     active: u8,
 }
@@ -30,9 +29,12 @@ struct TenantState {
 impl TenantState {
     const fn zero() -> Self {
         Self {
-            tenant_id: 0, max_publish_rate: 10_000,
-            current_tokens: 10_000, token_cap: 10_000,
-            overage_started_ms: 0, last_refill_ms: 0,
+            tenant_id: 0,
+            max_publish_rate: 10_000,
+            current_tokens: 10_000,
+            token_cap: 10_000,
+            overage_started_ms: 0,
+            last_refill_ms: 0,
             active: 0,
         }
     }
@@ -41,7 +43,7 @@ impl TenantState {
 #[repr(C)]
 pub struct Tenants {
     pub in_records: i32,
-    pub in_charge: i32,       // in[1]: charge events from publish path
+    pub in_charge: i32, // in[1]: charge events from publish path
     pub out_quota: i32,
     pub out_disconnect: i32,
 
@@ -56,8 +58,6 @@ pub struct Tenants {
 
     buf: [u8; 128],
 }
-
-
 
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
@@ -82,9 +82,13 @@ pub unsafe fn step(s: &mut Tenants, sys: &SyscallTable, out: &mut super::Outbox)
         if s.in_records >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_records, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (_, plen) = wire::channel_read_msg(sys, s.in_records, &mut s.buf);
-                if plen < 8 { continue; }
+                if plen < 8 {
+                    continue;
+                }
                 let tenant_id = u32::from_le_bytes([s.buf[0], s.buf[1], s.buf[2], s.buf[3]]);
                 let rate = u32::from_le_bytes([s.buf[4], s.buf[5], s.buf[6], s.buf[7]]);
 
@@ -102,9 +106,12 @@ pub unsafe fn step(s: &mut Tenants, sys: &SyscallTable, out: &mut super::Outbox)
                     for i in 0..MAX_TENANTS {
                         if s.tenants[i].active == 0 {
                             s.tenants[i] = TenantState {
-                                tenant_id, max_publish_rate: rate,
-                                current_tokens: rate as i32, token_cap: rate as i32,
-                                overage_started_ms: 0, last_refill_ms: now,
+                                tenant_id,
+                                max_publish_rate: rate,
+                                current_tokens: rate as i32,
+                                token_cap: rate as i32,
+                                overage_started_ms: 0,
+                                last_refill_ms: now,
                                 active: 1,
                             };
                             break;
@@ -119,14 +126,19 @@ pub unsafe fn step(s: &mut Tenants, sys: &SyscallTable, out: &mut super::Outbox)
         if s.in_charge >= 0 {
             for _ in 0..32 {
                 let poll = (sys.channel_poll)(s.in_charge, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (_, plen) = wire::channel_read_msg(sys, s.in_charge, &mut s.buf);
-                if plen < 8 { continue; }
+                if plen < 8 {
+                    continue;
+                }
                 let tenant_id = u32::from_le_bytes([s.buf[0], s.buf[1], s.buf[2], s.buf[3]]);
                 let cost = u32::from_le_bytes([s.buf[4], s.buf[5], s.buf[6], s.buf[7]]);
                 for i in 0..MAX_TENANTS {
                     if s.tenants[i].active == 1 && s.tenants[i].tenant_id == tenant_id {
-                        s.tenants[i].current_tokens = s.tenants[i].current_tokens.saturating_sub(cost as i32);
+                        s.tenants[i].current_tokens =
+                            s.tenants[i].current_tokens.saturating_sub(cost as i32);
                         s.charges = s.charges.wrapping_add(1);
                         break;
                     }
@@ -140,7 +152,9 @@ pub unsafe fn step(s: &mut Tenants, sys: &SyscallTable, out: &mut super::Outbox)
             s.last_tick_ms = now;
 
             for i in 0..MAX_TENANTS {
-                if s.tenants[i].active == 0 { continue; }
+                if s.tenants[i].active == 0 {
+                    continue;
+                }
                 // Refill tokens at max_publish_rate per second
                 let refill = elapsed_s.saturating_mul(s.tenants[i].max_publish_rate as i32);
                 s.tenants[i].current_tokens = (s.tenants[i].current_tokens.saturating_add(refill))
@@ -159,7 +173,12 @@ pub unsafe fn step(s: &mut Tenants, sys: &SyscallTable, out: &mut super::Outbox)
                         if s.out_disconnect >= 0 {
                             let poll_out = (sys.channel_poll)(s.out_disconnect, 0x02);
                             if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                                wire::channel_write_msg(sys, s.out_disconnect, wire::MSG_TENANT_DISCONNECT, &d);
+                                wire::channel_write_msg(
+                                    sys,
+                                    s.out_disconnect,
+                                    wire::MSG_TENANT_DISCONNECT,
+                                    &d,
+                                );
                                 s.disconnects = s.disconnects.wrapping_add(1);
                             }
                         }
@@ -193,6 +212,5 @@ pub unsafe fn step(s: &mut Tenants, sys: &SyscallTable, out: &mut super::Outbox)
             m[8..12].copy_from_slice(&s.disconnects.to_le_bytes());
             out.metrics.push(wire::MSG_METRICS, &m);
         }
-
     }
 }

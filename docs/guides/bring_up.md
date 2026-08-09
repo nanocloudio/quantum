@@ -31,7 +31,7 @@ Quantum's bare-metal build and scenarios live in these files:
 |---|---|
 | `.fluxor-rig.toml` | `[build.pi5]` recipe — builds Fluxor's pi5 firmware from the sibling `../fluxor` checkout, builds Quantum's PIC modules, runs `fluxor sync` to pull foundation/SDK artefacts, then `fluxor build` to produce a single kernel image |
 | `configs/quantum-pi5-smoke.yaml` | Minimal `modules: []` graph the smoke boots — exercises the dev-host → DUT pipeline through kernel handoff |
-| `configs/quantum-pi5.yaml` | Full-graph pi5 deployment (27 modules); group-fsync is controlled by `durability`'s `fsync_mode` / `group_window_ms` / `group_max_pending`, and `root_path: 1` puts WAL segments and snapshots at the FAT32 root |
+| `configs/quantum-pi5.yaml` | Full-graph pi5 deployment (15 modules); group-fsync is controlled by `durability`'s `fsync_mode` / `group_window_ms` / `group_max_pending`, and `root_path: 1` puts WAL segments and snapshots at the FAT32 root |
 | `tests/hardware/quantum_pi5_boot.toml` | Smoke scenario; pass signal is `observe.netboot_fetch` matching `kernel_2712.img` |
 
 ## Running the smoke

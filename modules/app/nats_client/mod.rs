@@ -24,7 +24,11 @@
 
 use core::ffi::c_void;
 
-#[allow(unused_imports, dead_code, reason = "shared SDK surface across modules")]
+#[allow(
+    unused_imports,
+    dead_code,
+    reason = "shared SDK surface across modules"
+)]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -129,22 +133,41 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<NatsState>() as u32
 }
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: drain any work queued for this instance without
+/// admitting new input.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_drain"]
-pub extern "C" fn module_drain(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_drain(state: *mut u8) -> i32 {
     unsafe {
         (*(state as *mut NatsState)).draining = 1;
         0
     }
 }
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -206,7 +229,13 @@ unsafe fn stage_send(s: &mut NatsState, n: usize) {
 }
 
 /// Feed one event into the subscriber machine and perform its action.
-unsafe fn feed(s: &mut NatsState, sys: &SyscallTable, ev: NEv, now: u64, msg: Option<(usize, usize)>) {
+unsafe fn feed(
+    s: &mut NatsState,
+    sys: &SyscallTable,
+    ev: NEv,
+    now: u64,
+    msg: Option<(usize, usize)>,
+) {
     let (action, next) = nats_transition(s.phase, ev);
     match action {
         NAct::Connect => {
@@ -220,7 +249,15 @@ unsafe fn feed(s: &mut NatsState, sys: &SyscallTable, ev: NEv, now: u64, msg: Op
             payload[5] = port[0];
             payload[6] = port[1];
             payload[7] = s.tag;
-            net_write_frame(sys, s.net_out, NET_CMD_CONNECT, payload.as_ptr(), 8, s.nbuf.as_mut_ptr(), NET_BUF);
+            net_write_frame(
+                sys,
+                s.net_out,
+                NET_CMD_CONNECT,
+                payload.as_ptr(),
+                8,
+                s.nbuf.as_mut_ptr(),
+                NET_BUF,
+            );
             s.started_ms = now;
         }
         NAct::SendConnectSub => {
@@ -267,7 +304,15 @@ unsafe fn feed(s: &mut NatsState, sys: &SyscallTable, ev: NEv, now: u64, msg: Op
         NAct::Fail => {
             if s.conn_id != 0 {
                 let close = [s.conn_id];
-                net_write_frame(sys, s.net_out, NET_CMD_CLOSE, close.as_ptr(), 1, s.nbuf.as_mut_ptr(), NET_BUF);
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CLOSE,
+                    close.as_ptr(),
+                    1,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
             }
             s.conn_id = 0;
             s.acc_len = 0;
@@ -280,9 +325,14 @@ unsafe fn feed(s: &mut NatsState, sys: &SyscallTable, ev: NEv, now: u64, msg: Op
     s.phase = next;
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut NatsState);
         let sys = &*s.syscalls;
@@ -358,8 +408,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_ERROR => {
-                        let ours = (s.phase == NPhase::Connecting && plen >= 3 && *payload.add(2) == s.tag)
-                            || (s.phase != NPhase::Disconnected && plen >= 1 && *payload == s.conn_id);
+                        let ours = (s.phase == NPhase::Connecting
+                            && plen >= 3
+                            && *payload.add(2) == s.tag)
+                            || (s.phase != NPhase::Disconnected
+                                && plen >= 1
+                                && *payload == s.conn_id);
                         if ours {
                             feed(s, sys, NEv::NetError, now, None);
                         }
@@ -378,7 +432,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     break;
                 }
                 let remaining = (s.req_len - s.req_sent) as usize;
-                let chunk = if remaining < max_chunk { remaining } else { max_chunk };
+                let chunk = if remaining < max_chunk {
+                    remaining
+                } else {
+                    max_chunk
+                };
                 let total_payload = chunk + 1;
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
@@ -402,10 +460,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // 6. Drain: leave once idle.
-        if s.draining == 1 && matches!(s.phase, NPhase::Disconnected | NPhase::Ready) && s.req_sent >= s.req_len {
+        if s.draining == 1
+            && matches!(s.phase, NPhase::Disconnected | NPhase::Ready)
+            && s.req_sent >= s.req_len
+        {
             if s.conn_id != 0 {
                 let close = [s.conn_id];
-                net_write_frame(sys, s.net_out, NET_CMD_CLOSE, close.as_ptr(), 1, s.nbuf.as_mut_ptr(), NET_BUF);
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CLOSE,
+                    close.as_ptr(),
+                    1,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
                 s.conn_id = 0;
             }
             return 1;

@@ -15,8 +15,13 @@
 
 # Build/test
 Cargo.lock
-/target/
+# Unanchored: with no root workspace each host crate under tools/ has its
+# own target/, so a leading-slash rule would miss them.
+target/
+# Shadow-tracked (see standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote.
 /tests/
+/.git-shadow/
 /data/
 /certs/
 

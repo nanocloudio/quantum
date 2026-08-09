@@ -6,7 +6,7 @@
 # quantum-linux-minimal.yaml: pi5 target, ip net stack, 9092, wal
 # root_path+skip_replay, debug->net telemetry.
 #
-# Quantum: MQTT-only single-node graph (21 modules).
+# Quantum: Kafka produce bench graph (13 modules).
 #
 # Topology (no-compromise design):
 #
@@ -83,7 +83,7 @@ modules:
   - name: gateway
   - name: operations
 
-  # ── Quantum protocol stack (13 modules) ─────────────────
+  # ── Quantum protocol stack (5 modules) ─────────────────
   - name: protocol
     params:
       advertised_host: "192.168.1.9"
@@ -218,8 +218,6 @@ wiring:
     to: gateway.credit_supply
   - from: admission.credits
     to: session_processor.flow_in
-  - from: admission.envelope
-    to: flow.envelope_in
   - from: consensus.lag_signal
     to: admission.lag
   - from: gateway.rejected

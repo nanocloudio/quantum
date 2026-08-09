@@ -135,7 +135,14 @@ pub struct NatsFrame {
 
 impl NatsFrame {
     fn simple(kind: NatsKind, total: usize) -> Self {
-        Self { kind, subject_start: 0, subject_end: 0, payload_start: 0, payload_end: 0, total }
+        Self {
+            kind,
+            subject_start: 0,
+            subject_end: 0,
+            payload_start: 0,
+            payload_end: 0,
+            total,
+        }
     }
     fn incomplete() -> Self {
         Self::simple(NatsKind::Incomplete, 0)

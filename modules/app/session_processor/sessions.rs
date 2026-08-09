@@ -11,9 +11,8 @@
 //! over fixed tables and returns without blocking.
 
 use super::{
-    PROTO_UNKNOWN, QOS2_PUBLISH,
-    MAX_INFLIGHT_PER_SESSION, MAX_SESSIONS, MAX_WILL_PAYLOAD,
-    MAX_WILL_TOPIC, SessionEpoch, StreamHash, TenantId,
+    SessionEpoch, StreamHash, TenantId, MAX_INFLIGHT_PER_SESSION, MAX_SESSIONS, MAX_WILL_PAYLOAD,
+    MAX_WILL_TOPIC, PROTO_UNKNOWN, QOS2_PUBLISH,
 };
 
 #[repr(C)]
@@ -35,8 +34,13 @@ pub struct Inflight {
 impl Inflight {
     pub const fn zero() -> Self {
         Self {
-            packet_id: 0, qos: 0, phase: 0, wal_index: 0,
-            correlation_id: 0, direction: 0, active: 0,
+            packet_id: 0,
+            qos: 0,
+            phase: 0,
+            wal_index: 0,
+            correlation_id: 0,
+            direction: 0,
+            active: 0,
         }
     }
 }
@@ -83,9 +87,8 @@ pub struct Session {
     /// has no equivalent property; propose-side normalises
     /// clean_session=0 connections to `u32::MAX` so they're treated as
     /// "never expire" by the sweep. Special values:
-    ///   * `0`           — expire immediately on disconnect (no persisted
-    ///                      slot survives the disconnect, even with
-    ///                      clean_start=false).
+    ///   * `0` — expire immediately on disconnect (no persisted slot
+    ///     survives the disconnect, even with clean_start=false).
     ///   * `u32::MAX`    — never expire (sweep skips the slot).
     ///   * anything else — purge at `disconnected_at_ms + session_expiry_s * 1000`.
     session_expiry_s: u32,
@@ -110,6 +113,7 @@ pub struct Session {
     ///     resurrects the session (MQTT 5 §3.1.3.2.2 — "if the Session
     ///     is taken over by another connection, the Will Message
     ///     publication MUST NOT be sent").
+    ///
     /// `0` means no pending Will fire.
     pending_will_fire_at_ms: u64,
 }
@@ -117,30 +121,45 @@ pub struct Session {
 impl Session {
     pub const fn zero() -> Self {
         Self {
-            tenant: 0, stream_hash: 0, session_epoch: 0,
-            protocol: PROTO_UNKNOWN, conn_id: 0, active: 0,
-            persisted: 0, clean_start: 0, transient: 0,
-            last_activity_ms: 0, keep_alive_ms: 0, next_msg_id: 1,
+            tenant: 0,
+            stream_hash: 0,
+            session_epoch: 0,
+            protocol: PROTO_UNKNOWN,
+            conn_id: 0,
+            active: 0,
+            persisted: 0,
+            clean_start: 0,
+            transient: 0,
+            last_activity_ms: 0,
+            keep_alive_ms: 0,
+            next_msg_id: 1,
             inflight: [Inflight::zero(); MAX_INFLIGHT_PER_SESSION],
-            will_present: 0, will_qos: 0, will_retain: 0, will_delay_ms: 0,
-            will_topic_len: 0, will_topic: [0; MAX_WILL_TOPIC],
-            will_payload_len: 0, will_payload: [0; MAX_WILL_PAYLOAD],
-            session_expiry_s: 0, disconnected_at_ms: 0,
+            will_present: 0,
+            will_qos: 0,
+            will_retain: 0,
+            will_delay_ms: 0,
+            will_topic_len: 0,
+            will_topic: [0; MAX_WILL_TOPIC],
+            will_payload_len: 0,
+            will_payload: [0; MAX_WILL_PAYLOAD],
+            session_expiry_s: 0,
+            disconnected_at_ms: 0,
             receive_maximum: 0,
             pending_will_fire_at_ms: 0,
         }
     }
 
-    pub fn allocate_inflight(
-        &mut self, packet_id: u16, qos: u8, direction: u8,
-    ) -> Option<usize> {
+    pub fn allocate_inflight(&mut self, packet_id: u16, qos: u8, direction: u8) -> Option<usize> {
         for i in 0..MAX_INFLIGHT_PER_SESSION {
             if self.inflight[i].active == 0 {
                 self.inflight[i] = Inflight {
-                    packet_id, qos,
+                    packet_id,
+                    qos,
                     phase: if qos == 2 { QOS2_PUBLISH } else { 0 },
-                    wal_index: 0, correlation_id: 0,
-                    direction, active: 1,
+                    wal_index: 0,
+                    correlation_id: 0,
+                    direction,
+                    active: 1,
                 };
                 return Some(i);
             }
@@ -184,19 +203,31 @@ pub fn init(s: &mut Sessions) {
 // ── Subscriber flow control ─────────────────────────────────────────
 
 pub fn prefetch_credit(s: &Sessions, si: usize) -> u32 {
-    if si < MAX_SESSIONS { s.prefetch_credit[si] } else { 0 }
+    if si < MAX_SESSIONS {
+        s.prefetch_credit[si]
+    } else {
+        0
+    }
 }
 
 pub fn set_prefetch_credit(s: &mut Sessions, si: usize, credit: u32) {
-    if si < MAX_SESSIONS { s.prefetch_credit[si] = credit; }
+    if si < MAX_SESSIONS {
+        s.prefetch_credit[si] = credit;
+    }
 }
 
 pub fn sub_outstanding(s: &Sessions, si: usize) -> u32 {
-    if si < MAX_SESSIONS { s.sub_outstanding[si] } else { 0 }
+    if si < MAX_SESSIONS {
+        s.sub_outstanding[si]
+    } else {
+        0
+    }
 }
 
 pub fn note_delivery(s: &mut Sessions, si: usize) -> u32 {
-    if si >= MAX_SESSIONS { return 0; }
+    if si >= MAX_SESSIONS {
+        return 0;
+    }
     s.sub_outstanding[si] = s.sub_outstanding[si].wrapping_add(1);
     s.sub_outstanding[si]
 }
@@ -209,7 +240,9 @@ pub fn note_ack(s: &mut Sessions, si: usize) {
 }
 
 pub fn set_sub_outstanding(s: &mut Sessions, si: usize, n: u32) {
-    if si < MAX_SESSIONS { s.sub_outstanding[si] = n; }
+    if si < MAX_SESSIONS {
+        s.sub_outstanding[si] = n;
+    }
 }
 
 /// Clear the flow-control window — done on every transition that also
@@ -318,23 +351,43 @@ pub fn is_transient(s: &Sessions, si: usize) -> bool {
 }
 
 pub fn conn_id(s: &Sessions, si: usize) -> u8 {
-    if si < MAX_SESSIONS { s.slots[si].conn_id } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].conn_id
+    } else {
+        0
+    }
 }
 
 pub fn stream_hash(s: &Sessions, si: usize) -> StreamHash {
-    if si < MAX_SESSIONS { s.slots[si].stream_hash } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].stream_hash
+    } else {
+        0
+    }
 }
 
 pub fn tenant(s: &Sessions, si: usize) -> TenantId {
-    if si < MAX_SESSIONS { s.slots[si].tenant } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].tenant
+    } else {
+        0
+    }
 }
 
 pub fn session_epoch(s: &Sessions, si: usize) -> SessionEpoch {
-    if si < MAX_SESSIONS { s.slots[si].session_epoch } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].session_epoch
+    } else {
+        0
+    }
 }
 
 pub fn protocol(s: &Sessions, si: usize) -> u8 {
-    if si < MAX_SESSIONS { s.slots[si].protocol } else { PROTO_UNKNOWN }
+    if si < MAX_SESSIONS {
+        s.slots[si].protocol
+    } else {
+        PROTO_UNKNOWN
+    }
 }
 
 /// Record client activity, which defers the keep-alive deadline.
@@ -369,10 +422,16 @@ pub fn session_expired(s: &Sessions, si: usize, now: u64) -> bool {
 /// Take the next subscriber-delivery packet id. MQTT reserves id 0, so
 /// a wrap lands on 1.
 pub fn next_sub_packet_id(s: &mut Sessions, si: usize) -> u16 {
-    if si >= MAX_SESSIONS { return 1; }
+    if si >= MAX_SESSIONS {
+        return 1;
+    }
     let id_full = s.slots[si].next_msg_id;
     s.slots[si].next_msg_id = id_full.wrapping_add(1);
-    if (id_full as u16) == 0 { 1 } else { id_full as u16 }
+    if (id_full as u16) == 0 {
+        1
+    } else {
+        id_full as u16
+    }
 }
 
 /// Take the next packet id for a broker-originated publish, wrapping
@@ -394,7 +453,9 @@ pub fn next_packet_id(s: &mut Sessions, si: usize) -> u16 {
 /// Wipe the per-session delivery state a fresh (non-resumed) session
 /// must not inherit: QoS inflight and the packet-id counter.
 pub fn reset_delivery_state(s: &mut Sessions, si: usize) {
-    if si >= MAX_SESSIONS { return; }
+    if si >= MAX_SESSIONS {
+        return;
+    }
     s.slots[si].inflight = [Inflight::zero(); MAX_INFLIGHT_PER_SESSION];
     s.slots[si].next_msg_id = 1;
 }
@@ -402,10 +463,16 @@ pub fn reset_delivery_state(s: &mut Sessions, si: usize) {
 /// Bind a freshly-admitted connection to an existing slot on the
 /// propose side. `mark_transient` then flags it pending apply.
 pub fn rebind(
-    s: &mut Sessions, si: usize, conn_id: u8, protocol: u8, clean_start: bool,
+    s: &mut Sessions,
+    si: usize,
+    conn_id: u8,
+    protocol: u8,
+    clean_start: bool,
     keep_alive_ms: u32,
 ) {
-    if si >= MAX_SESSIONS { return; }
+    if si >= MAX_SESSIONS {
+        return;
+    }
     let x = &mut s.slots[si];
     x.conn_id = conn_id;
     x.protocol = protocol;
@@ -415,20 +482,19 @@ pub fn rebind(
 
 /// Occupy a free slot for a CONNECT that has no prior session. `active`
 /// flips at QOP_CONNECT apply; until then the slot is transient.
-pub fn open_transient(
-    s: &mut Sessions, si: usize, tenant: TenantId, stream_hash: StreamHash,
-    protocol: u8, conn_id: u8, clean_start: bool, keep_alive_ms: u32, now: u64,
-) {
-    if si >= MAX_SESSIONS { return; }
+pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u8, now: u64) {
+    if si >= MAX_SESSIONS {
+        return;
+    }
     s.slots[si] = Session::zero();
     let x = &mut s.slots[si];
-    x.tenant = tenant;
-    x.stream_hash = stream_hash;
-    x.protocol = protocol;
+    x.tenant = p.tenant;
+    x.stream_hash = p.stream_hash;
+    x.protocol = p.protocol;
     x.conn_id = conn_id;
     x.transient = 1;
-    x.clean_start = u8::from(clean_start);
-    x.keep_alive_ms = keep_alive_ms;
+    x.clean_start = u8::from(p.clean_start);
+    x.keep_alive_ms = p.keep_alive_ms;
     x.last_activity_ms = now;
     x.next_msg_id = 1;
 }
@@ -447,7 +513,9 @@ pub struct ConnectParams {
 /// token every in-flight round-trip is validated against — and clears
 /// `persisted`, since the session is no longer parked.
 pub fn commit_connect(s: &mut Sessions, si: usize, p: ConnectParams) {
-    if si >= MAX_SESSIONS { return; }
+    if si >= MAX_SESSIONS {
+        return;
+    }
     let x = &mut s.slots[si];
     x.tenant = p.tenant;
     x.stream_hash = p.stream_hash;
@@ -476,15 +544,23 @@ pub fn mark_persisted(s: &mut Sessions, si: usize) {
 }
 
 pub fn set_session_expiry(s: &mut Sessions, si: usize, secs: u32) {
-    if si < MAX_SESSIONS { s.slots[si].session_expiry_s = secs; }
+    if si < MAX_SESSIONS {
+        s.slots[si].session_expiry_s = secs;
+    }
 }
 
 pub fn session_expiry_s(s: &Sessions, si: usize) -> u32 {
-    if si < MAX_SESSIONS { s.slots[si].session_expiry_s } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].session_expiry_s
+    } else {
+        0
+    }
 }
 
 pub fn set_receive_maximum(s: &mut Sessions, si: usize, n: u16) {
-    if si < MAX_SESSIONS { s.slots[si].receive_maximum = n; }
+    if si < MAX_SESSIONS {
+        s.slots[si].receive_maximum = n;
+    }
 }
 
 pub fn set_conn(s: &mut Sessions, si: usize, conn_id: u8, protocol: u8) {
@@ -495,14 +571,18 @@ pub fn set_conn(s: &mut Sessions, si: usize, conn_id: u8, protocol: u8) {
 }
 
 pub fn mark_transient(s: &mut Sessions, si: usize) {
-    if si < MAX_SESSIONS { s.slots[si].transient = 1; }
+    if si < MAX_SESSIONS {
+        s.slots[si].transient = 1;
+    }
 }
 
 /// Take the session out of service. `persisted` decides whether the
 /// slot is parked for a matching reconnect (stamping the disconnect
 /// time so the expiry sweep can purge it) or dropped outright.
 pub fn close(s: &mut Sessions, si: usize, persisted: bool, now: u64) {
-    if si >= MAX_SESSIONS { return; }
+    if si >= MAX_SESSIONS {
+        return;
+    }
     let x = &mut s.slots[si];
     x.active = 0;
     x.transient = 0;
@@ -517,11 +597,17 @@ pub fn close(s: &mut Sessions, si: usize, persisted: bool, now: u64) {
 /// Unbind the connection without ending the session — the slot keeps
 /// its identity for a reconnect.
 pub fn unbind_conn(s: &mut Sessions, si: usize) {
-    if si < MAX_SESSIONS { s.slots[si].conn_id = 0; }
+    if si < MAX_SESSIONS {
+        s.slots[si].conn_id = 0;
+    }
 }
 
 pub fn receive_maximum(s: &Sessions, si: usize) -> u16 {
-    if si < MAX_SESSIONS { s.slots[si].receive_maximum } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].receive_maximum
+    } else {
+        0
+    }
 }
 
 pub fn clean_start(s: &Sessions, si: usize) -> bool {
@@ -531,12 +617,16 @@ pub fn clean_start(s: &Sessions, si: usize) -> bool {
 /// Reclaim an expired persisted slot: identity and delivery state go,
 /// the slot returns to the free pool.
 pub fn reclaim(s: &mut Sessions, si: usize) {
-    if si < MAX_SESSIONS { s.slots[si] = Session::zero(); }
+    if si < MAX_SESSIONS {
+        s.slots[si] = Session::zero();
+    }
 }
 
 /// Free the slot entirely.
 pub fn clear(s: &mut Sessions, si: usize) {
-    if si < MAX_SESSIONS { s.slots[si] = Session::zero(); }
+    if si < MAX_SESSIONS {
+        s.slots[si] = Session::zero();
+    }
 }
 
 // ── Will messages ───────────────────────────────────────────────────
@@ -568,16 +658,20 @@ pub fn will_view(s: &Sessions, si: usize) -> Option<WillView> {
 }
 
 pub fn will_topic_into(s: &Sessions, si: usize, dst: &mut [u8]) -> usize {
-    if si >= MAX_SESSIONS { return 0; }
+    if si >= MAX_SESSIONS {
+        return 0;
+    }
     let n = (s.slots[si].will_topic_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.slots[si].will_topic[i]; }
+    dst[..n].copy_from_slice(&s.slots[si].will_topic[..n]);
     n
 }
 
 pub fn will_payload_into(s: &Sessions, si: usize, dst: &mut [u8]) -> usize {
-    if si >= MAX_SESSIONS { return 0; }
+    if si >= MAX_SESSIONS {
+        return 0;
+    }
     let n = (s.slots[si].will_payload_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.slots[si].will_payload[i]; }
+    dst[..n].copy_from_slice(&s.slots[si].will_payload[..n]);
     n
 }
 
@@ -586,10 +680,17 @@ pub fn will_payload_into(s: &Sessions, si: usize, dst: &mut [u8]) -> usize {
 /// correct behaviour per MQTT 3.1.1 §3.1.2.5, so `clear_will` is the
 /// no-Will branch rather than a no-op.
 pub fn set_will(
-    s: &mut Sessions, si: usize, qos: u8, retain: bool, delay_ms: u32,
-    topic: &[u8], payload: &[u8],
+    s: &mut Sessions,
+    si: usize,
+    qos: u8,
+    retain: bool,
+    delay_ms: u32,
+    topic: &[u8],
+    payload: &[u8],
 ) {
-    if si >= MAX_SESSIONS { return; }
+    if si >= MAX_SESSIONS {
+        return;
+    }
     let x = &mut s.slots[si];
     x.will_present = 1;
     x.will_qos = qos & 0x03;
@@ -599,12 +700,14 @@ pub fn set_will(
     let pn = payload.len().min(MAX_WILL_PAYLOAD);
     x.will_topic_len = tn as u16;
     x.will_payload_len = pn as u16;
-    for i in 0..tn { x.will_topic[i] = topic[i]; }
-    for i in 0..pn { x.will_payload[i] = payload[i]; }
+    x.will_topic[..tn].copy_from_slice(&topic[..tn]);
+    x.will_payload[..pn].copy_from_slice(&payload[..pn]);
 }
 
 pub fn clear_will(s: &mut Sessions, si: usize) {
-    if si >= MAX_SESSIONS { return; }
+    if si >= MAX_SESSIONS {
+        return;
+    }
     let x = &mut s.slots[si];
     x.will_present = 0;
     x.will_topic_len = 0;
@@ -626,11 +729,19 @@ pub fn will_due(s: &Sessions, si: usize, now: u64) -> bool {
 }
 
 pub fn will_deadline(s: &Sessions, si: usize) -> u64 {
-    if si < MAX_SESSIONS { s.slots[si].pending_will_fire_at_ms } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].pending_will_fire_at_ms
+    } else {
+        0
+    }
 }
 
 pub fn will_delay_ms(s: &Sessions, si: usize) -> u32 {
-    if si < MAX_SESSIONS { s.slots[si].will_delay_ms } else { 0 }
+    if si < MAX_SESSIONS {
+        s.slots[si].will_delay_ms
+    } else {
+        0
+    }
 }
 
 // ── QoS inflight ────────────────────────────────────────────────────
@@ -662,7 +773,11 @@ pub fn inflight_view(s: &Sessions, si: usize, ii: usize) -> Option<InflightView>
 
 /// Reserve an in-flight slot for `packet_id` in `direction`.
 pub fn inflight_add(
-    s: &mut Sessions, si: usize, packet_id: u16, qos: u8, direction: u8,
+    s: &mut Sessions,
+    si: usize,
+    packet_id: u16,
+    qos: u8,
+    direction: u8,
 ) -> Option<usize> {
     if si >= MAX_SESSIONS {
         return None;

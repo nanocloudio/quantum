@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Live protocol tests for Quantum's messaging clients — proves each client works
-# STANDALONE (no chronicle) against a REAL broker.
+# Live protocol tests for Quantum's messaging clients — proves each client
+# works against a REAL broker with no sibling repo in the loop.
 #
 #   ./scripts/live_clients.sh            # all
 #   ./scripts/live_clients.sh nats amqp  # a subset

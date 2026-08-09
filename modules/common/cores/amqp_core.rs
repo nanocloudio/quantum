@@ -112,12 +112,23 @@ pub fn amqp_start_ok(user: &[u8], pass: &[u8], out: &mut [u8]) -> Option<usize> 
     aput(&mut resp, &mut rp, pass)?;
     alongstr(&mut args, &mut p, &resp[..rp])?;
     ashortstr(&mut args, &mut p, b"en_US")?;
-    amqp_method_frame(0, method::CONNECTION, method::CONN_START_OK, &args[..p], out)
+    amqp_method_frame(
+        0,
+        method::CONNECTION,
+        method::CONN_START_OK,
+        &args[..p],
+        out,
+    )
 }
 
 /// Connection.Tune-Ok: echo the server's negotiated `channel-max`, `frame-max`,
 /// `heartbeat`.
-pub fn amqp_tune_ok(channel_max: u16, frame_max: u32, heartbeat: u16, out: &mut [u8]) -> Option<usize> {
+pub fn amqp_tune_ok(
+    channel_max: u16,
+    frame_max: u32,
+    heartbeat: u16,
+    out: &mut [u8],
+) -> Option<usize> {
     let mut args = [0u8; 8];
     let mut p = 0;
     au16(&mut args, &mut p, channel_max)?;
@@ -141,7 +152,13 @@ pub fn amqp_channel_open(channel: u16, out: &mut [u8]) -> Option<usize> {
     let mut args = [0u8; 8];
     let mut p = 0;
     ashortstr(&mut args, &mut p, b"")?;
-    amqp_method_frame(channel, method::CHANNEL, method::CHANNEL_OPEN, &args[..p], out)
+    amqp_method_frame(
+        channel,
+        method::CHANNEL,
+        method::CHANNEL_OPEN,
+        &args[..p],
+        out,
+    )
 }
 
 // ---- frame parsing ----------------------------------------------------------
@@ -172,7 +189,13 @@ pub fn amqp_parse_frame(buf: &[u8]) -> Option<AmqpFrame> {
     if buf[total - 1] != FRAME_END {
         return None;
     }
-    Some(AmqpFrame { ftype, channel, payload_start: 7, payload_end: 7 + size, total })
+    Some(AmqpFrame {
+        ftype,
+        channel,
+        payload_start: 7,
+        payload_end: 7 + size,
+        total,
+    })
 }
 
 /// `(class_id, method_id)` of a METHOD frame's payload, or `None`.

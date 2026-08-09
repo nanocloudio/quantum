@@ -4,7 +4,7 @@ Quantum is configured by a **graph YAML**: one file describes one
 deployable broker as a set of modules, their parameters, the wiring
 between their ports, and the platform and scheduler settings the runtime
 boots under. There is no separate flat config file — the graph *is* the
-configuration. `fluxor validate configs/<file>.yaml` checks a graph
+configuration. `fluxor build --check configs/<file>.yaml` checks a graph
 against the current module manifests; `fluxor run configs/<file>.yaml`
 boots it.
 
@@ -16,12 +16,17 @@ surface an operator edits.
 
 | File | Target | Purpose |
 |---|---|---|
-| `configs/quantum-pi5.yaml` | pi5 | Full bare-metal deployment graph — 27 modules, the Linux set plus `tls` (see [bring_up.md](bring_up.md)) |
+| `configs/quantum-pi5.yaml` | pi5 | Full bare-metal deployment graph — 15 modules, the Linux set plus `tls` (see [bring_up.md](bring_up.md)) |
 | `configs/quantum-pi5-smoke.yaml` | pi5 | Minimal `modules: []` graph for the netboot smoke |
-| `configs/quantum-linux.yaml` | linux | Full graph on the Linux platform stack — 26 modules: 7 Clustor substrate + 19 Quantum |
-| `configs/quantum-linux-2p.yaml` | linux | Two-partition variant for WAL-durability tests |
-| `configs/quantum-linux-minimal.yaml` | linux | Reduced MQTT-only graph for smokes |
-| `configs/quantum-node0.yaml` … `node2.yaml` | linux | Three-node cluster for replication tests |
+| `configs/quantum-linux.yaml` | linux | Full graph on the Linux platform stack — 14 modules: 7 Clustor substrate + 7 Quantum |
+| `configs/quantum-pi5-bench.yaml` | pi5 | The pi5 graph plus the in-graph load injector — 16 modules |
+| `configs/quantum-pi5-kafka-bench.yaml` | pi5 | Kafka produce bench for the rig — 13 modules |
+| `configs/quantum-linux-2p.yaml` | linux | Two-partition variant for WAL-durability tests — 15 modules |
+| `configs/quantum-linux-minimal.yaml` | linux | Reduced MQTT-only graph for smokes — 13 modules |
+| `configs/quantum-linux-quic.yaml` | linux | MQTT-over-QUIC ingress via `quic` + `mqtt_quic_adapter` — 15 modules |
+| `configs/quantum-linux-md.yaml` | linux | Local multi-domain proxy for the pi5 Kafka bench — 13 modules |
+| `configs/quantum-node0.yaml` … `node2.yaml` | linux | Three-node cluster for replication tests — 12 modules each |
+| `configs/consensus-bench-pi5.yaml` | pi5 | Consensus/WAL bench, no protocol surface — 8 modules |
 
 ## Anatomy of a graph
 
@@ -84,7 +89,7 @@ Each entry under `modules` names a module and may set parameters the
 module's `manifest.toml` declares — for example `durability.fsync_mode`,
 `durability.segment_bytes`, `consensus.proposal_batch_timeout_ms`, and
 `admission.entry_credit_max`. Parameters left unset take the manifest
-default. `fluxor validate` rejects unknown parameters and unsatisfied
+default. `fluxor build --check` rejects unknown parameters and unsatisfied
 port wiring.
 
 ### Wiring and channel buffers
@@ -122,13 +127,26 @@ drivers default to (override with `QUANTUM_HOST` / `QUANTUM_PORT`, or
 
 ## Protocol selection
 
-A protocol is enabled by including its codec module in the graph.
-`quantum-linux-minimal.yaml` wires `protocol`'s mqtt component, `protocol`'s amqp component, and
-`protocol`'s kafka component behind `protocol`'s router component, which demuxes by ALPN tag and
-falls back to `mqtt`. Build-time Cargo feature gates in the workspace
-manifests (`Cargo.toml`) gate which codecs and transports compile;
-`all-protocols` builds MQTT + Kafka + AMQP together. To serve only one
-protocol, ship a graph that wires only that codec.
+All three protocols live in the one `protocol` module, whose router
+demuxes each connection by ALPN tag (falling back to `mqtt`) and hands it
+to the owning codec. A graph that names `protocol` with no `variant:` —
+as `quantum-linux-minimal.yaml` does — gets the `full` variant and serves
+all three.
+
+To serve fewer, select a variant in the graph YAML; the codecs a
+deployment doesn't need are compiled out of the artefact:
+
+```yaml
+  - name: protocol
+    variant: kafka        # full (default) | mqtt | kafka | amqp
+  - name: session_processor
+    variant: kafka        # match the protocol variant
+```
+
+Variants are declared in each module's `manifest.toml` and selected per
+graph — there are no Cargo feature gates in the shipped artefacts
+(`standards/dependencies.md` §9a). The saving is real: the kafka-only
+`protocol` artefact is 13 KB against 51 KB for `full`.
 
 ## Durability tuning
 

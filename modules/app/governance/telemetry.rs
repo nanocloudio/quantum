@@ -10,8 +10,7 @@
 //! rollup per `rollup_interval_ms`.
 
 use super::abi::SyscallTable;
-use super::{dev_log, dev_millis, dev_channel_port, wire};
-
+use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 const MAX_KEYS: usize = 4096;
 
@@ -25,7 +24,7 @@ struct MetricKey {
     metric_id: u8,
     key_hash: u64,
     counter: u64,
-    sum: u64,           // for histogram-like aggregations
+    sum: u64, // for histogram-like aggregations
     last_update_ms: u64,
     active: u8,
 }
@@ -33,8 +32,15 @@ struct MetricKey {
 impl MetricKey {
     const fn zero() -> Self {
         Self {
-            tenant: 0, protocol: 0, prg: 0, metric_id: 0,
-            key_hash: 0, counter: 0, sum: 0, last_update_ms: 0, active: 0,
+            tenant: 0,
+            protocol: 0,
+            prg: 0,
+            metric_id: 0,
+            key_hash: 0,
+            counter: 0,
+            sum: 0,
+            last_update_ms: 0,
+            active: 0,
         }
     }
 }
@@ -42,7 +48,9 @@ impl MetricKey {
 /// Hash the dimensional components into a single u64 key.
 fn dim_hash(tenant: u32, protocol: u8, prg: u16, metric_id: u8) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in tenant.to_le_bytes().iter()
+    for b in tenant
+        .to_le_bytes()
+        .iter()
         .chain(core::iter::once(&protocol))
         .chain(prg.to_le_bytes().iter())
         .chain(core::iter::once(&metric_id))
@@ -69,8 +77,6 @@ pub struct Telemetry {
 
     buf: [u8; 256],
 }
-
-
 
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
@@ -102,9 +108,13 @@ pub unsafe fn step(s: &mut Telemetry, sys: &SyscallTable) {
             let mut rec = [0u8; 256];
             loop {
                 let poll = (sys.channel_poll)(s.in_ingest, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (_, plen) = wire::channel_read_msg(sys, s.in_ingest, &mut rec);
-                if plen == 0 { break; }
+                if plen == 0 {
+                    break;
+                }
                 let n = (plen as usize).min(rec.len());
                 on_sample(s, &rec[..n], now);
             }
@@ -132,7 +142,6 @@ pub unsafe fn step(s: &mut Telemetry, sys: &SyscallTable) {
                 s.rollups_emitted = s.rollups_emitted.wrapping_add(1);
             }
         }
-
     }
 }
 
@@ -141,7 +150,9 @@ pub unsafe fn step(s: &mut Telemetry, sys: &SyscallTable) {
 /// key by their dimensions; anything else falls back to a payload hash.
 pub fn on_sample(s: &mut Telemetry, payload: &[u8], now: u64) {
     let plen = payload.len().min(s.buf.len());
-    if plen == 0 { return; }
+    if plen == 0 {
+        return;
+    }
     s.buf[..plen].copy_from_slice(&payload[..plen]);
     s.total_ingested = s.total_ingested.wrapping_add(1);
 
@@ -151,7 +162,13 @@ pub fn on_sample(s: &mut Telemetry, payload: &[u8], now: u64) {
         let protocol = s.buf[5];
         let prg = u16::from_le_bytes([s.buf[6], s.buf[7]]);
         let metric_id = s.buf[8];
-        (tenant, protocol, prg, metric_id, dim_hash(tenant, protocol, prg, metric_id))
+        (
+            tenant,
+            protocol,
+            prg,
+            metric_id,
+            dim_hash(tenant, protocol, prg, metric_id),
+        )
     } else {
         let h = wire::fnv1a_64(&s.buf[..plen]);
         (0u32, 0u8, 0u16, 0u8, h)
@@ -163,14 +180,24 @@ pub fn on_sample(s: &mut Telemetry, payload: &[u8], now: u64) {
         s.keys[idx].counter = s.keys[idx].counter.wrapping_add(1);
         // Track sum of first u64 in payload as a crude accumulator
         if plen >= 17 {
-            let v = u64::from_le_bytes([s.buf[9], s.buf[10], s.buf[11], s.buf[12], s.buf[13], s.buf[14], s.buf[15], s.buf[16]]);
+            let v = u64::from_le_bytes([
+                s.buf[9], s.buf[10], s.buf[11], s.buf[12], s.buf[13], s.buf[14], s.buf[15],
+                s.buf[16],
+            ]);
             s.keys[idx].sum = s.keys[idx].sum.wrapping_add(v);
         }
         s.keys[idx].last_update_ms = now;
     } else if s.keys[idx].active == 0 {
         s.keys[idx] = MetricKey {
-            tenant, protocol, prg, metric_id,
-            key_hash, counter: 1, sum: 0, last_update_ms: now, active: 1,
+            tenant,
+            protocol,
+            prg,
+            metric_id,
+            key_hash,
+            counter: 1,
+            sum: 0,
+            last_update_ms: now,
+            active: 1,
         };
     } else {
         s.cardinality_violations = s.cardinality_violations.wrapping_add(1);

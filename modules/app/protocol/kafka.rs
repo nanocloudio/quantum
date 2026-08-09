@@ -10,8 +10,7 @@
 //! `RX_QUOTA` records off `in_raw` and `RESP_QUOTA` off `in_responses`.
 
 use super::abi::SyscallTable;
-use super::{dev_log, dev_millis, dev_channel_port, wire};
-
+use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 /// Per-connection reassembly capacity. Bounds the largest single Kafka
 /// request we accept; a request whose `size` field exceeds this closes
@@ -60,7 +59,12 @@ struct KConn {
 
 impl KConn {
     const fn zero() -> Self {
-        Self { conn_id: 0, active: 0, len: 0, buf: [0; RASM] }
+        Self {
+            conn_id: 0,
+            active: 0,
+            len: 0,
+            buf: [0; RASM],
+        }
     }
 }
 
@@ -112,12 +116,12 @@ pub unsafe fn set_advertised_host(s: &mut Kafka, d: *const u8, len: usize) {
     s.advertised_host_len = len as u8;
 }
 
-
-
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
 pub fn init(s: &mut Kafka) {
-    for c in s.conns.iter_mut() { *c = KConn::zero(); }
+    for c in s.conns.iter_mut() {
+        *c = KConn::zero();
+    }
     s.topics_seen_count = 0;
     s.next_producer_id = 0;
     s.advertised_host_len = 0;
@@ -140,9 +144,13 @@ pub fn finish_init(s: &mut Kafka) {
 /// rationale.
 /// # Safety
 unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     let total = 1 + bytes.len();
-    if total > OUT_BUF { return false; }
+    if total > OUT_BUF {
+        return false;
+    }
     let mut out = [0u8; OUT_BUF];
     out[0] = conn_id;
     out[1..total].copy_from_slice(bytes);
@@ -152,7 +160,9 @@ unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -
 
 fn find_conn(s: &mut Kafka, conn_id: u8) -> usize {
     for i in 0..KCONNS {
-        if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id { return i; }
+        if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
+            return i;
+        }
     }
     for i in 0..KCONNS {
         if s.conns[i].active == 0 {
@@ -171,10 +181,14 @@ fn find_conn(s: &mut Kafka, conn_id: u8) -> usize {
 }
 
 fn remember_topic(s: &mut Kafka, name: &[u8]) {
-    if name.is_empty() || name.len() > MAX_TOPIC_LEN { return; }
+    if name.is_empty() || name.len() > MAX_TOPIC_LEN {
+        return;
+    }
     let n = s.topics_seen_count as usize;
     for i in 0..n {
-        if &s.topics_seen[i][..s.topics_seen_len[i] as usize] == name { return; }
+        if &s.topics_seen[i][..s.topics_seen_len[i] as usize] == name {
+            return;
+        }
     }
     if n < MAX_TOPICS_SEEN {
         s.topics_seen[n][..name.len()].copy_from_slice(name);
@@ -188,11 +202,17 @@ fn remember_topic(s: &mut Kafka, name: &[u8]) {
 /// Frame `[size][corr][body]` into `s.frame` and send to the client.
 /// # Safety
 unsafe fn send_response(
-    s: &mut Kafka, sys: &SyscallTable, conn_id: u8, corr: i32, body_len: usize,
+    s: &mut Kafka,
+    sys: &SyscallTable,
+    conn_id: u8,
+    corr: i32,
+    body_len: usize,
 ) {
     // Body was built in s.scratch[..body_len].
     let total = 8 + body_len;
-    if total > OUT_BUF { return; }
+    if total > OUT_BUF {
+        return;
+    }
     s.frame[0..4].copy_from_slice(&((4 + body_len) as i32).to_be_bytes());
     s.frame[4..8].copy_from_slice(&corr.to_be_bytes());
     s.frame[8..total].copy_from_slice(&s.scratch[..body_len]);
@@ -226,15 +246,21 @@ fn build_api_versions(s: &mut Kafka, api_ver: i16) -> usize {
         (API_INIT_PRODUCER_ID, 0, 1),
     ];
     let mut p = 0usize;
-    s.scratch[p..p + 2].copy_from_slice(&error.to_be_bytes()); p += 2;
-    s.scratch[p..p + 4].copy_from_slice(&(KEYS.len() as i32).to_be_bytes()); p += 4;
+    s.scratch[p..p + 2].copy_from_slice(&error.to_be_bytes());
+    p += 2;
+    s.scratch[p..p + 4].copy_from_slice(&(KEYS.len() as i32).to_be_bytes());
+    p += 4;
     for &(k, mn, mx) in KEYS.iter() {
-        s.scratch[p..p + 2].copy_from_slice(&k.to_be_bytes()); p += 2;
-        s.scratch[p..p + 2].copy_from_slice(&mn.to_be_bytes()); p += 2;
-        s.scratch[p..p + 2].copy_from_slice(&mx.to_be_bytes()); p += 2;
+        s.scratch[p..p + 2].copy_from_slice(&k.to_be_bytes());
+        p += 2;
+        s.scratch[p..p + 2].copy_from_slice(&mn.to_be_bytes());
+        p += 2;
+        s.scratch[p..p + 2].copy_from_slice(&mx.to_be_bytes());
+        p += 2;
     }
     if !downgrade && api_ver >= 1 {
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
     }
     p
 }
@@ -247,25 +273,41 @@ fn build_api_versions(s: &mut Kafka, api_ver: i16) -> usize {
 fn put_metadata_topic(s: &mut Kafka, mut p: usize, name_idx: usize, v: i16) -> usize {
     let nlen = s.topics_seen_len[name_idx] as usize;
     let parts = s.partitions.clamp(1, 16) as usize;
-    s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2; // error
-    s.scratch[p..p + 2].copy_from_slice(&(nlen as i16).to_be_bytes()); p += 2;
+    s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+    p += 2; // error
+    s.scratch[p..p + 2].copy_from_slice(&(nlen as i16).to_be_bytes());
+    p += 2;
     let name = s.topics_seen[name_idx];
-    s.scratch[p..p + nlen].copy_from_slice(&name[..nlen]); p += nlen;
-    if v >= 1 { s.scratch[p] = 0; p += 1; } // is_internal = false
-    s.scratch[p..p + 4].copy_from_slice(&(parts as i32).to_be_bytes()); p += 4;
+    s.scratch[p..p + nlen].copy_from_slice(&name[..nlen]);
+    p += nlen;
+    if v >= 1 {
+        s.scratch[p] = 0;
+        p += 1;
+    } // is_internal = false
+    s.scratch[p..p + 4].copy_from_slice(&(parts as i32).to_be_bytes());
+    p += 4;
     for part in 0..parts {
-        s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2; // error
-        s.scratch[p..p + 4].copy_from_slice(&(part as i32).to_be_bytes()); p += 4;
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // leader
+        s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+        p += 2; // error
+        s.scratch[p..p + 4].copy_from_slice(&(part as i32).to_be_bytes());
+        p += 4;
+        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // leader
         if v >= 7 {
-            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // leader_epoch
+            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+            p += 4; // leader_epoch
         }
-        s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4; // replicas: [0]
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
-        s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4; // isr: [0]
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+        s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+        p += 4; // replicas: [0]
+        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
+        s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+        p += 4; // isr: [0]
+        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4;
         if v >= 5 {
-            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // offline: []
+            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+            p += 4; // offline: []
         }
     }
     p
@@ -285,10 +327,14 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
             all = false;
             let mut off = 4usize;
             for _ in 0..count.min(MAX_TOPICS_SEEN as i32) {
-                if off + 2 > req.len() { break; }
+                if off + 2 > req.len() {
+                    break;
+                }
                 let nlen = i16::from_be_bytes([req[off], req[off + 1]]) as usize;
                 off += 2;
-                if off + nlen > req.len() || nlen == 0 || nlen > MAX_TOPIC_LEN { break; }
+                if off + nlen > req.len() || nlen == 0 || nlen > MAX_TOPIC_LEN {
+                    break;
+                }
                 let mut name = [0u8; MAX_TOPIC_LEN];
                 name[..nlen].copy_from_slice(&req[off..off + nlen]);
                 off += nlen;
@@ -296,7 +342,7 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
                 // Locate index in topics_seen (remember_topic guarantees
                 // presence unless the table is full).
                 for i in 0..s.topics_seen_count as usize {
-                    if &s.topics_seen[i][..s.topics_seen_len[i] as usize] == &name[..nlen]
+                    if s.topics_seen[i][..s.topics_seen_len[i] as usize] == name[..nlen]
                         && want_n < MAX_TOPICS_SEEN
                     {
                         want[want_n] = i;
@@ -311,33 +357,45 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
     }
     if all {
         want_n = s.topics_seen_count as usize;
-        for (i, w) in want.iter_mut().enumerate().take(want_n) { *w = i; }
+        for (i, w) in want.iter_mut().enumerate().take(want_n) {
+            *w = i;
+        }
     }
 
     let mut p = 0usize;
     if v >= 3 {
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // throttle
+        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // throttle
     }
     // brokers: [1 broker: node 0, advertised host:port, rack null (v1+)]
-    s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes()); p += 4;
-    s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // node_id
+    s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    p += 4;
+    s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+    p += 4; // node_id
     let hlen = s.advertised_host_len as usize;
-    s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes()); p += 2;
+    s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes());
+    p += 2;
     let host = s.advertised_host;
-    s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]); p += hlen;
-    s.scratch[p..p + 4].copy_from_slice(&(s.advertised_port as i32).to_be_bytes()); p += 4;
+    s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]);
+    p += hlen;
+    s.scratch[p..p + 4].copy_from_slice(&(s.advertised_port as i32).to_be_bytes());
+    p += 4;
     if v >= 1 {
-        s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes()); p += 2; // rack null
+        s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+        p += 2; // rack null
     }
     if v >= 2 {
-        s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes()); p += 2; // cluster_id null
+        s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+        p += 2; // cluster_id null
     }
     if v >= 1 {
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // controller_id
+        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // controller_id
     }
-    s.scratch[p..p + 4].copy_from_slice(&(want_n as i32).to_be_bytes()); p += 4;
-    for i in 0..want_n {
-        p = put_metadata_topic(s, p, want[i], v);
+    s.scratch[p..p + 4].copy_from_slice(&(want_n as i32).to_be_bytes());
+    p += 4;
+    for w in want.iter().take(want_n) {
+        p = put_metadata_topic(s, p, *w, v);
     }
     p
 }
@@ -347,10 +405,18 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
 /// Process one complete Kafka request sitting at `conn.buf[off..off+total]`.
 /// # Safety
 unsafe fn handle_request(
-    s: &mut Kafka, sys: &SyscallTable, conn_id: u8, ci: usize, off: usize, total: usize,
+    s: &mut Kafka,
+    sys: &SyscallTable,
+    conn_id: u8,
+    ci: usize,
+    off: usize,
+    total: usize,
 ) {
     let req = &s.conns[ci].buf[off..off + total];
-    if total < 12 { s.parse_errors = s.parse_errors.wrapping_add(1); return; }
+    if total < 12 {
+        s.parse_errors = s.parse_errors.wrapping_add(1);
+        return;
+    }
     let api_key = i16::from_be_bytes([req[4], req[5]]);
     let api_ver = i16::from_be_bytes([req[6], req[7]]);
     let corr = i32::from_be_bytes([req[8], req[9], req[10], req[11]]);
@@ -362,7 +428,10 @@ unsafe fn handle_request(
         body_off += 2;
         if cl > 0 {
             body_off += cl as usize;
-            if body_off > total { s.parse_errors = s.parse_errors.wrapping_add(1); return; }
+            if body_off > total {
+                s.parse_errors = s.parse_errors.wrapping_add(1);
+                return;
+            }
         }
     } else {
         s.parse_errors = s.parse_errors.wrapping_add(1);
@@ -379,7 +448,10 @@ unsafe fn handle_request(
             // Copy the request body into `frame` (as scratch input) so
             // build_metadata can borrow it while writing s.scratch.
             let body_len = total - body_off;
-            if body_len > OUT_BUF { s.parse_errors = s.parse_errors.wrapping_add(1); return; }
+            if body_len > OUT_BUF {
+                s.parse_errors = s.parse_errors.wrapping_add(1);
+                return;
+            }
             core::ptr::copy_nonoverlapping(
                 s.conns[ci].buf.as_ptr().add(off + body_off),
                 s.frame.as_mut_ptr(),
@@ -400,16 +472,23 @@ unsafe fn handle_request(
             let port = s.advertised_port as i32;
             let mut p = 0usize;
             if api_ver >= 1 {
-                s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
+                s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+                p += 4;
             }
-            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
+            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
             if api_ver >= 1 {
-                s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes()); p += 2;
+                s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+                p += 2;
             }
-            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4; // node 0
-            s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes()); p += 2;
-            s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]); p += hlen;
-            s.scratch[p..p + 4].copy_from_slice(&port.to_be_bytes()); p += 4;
+            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+            p += 4; // node 0
+            s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes());
+            p += 2;
+            s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]);
+            p += hlen;
+            s.scratch[p..p + 4].copy_from_slice(&port.to_be_bytes());
+            p += 4;
             send_response(s, sys, conn_id, corr, p);
         }
         API_INIT_PRODUCER_ID => {
@@ -420,15 +499,18 @@ unsafe fn handle_request(
             s.next_producer_id = s.next_producer_id.wrapping_add(1);
             let pid = s.next_producer_id as i64;
             let mut p = 0usize;
-            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes()); p += 4;
-            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
-            s.scratch[p..p + 8].copy_from_slice(&pid.to_be_bytes()); p += 8;
-            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes()); p += 2;
+            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+            p += 4;
+            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
+            s.scratch[p..p + 8].copy_from_slice(&pid.to_be_bytes());
+            p += 8;
+            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            p += 2;
             send_response(s, sys, conn_id, corr, p);
         }
-        API_PRODUCE | API_FETCH | API_LIST_OFFSETS | API_OFFSET_COMMIT
-        | API_OFFSET_FETCH | API_JOIN_GROUP | API_HEARTBEAT
-        | API_LEAVE_GROUP | API_SYNC_GROUP => {
+        API_PRODUCE | API_FETCH | API_LIST_OFFSETS | API_OFFSET_COMMIT | API_OFFSET_FETCH
+        | API_JOIN_GROUP | API_HEARTBEAT | API_LEAVE_GROUP | API_SYNC_GROUP => {
             // Envelope: [conn_id][proto=1][api_key LE][api_ver LE][corr LE][body]
             let body_len = total - body_off;
             let env_len = 10 + body_len;
@@ -448,7 +530,10 @@ unsafe fn handle_request(
             );
             let out = s.out_proposals;
             let w = wire::channel_write_msg(
-                sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..10 + body_len],
+                sys,
+                out,
+                wire::MSG_SESSION_PROPOSAL,
+                &s.scratch[..10 + body_len],
             );
             if w <= 0 {
                 // codec_in saturated — drop; producer retries on timeout.
@@ -477,13 +562,16 @@ unsafe fn handle_request(
 pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[u8]) {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-
         // Stage the record exactly as the channel read did:
         // `frame` holds `[conn_id][tcp chunk]`.
         let n = payload.len();
-        if n > s.frame.len() { return; }
+        if n > s.frame.len() {
+            return;
+        }
         s.frame[..n].copy_from_slice(payload);
-        if n < 1 { return; }
+        if n < 1 {
+            return;
+        }
         let conn_id = s.frame[0];
 
         // Connection closed: release this conn's reassembly slot and
@@ -499,13 +587,13 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             // that type already means "MQTT DISCONNECT packet" on this
             // fan-in lane and is claimed by session_processor's MQTT
             // path). session_processor releases conn-keyed state on it.
-            let mut cb = [conn_id];
-            wire::channel_write_msg(
-                sys, s.out_proposals, wire::MSG_CONN_CLOSED, &mut cb,
-            );
+            let cb = [conn_id];
+            wire::channel_write_msg(sys, s.out_proposals, wire::MSG_CONN_CLOSED, &cb);
             return;
         }
-        if n <= 1 { return; }
+        if n <= 1 {
+            return;
+        }
         let data_len = n - 1;
         let ci = find_conn(s, conn_id);
 
@@ -529,7 +617,9 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
         let mut off = 0usize;
         let mut avail = s.conns[ci].len as usize;
         loop {
-            if avail < 4 { break; }
+            if avail < 4 {
+                break;
+            }
             let size = i32::from_be_bytes([
                 s.conns[ci].buf[off],
                 s.conns[ci].buf[off + 1],
@@ -545,7 +635,9 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
                 break;
             }
             let total = 4 + size as usize;
-            if avail < total { break; }
+            if avail < total {
+                break;
+            }
             handle_request(s, sys, conn_id, ci, off, total);
             off += total;
             avail -= total;
@@ -558,7 +650,9 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
                 avail,
             );
         }
-        if off > 0 { s.conns[ci].len = avail as u16; }
+        if off > 0 {
+            s.conns[ci].len = avail as u16;
+        }
     }
 }
 

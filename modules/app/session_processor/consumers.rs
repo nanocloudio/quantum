@@ -29,8 +29,7 @@
 //! over fixed tables and returns without blocking.
 
 use super::{
-    ACONSUMERS, AMQP_TAG_MAX, KAFKA_MAX_TOPIC, KGROUPS, KGROUP_MEMBERS, KG_META, KG_NAME,
-    KOFFSETS,
+    ACONSUMERS, AMQP_TAG_MAX, KAFKA_MAX_TOPIC, KGROUPS, KGROUP_MEMBERS, KG_META, KG_NAME, KOFFSETS,
 };
 
 #[repr(C)]
@@ -54,9 +53,15 @@ struct KGroupMember {
 impl KGroupMember {
     const fn zero() -> Self {
         Self {
-            active: 0, id_len: 0, conn_id: 0, _pad: 0,
-            meta_len: 0, assign_len: 0,
-            id: [0; KG_NAME], meta: [0; KG_META], assign: [0; KG_META],
+            active: 0,
+            id_len: 0,
+            conn_id: 0,
+            _pad: 0,
+            meta_len: 0,
+            assign_len: 0,
+            id: [0; KG_NAME],
+            meta: [0; KG_META],
+            assign: [0; KG_META],
         }
     }
 }
@@ -78,9 +83,14 @@ struct KGroup {
 impl KGroup {
     const fn zero() -> Self {
         Self {
-            active: 0, name_len: 0, proto_len: 0, _pad: 0,
-            generation: 0, member_seq: 0,
-            name: [0; KG_NAME], proto: [0; 16],
+            active: 0,
+            name_len: 0,
+            proto_len: 0,
+            _pad: 0,
+            generation: 0,
+            member_seq: 0,
+            name: [0; KG_NAME],
+            proto: [0; 16],
             members: [KGroupMember::zero(); KGROUP_MEMBERS],
         }
     }
@@ -103,9 +113,15 @@ struct KOffset {
 impl KOffset {
     const fn zero() -> Self {
         Self {
-            active: 0, group_len: 0, topic_len: 0, _pad: 0,
-            partition: 0, _pad2: 0, offset: -1,
-            group: [0; KG_NAME], topic: [0; KAFKA_MAX_TOPIC],
+            active: 0,
+            group_len: 0,
+            topic_len: 0,
+            _pad: 0,
+            partition: 0,
+            _pad2: 0,
+            offset: -1,
+            group: [0; KG_NAME],
+            topic: [0; KAFKA_MAX_TOPIC],
         }
     }
 }
@@ -140,24 +156,37 @@ struct AmqpConsumer {
 impl AmqpConsumer {
     const fn zero() -> Self {
         Self {
-            active: 0, conn_id: 0, no_ack: 0, tag_len: 0, queue_len: 0,
-            _pad: 0, channel: 0, prefetch: 0, unacked: 0,
-            next_dtag: 1, last_acked_dtag: 0, cursor: 0,
-            tag: [0; AMQP_TAG_MAX], queue: [0; KAFKA_MAX_TOPIC],
+            active: 0,
+            conn_id: 0,
+            no_ack: 0,
+            tag_len: 0,
+            queue_len: 0,
+            _pad: 0,
+            channel: 0,
+            prefetch: 0,
+            unacked: 0,
+            next_dtag: 1,
+            last_acked_dtag: 0,
+            cursor: 0,
+            tag: [0; AMQP_TAG_MAX],
+            queue: [0; KAFKA_MAX_TOPIC],
         }
     }
 }
 
 fn group_find_idx(s: &Consumers, name: &[u8]) -> Option<usize> {
     (0..KGROUPS).find(|&i| {
-        s.groups[i].active == 1
-            && &s.groups[i].name[..s.groups[i].name_len as usize] == name
+        s.groups[i].active == 1 && &s.groups[i].name[..s.groups[i].name_len as usize] == name
     })
 }
 
 fn group_find_or_create_idx(s: &mut Consumers, name: &[u8]) -> Option<usize> {
-    if name.is_empty() || name.len() > KG_NAME { return None; }
-    if let Some(i) = group_find_idx(s, name) { return Some(i); }
+    if name.is_empty() || name.len() > KG_NAME {
+        return None;
+    }
+    if let Some(i) = group_find_idx(s, name) {
+        return Some(i);
+    }
     for i in 0..KGROUPS {
         if s.groups[i].active == 0 {
             s.groups[i] = KGroup::zero();
@@ -173,8 +202,7 @@ fn group_find_or_create_idx(s: &mut Consumers, name: &[u8]) -> Option<usize> {
 
 fn member_idx(g: &KGroup, id: &[u8]) -> Option<usize> {
     (0..KGROUP_MEMBERS).find(|&i| {
-        g.members[i].active == 1
-            && &g.members[i].id[..g.members[i].id_len as usize] == id
+        g.members[i].active == 1 && &g.members[i].id[..g.members[i].id_len as usize] == id
     })
 }
 
@@ -184,7 +212,9 @@ fn leader_idx(g: &KGroup) -> Option<usize> {
 }
 
 pub fn offset_store(s: &mut Consumers, group: &[u8], topic: &[u8], partition: u16, offset: i64) {
-    if group.len() > KG_NAME || topic.len() > KAFKA_MAX_TOPIC { return; }
+    if group.len() > KG_NAME || topic.len() > KAFKA_MAX_TOPIC {
+        return;
+    }
     for i in 0..KOFFSETS {
         let o = &s.offsets[i];
         if o.active == 1
@@ -234,9 +264,15 @@ pub struct Consumers {
 }
 
 pub fn init(s: &mut Consumers) {
-    for g in s.groups.iter_mut() { *g = KGroup::zero(); }
-    for o in s.offsets.iter_mut() { *o = KOffset::zero(); }
-    for c in s.amqp.iter_mut() { *c = AmqpConsumer::zero(); }
+    for g in s.groups.iter_mut() {
+        *g = KGroup::zero();
+    }
+    for o in s.offsets.iter_mut() {
+        *o = KOffset::zero();
+    }
+    for c in s.amqp.iter_mut() {
+        *c = AmqpConsumer::zero();
+    }
 }
 
 // ── Groups ──────────────────────────────────────────────────────────
@@ -250,15 +286,27 @@ pub fn group_find_or_create(s: &mut Consumers, name: &[u8]) -> Option<usize> {
 }
 
 pub fn group_generation(s: &Consumers, gi: usize) -> i32 {
-    if gi < KGROUPS { s.groups[gi].generation } else { 0 }
+    if gi < KGROUPS {
+        s.groups[gi].generation
+    } else {
+        0
+    }
 }
 
 pub fn group_leader(s: &Consumers, gi: usize) -> Option<usize> {
-    if gi < KGROUPS { leader_idx(&s.groups[gi]) } else { None }
+    if gi < KGROUPS {
+        leader_idx(&s.groups[gi])
+    } else {
+        None
+    }
 }
 
 pub fn member_find(s: &Consumers, gi: usize, id: &[u8]) -> Option<usize> {
-    if gi < KGROUPS { member_idx(&s.groups[gi], id) } else { None }
+    if gi < KGROUPS {
+        member_idx(&s.groups[gi], id)
+    } else {
+        None
+    }
 }
 
 pub fn member_active(s: &Consumers, gi: usize, mi: usize) -> bool {
@@ -267,30 +315,38 @@ pub fn member_active(s: &Consumers, gi: usize, mi: usize) -> bool {
 
 /// Copy the group's protocol name out. Returns its length.
 pub fn group_proto_into(s: &Consumers, gi: usize, dst: &mut [u8]) -> usize {
-    if gi >= KGROUPS { return 0; }
+    if gi >= KGROUPS {
+        return 0;
+    }
     let n = (s.groups[gi].proto_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.groups[gi].proto[i]; }
+    dst[..n].copy_from_slice(&s.groups[gi].proto[..n]);
     n
 }
 
 pub fn member_id_into(s: &Consumers, gi: usize, mi: usize, dst: &mut [u8]) -> usize {
-    if !member_active(s, gi, mi) { return 0; }
+    if !member_active(s, gi, mi) {
+        return 0;
+    }
     let n = (s.groups[gi].members[mi].id_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.groups[gi].members[mi].id[i]; }
+    dst[..n].copy_from_slice(&s.groups[gi].members[mi].id[..n]);
     n
 }
 
 pub fn member_meta_into(s: &Consumers, gi: usize, mi: usize, dst: &mut [u8]) -> usize {
-    if !member_active(s, gi, mi) { return 0; }
+    if !member_active(s, gi, mi) {
+        return 0;
+    }
     let n = (s.groups[gi].members[mi].meta_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.groups[gi].members[mi].meta[i]; }
+    dst[..n].copy_from_slice(&s.groups[gi].members[mi].meta[..n]);
     n
 }
 
 pub fn member_assignment_into(s: &Consumers, gi: usize, mi: usize, dst: &mut [u8]) -> usize {
-    if !member_active(s, gi, mi) { return 0; }
+    if !member_active(s, gi, mi) {
+        return 0;
+    }
     let n = (s.groups[gi].members[mi].assign_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.groups[gi].members[mi].assign[i]; }
+    dst[..n].copy_from_slice(&s.groups[gi].members[mi].assign[..n]);
     n
 }
 
@@ -298,28 +354,34 @@ pub fn member_assignment_into(s: &Consumers, gi: usize, mi: usize, dst: &mut [u8
 /// ("qm-<seq>"), written into `dst`. Returns its length. Consumes a
 /// sequence number, so call once per join that needs one.
 pub fn next_member_id(s: &mut Consumers, gi: usize, dst: &mut [u8]) -> usize {
-    if gi >= KGROUPS || dst.len() < 13 { return 0; }
+    if gi >= KGROUPS || dst.len() < 13 {
+        return 0;
+    }
     s.groups[gi].member_seq = s.groups[gi].member_seq.wrapping_add(1);
     let mut n = s.groups[gi].member_seq;
-    dst[0] = b'q'; dst[1] = b'm'; dst[2] = b'-';
+    dst[0] = b'q';
+    dst[1] = b'm';
+    dst[2] = b'-';
     let mut digits = [0u8; 10];
     let mut d = 0;
     loop {
         digits[d] = b'0' + (n % 10) as u8;
         n /= 10;
         d += 1;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
-    for k in 0..d { dst[3 + k] = digits[d - 1 - k]; }
+    for k in 0..d {
+        dst[3 + k] = digits[d - 1 - k];
+    }
     3 + d
 }
 
 /// Admit a member. Returns its index, or None when the member table is
 /// full. A member that is already present is returned as-is; a new one
 /// bumps the generation, because membership changed.
-pub fn member_join(
-    s: &mut Consumers, gi: usize, id: &[u8], conn_id: u8,
-) -> Option<usize> {
+pub fn member_join(s: &mut Consumers, gi: usize, id: &[u8], conn_id: u8) -> Option<usize> {
     if gi >= KGROUPS || id.is_empty() || id.len() > KG_NAME {
         return None;
     }
@@ -332,42 +394,46 @@ pub fn member_join(
     m.active = 1;
     m.id_len = id.len() as u8;
     m.conn_id = conn_id;
-    for i in 0..id.len() { m.id[i] = id[i]; }
+    m.id[..id.len()].copy_from_slice(id);
     s.groups[gi].generation = s.groups[gi].generation.wrapping_add(1);
     Some(free)
 }
 
 /// Record the member's subscription metadata and the group's protocol
 /// name, as carried by JoinGroup.
-pub fn member_set_meta(
-    s: &mut Consumers, gi: usize, mi: usize, meta: &[u8], proto: &[u8],
-) {
-    if !member_active(s, gi, mi) { return; }
+pub fn member_set_meta(s: &mut Consumers, gi: usize, mi: usize, meta: &[u8], proto: &[u8]) {
+    if !member_active(s, gi, mi) {
+        return;
+    }
     let n = meta.len().min(KG_META);
     s.groups[gi].members[mi].meta_len = n as u16;
-    for i in 0..n { s.groups[gi].members[mi].meta[i] = meta[i]; }
+    s.groups[gi].members[mi].meta[..n].copy_from_slice(&meta[..n]);
     let p = proto.len().min(16);
     s.groups[gi].proto_len = p as u8;
-    for i in 0..p { s.groups[gi].proto[i] = proto[i]; }
+    s.groups[gi].proto[..p].copy_from_slice(&proto[..p]);
 }
 
 /// Store one member's assignment, as pushed by the group leader in
 /// SyncGroup. False if the member is unknown.
-pub fn member_set_assignment(
-    s: &mut Consumers, gi: usize, id: &[u8], assign: &[u8],
-) -> bool {
-    if gi >= KGROUPS { return false; }
-    let Some(mi) = member_idx(&s.groups[gi], id) else { return false; };
+pub fn member_set_assignment(s: &mut Consumers, gi: usize, id: &[u8], assign: &[u8]) -> bool {
+    if gi >= KGROUPS {
+        return false;
+    }
+    let Some(mi) = member_idx(&s.groups[gi], id) else {
+        return false;
+    };
     let n = assign.len().min(KG_META);
     s.groups[gi].members[mi].assign_len = n as u16;
-    for i in 0..n { s.groups[gi].members[mi].assign[i] = assign[i]; }
+    s.groups[gi].members[mi].assign[..n].copy_from_slice(&assign[..n]);
     true
 }
 
 /// Release a member. Bumps the generation, and deactivates the group
 /// once its last member is gone so a stale name cannot hold a slot.
 pub fn member_leave(s: &mut Consumers, gi: usize, mi: usize) {
-    if !member_active(s, gi, mi) { return; }
+    if !member_active(s, gi, mi) {
+        return;
+    }
     s.groups[gi].members[mi] = KGroupMember::zero();
     s.groups[gi].generation = s.groups[gi].generation.wrapping_add(1);
     if leader_idx(&s.groups[gi]).is_none() {
@@ -438,16 +504,20 @@ pub fn consumer_in_credit(s: &Consumers, ci: usize) -> bool {
 }
 
 pub fn consumer_queue_into(s: &Consumers, ci: usize, dst: &mut [u8]) -> usize {
-    if !consumer_active(s, ci) { return 0; }
+    if !consumer_active(s, ci) {
+        return 0;
+    }
     let n = (s.amqp[ci].queue_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.amqp[ci].queue[i]; }
+    dst[..n].copy_from_slice(&s.amqp[ci].queue[..n]);
     n
 }
 
 pub fn consumer_tag_into(s: &Consumers, ci: usize, dst: &mut [u8]) -> usize {
-    if !consumer_active(s, ci) { return 0; }
+    if !consumer_active(s, ci) {
+        return 0;
+    }
     let n = (s.amqp[ci].tag_len as usize).min(dst.len());
-    for i in 0..n { dst[i] = s.amqp[ci].tag[i]; }
+    dst[..n].copy_from_slice(&s.amqp[ci].tag[..n]);
     n
 }
 
@@ -466,10 +536,20 @@ pub fn consumer_slot(s: &Consumers, conn_id: u8, channel: u16) -> Option<usize> 
 /// Register a Basic.Consume. `cursor` is where delivery starts — the
 /// caller passes the queue's current Get cursor so Get-consumed
 /// messages are not redelivered.
-#[allow(clippy::too_many_arguments, reason = "one registration record, passed flat")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one registration record, passed flat"
+)]
 pub fn consumer_register(
-    s: &mut Consumers, ci: usize, conn_id: u8, channel: u16, no_ack: bool,
-    prefetch: u16, tag: &[u8], queue: &[u8], cursor: u64,
+    s: &mut Consumers,
+    ci: usize,
+    conn_id: u8,
+    channel: u16,
+    no_ack: bool,
+    prefetch: u16,
+    tag: &[u8],
+    queue: &[u8],
+    cursor: u64,
 ) {
     if ci >= ACONSUMERS {
         return;
@@ -485,8 +565,8 @@ pub fn consumer_register(
     let ql = queue.len().min(KAFKA_MAX_TOPIC);
     c.tag_len = tl as u8;
     c.queue_len = ql as u8;
-    for i in 0..tl { c.tag[i] = tag[i]; }
-    for i in 0..ql { c.queue[i] = queue[i]; }
+    c.tag[..tl].copy_from_slice(&tag[..tl]);
+    c.queue[..ql].copy_from_slice(&queue[..ql]);
     c.cursor = cursor;
 }
 
@@ -576,12 +656,12 @@ pub fn consumer_ack(s: &mut Consumers, ci: usize, dt: u64, multiple: bool) -> u6
 pub fn release_conn(s: &mut Consumers, conn_id: u8) -> u32 {
     let mut released = 0;
     for gi in 0..KGROUPS {
-        if s.groups[gi].active != 1 { continue; }
+        if s.groups[gi].active != 1 {
+            continue;
+        }
         let mut changed = false;
         for mi in 0..KGROUP_MEMBERS {
-            if s.groups[gi].members[mi].active == 1
-                && s.groups[gi].members[mi].conn_id == conn_id
-            {
+            if s.groups[gi].members[mi].active == 1 && s.groups[gi].members[mi].conn_id == conn_id {
                 s.groups[gi].members[mi] = KGroupMember::zero();
                 changed = true;
                 released += 1;

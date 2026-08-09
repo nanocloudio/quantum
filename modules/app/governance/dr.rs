@@ -11,8 +11,7 @@
 //! and at most one promotion transition per tick.
 
 use super::abi::SyscallTable;
-use super::{dev_log, dev_millis, dev_channel_port, wire};
-
+use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 const STATE_IDLE: u8 = 0;
 const STATE_CHECKPOINT_EXPORTING: u8 = 1;
@@ -22,11 +21,11 @@ const STATE_PROMOTING: u8 = 4;
 
 #[repr(C)]
 pub struct Dr {
-    pub in_wal_signal: i32,       // in[0]: compaction signal from wal
-    pub in_snapshot_resp: i32,    // in[1]: snapshot export completion
-    pub in_promotion_req: i32,    // in[2]: promotion request from operations
-    pub out_snapshot_req: i32,    // out[0]: snapshot trigger to durability
-    pub out_promotion: i32,       // out[1]: promotion command to operations
+    pub in_wal_signal: i32,    // in[0]: compaction signal from wal
+    pub in_snapshot_resp: i32, // in[1]: snapshot export completion
+    pub in_promotion_req: i32, // in[2]: promotion request from operations
+    pub out_snapshot_req: i32, // out[0]: snapshot trigger to durability
+    pub out_promotion: i32,    // out[1]: promotion command to operations
 
     checkpoint_interval_s: u32,
     wal_archive_interval_s: u32,
@@ -42,8 +41,6 @@ pub struct Dr {
 
     buf: [u8; 128],
 }
-
-
 
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
@@ -68,10 +65,15 @@ pub unsafe fn step(s: &mut Dr, sys: &SyscallTable, out: &mut super::Outbox) {
         if s.in_wal_signal >= 0 {
             loop {
                 let poll = (sys.channel_poll)(s.in_wal_signal, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (_, plen) = wire::channel_read_msg(sys, s.in_wal_signal, &mut s.buf);
                 if plen >= 8 {
-                    s.wal_cursor_index = u64::from_le_bytes([s.buf[0], s.buf[1], s.buf[2], s.buf[3], s.buf[4], s.buf[5], s.buf[6], s.buf[7]]);
+                    s.wal_cursor_index = u64::from_le_bytes([
+                        s.buf[0], s.buf[1], s.buf[2], s.buf[3], s.buf[4], s.buf[5], s.buf[6],
+                        s.buf[7],
+                    ]);
                 }
             }
         }
@@ -80,7 +82,9 @@ pub unsafe fn step(s: &mut Dr, sys: &SyscallTable, out: &mut super::Outbox) {
         if s.in_snapshot_resp >= 0 {
             loop {
                 let poll = (sys.channel_poll)(s.in_snapshot_resp, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (_, _plen) = wire::channel_read_msg(sys, s.in_snapshot_resp, &mut s.buf);
                 if s.state == STATE_CHECKPOINT_EXPORTING {
                     s.state = STATE_IDLE;
@@ -93,10 +97,16 @@ pub unsafe fn step(s: &mut Dr, sys: &SyscallTable, out: &mut super::Outbox) {
         if s.in_promotion_req >= 0 {
             loop {
                 let poll = (sys.channel_poll)(s.in_promotion_req, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (_, _plen) = wire::channel_read_msg(sys, s.in_promotion_req, &mut s.buf);
                 if s.state == STATE_IDLE {
-                    s.state = if s.fence_commit_required == 1 { STATE_FENCING } else { STATE_PROMOTING };
+                    s.state = if s.fence_commit_required == 1 {
+                        STATE_FENCING
+                    } else {
+                        STATE_PROMOTING
+                    };
                     // Audit: promotion started.
                     let mut ev = [0u8; 2];
                     ev[0] = 5; // AUDIT_DR_EVENT
@@ -130,7 +140,7 @@ pub unsafe fn step(s: &mut Dr, sys: &SyscallTable, out: &mut super::Outbox) {
                 // Emit promotion command to operations
                 if s.out_promotion >= 0 {
                     let mut p = [0u8; 9];
-                    p[0] = 1;  // controlled
+                    p[0] = 1; // controlled
                     p[1..9].copy_from_slice(&s.wal_cursor_index.to_le_bytes());
                     let poll = (sys.channel_poll)(s.out_promotion, 0x02);
                     if poll > 0 && (poll as u32 & 0x02) != 0 {
@@ -175,13 +185,13 @@ pub unsafe fn step(s: &mut Dr, sys: &SyscallTable, out: &mut super::Outbox) {
         }
 
         // Metrics
-        if (now / 1000) % 10 == 0 {            let mut m = [0u8; 16];
+        if (now / 1000).is_multiple_of(10) {
+            let mut m = [0u8; 16];
             m[0..4].copy_from_slice(&s.checkpoints_shipped.to_le_bytes());
             m[4..8].copy_from_slice(&s.archives_shipped.to_le_bytes());
             m[8..12].copy_from_slice(&s.promotions.to_le_bytes());
             m[12] = s.state;
             out.metrics.push(wire::MSG_METRICS, &m);
         }
-
     }
 }

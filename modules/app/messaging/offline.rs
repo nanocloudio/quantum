@@ -244,4 +244,3 @@ pub fn metrics(o: &Offline, m: &mut [u8; 24]) -> usize {
     m[20..24].copy_from_slice(&active.to_le_bytes());
     24
 }
-

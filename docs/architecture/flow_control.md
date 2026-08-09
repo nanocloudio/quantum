@@ -29,7 +29,7 @@ something they already know how to interpret.
 |---|---|---|---|
 | **Proposal admission** | `admission` (Clustor) | Node-wide singleton | Replication lag signal from `consensus.lag_signal` (Q16.16 PID over entry + byte credits) |
 | **Consumer prefetch** | `flow`'s prefetch component (Quantum) | Per-session | Apply-to-delivery queue depth |
-| **Backpressure translation** | `flow`'s backpressure component (Quantum) | Per-protocol | Queue depths + envelope from `admission` |
+| **Backpressure translation** | `flow`'s backpressure component (Quantum) | Per-protocol | Queue depths + rejects from `gateway` |
 
 The split is deliberate. Proposal admission is a node-level resource
 decision (do we have headroom to accept another publish into the WAL
@@ -91,6 +91,13 @@ ramp back to the configured maximum.
 The operational observability surface for flow control. Tracks queue
 depths, evaluates configurable thresholds, and emits per-protocol
 metrics that operators watch on dashboards.
+
+The component also has an `envelope_in` port and an `on_envelope`
+handler for a substrate-supplied throttle envelope, but **no graph wires
+it**: Clustor retired `admission.envelope` as a dead port (it was
+declared and never written), so today the translation runs on queue
+depths and `gateway.rejected` alone. Reinstating the envelope path needs
+a substrate-side decision about what emits it.
 
 ### Queue depth thresholds
 

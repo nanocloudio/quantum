@@ -45,7 +45,6 @@
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset. unreachable_patterns: defensive `_ => Error` arms in enum state-machine matches are intentional — adding a new variant should not silently bypass the error path"
 )]
 
-
 use core::ffi::c_void;
 
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
@@ -106,11 +105,11 @@ const MQTT_PINGRESP: u8 = 0xD0;
 // ============================================================================
 
 mod params_def {
-    use super::MqttState;
-    use super::p_u32;
     use super::p_u16;
+    use super::p_u32;
     use super::p_u8;
     use super::ptr_copy;
+    use super::MqttState;
     use super::MAX_CLIENT_ID_LEN;
     use super::MAX_TOPIC_LEN;
     use super::SCHEMA_MAX;
@@ -396,27 +395,21 @@ unsafe fn build_subscribe(s: &mut MqttState) -> usize {
 
     // Variable header: packet ID
     s.packet_id = s.packet_id.wrapping_add(1);
-    if s.packet_id == 0 { s.packet_id = 1; }
+    if s.packet_id == 0 {
+        s.packet_id = 1;
+    }
     *buf.add(offset) = (s.packet_id >> 8) as u8;
     *buf.add(offset + 1) = (s.packet_id & 0xFF) as u8;
     offset += 2;
 
     // Payload: filter 1 (topic + QoS 0)
-    offset += write_mqtt_string(
-        buf.add(offset),
-        s.subscribe_topic.as_ptr(),
-        topic_len,
-    );
+    offset += write_mqtt_string(buf.add(offset), s.subscribe_topic.as_ptr(), topic_len);
     *buf.add(offset) = 0; // QoS 0
     offset += 1;
 
     // Payload: filter 2 (optional broadcast/presence topic)
     if topic2_len > 0 {
-        offset += write_mqtt_string(
-            buf.add(offset),
-            s.subscribe_topic2.as_ptr(),
-            topic2_len,
-        );
+        offset += write_mqtt_string(buf.add(offset), s.subscribe_topic2.as_ptr(), topic2_len);
         *buf.add(offset) = 0; // QoS 0
         offset += 1;
     }
@@ -438,7 +431,13 @@ unsafe fn build_publish(
     let remaining = 2 + topic_len + payload_len;
 
     // Estimate total: 1 (type) + 1-4 (remaining len) + remaining
-    let rl_bytes = if remaining < 128 { 1 } else if remaining < 16384 { 2 } else { 3 };
+    let rl_bytes = if remaining < 128 {
+        1
+    } else if remaining < 16384 {
+        2
+    } else {
+        3
+    };
     let total = 1 + rl_bytes + remaining;
     if total > buf_size {
         return 0;
@@ -478,13 +477,21 @@ unsafe fn flush_tx(s: &mut MqttState) -> bool {
     if s.tx_sent >= s.tx_len {
         return true;
     }
-    if s.net_out_chan < 0 { return false; }
+    if s.net_out_chan < 0 {
+        return false;
+    }
     let sys = &*s.syscalls;
     let remaining = (s.tx_len - s.tx_sent) as usize;
     // Max data per frame: net_buf - frame_hdr(3) - conn_id(1)
     let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
-    let to_send = if remaining < max_data { remaining } else { max_data };
-    if to_send == 0 { return true; }
+    let to_send = if remaining < max_data {
+        remaining
+    } else {
+        max_data
+    };
+    if to_send == 0 {
+        return true;
+    }
 
     // Build CMD_SEND payload: [conn_id][data...]
     let scratch = s.net_buf.as_mut_ptr();
@@ -663,7 +670,9 @@ unsafe fn process_rx_packet(s: &mut MqttState) -> usize {
 /// Read from net_in channel, extract MSG_DATA payloads into rx_buf, process MQTT packets.
 /// Also handles MSG_CLOSED and MSG_ERROR frames.
 unsafe fn handle_rx(s: &mut MqttState) {
-    if s.net_in_chan < 0 { return; }
+    if s.net_in_chan < 0 {
+        return;
+    }
     let sys = &*s.syscalls;
 
     // Try to process any buffered data first if buffer is full
@@ -774,14 +783,14 @@ unsafe fn compact_rx(s: &mut MqttState, consumed: usize) {
 /// Check app_in_chan for messages to publish.
 unsafe fn handle_tx_from_channel(s: &mut MqttState) {
     // Don't read channel if we still have unsent data
-    if s.tx_sent < s.tx_len {
-        if !flush_tx(s) {
-            return;
-        }
+    if s.tx_sent < s.tx_len && !flush_tx(s) {
+        return;
     }
 
     let sys = &*s.syscalls;
-    if s.app_in_chan < 0 { return; }
+    if s.app_in_chan < 0 {
+        return;
+    }
 
     let poll = (sys.channel_poll)(s.app_in_chan, POLL_IN);
     if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
@@ -789,12 +798,10 @@ unsafe fn handle_tx_from_channel(s: &mut MqttState) {
     }
 
     // Read framed message: [topic_len:u8][topic][EventHeader+payload]
-    let rc = (sys.channel_read)(
-        s.app_in_chan,
-        s.chan_buf.as_mut_ptr(),
-        CHAN_BUF_SIZE,
-    );
-    if rc <= 1 { return; }
+    let rc = (sys.channel_read)(s.app_in_chan, s.chan_buf.as_mut_ptr(), CHAN_BUF_SIZE);
+    if rc <= 1 {
+        return;
+    }
     let msg_len = rc as usize;
 
     let cb = s.chan_buf.as_ptr();
@@ -825,7 +832,9 @@ unsafe fn handle_tx_from_channel(s: &mut MqttState) {
 
 /// Send PINGREQ if keepalive interval elapsed.
 unsafe fn handle_keepalive(s: &mut MqttState) {
-    if s.keepalive_s == 0 { return; }
+    if s.keepalive_s == 0 {
+        return;
+    }
 
     let now = millis(s);
     let interval_ms = (s.keepalive_s as u64) * 1000;
@@ -850,12 +859,12 @@ unsafe fn handle_keepalive(s: &mut MqttState) {
 
 /// Check net_in for MSG_CLOSED/MSG_ERROR (connection health).
 unsafe fn check_net_health(s: &mut MqttState) {
-    if s.net_in_chan < 0 { return; }
-    let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
-    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+    if s.net_in_chan < 0 {
         return;
     }
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
+    if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {}
     // Peek: if there's a frame, handle_rx will process it on next tick.
     // We don't consume here to avoid losing data frames.
 }
@@ -871,9 +880,13 @@ unsafe fn enter_reconnect(s: &mut MqttState) {
         let mut payload = [0u8; 1];
         payload[0] = s.conn_id;
         net_write_frame(
-            sys, s.net_out_chan, NET_CMD_CLOSE,
-            payload.as_ptr(), 1,
-            s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
+            sys,
+            s.net_out_chan,
+            NET_CMD_CLOSE,
+            payload.as_ptr(),
+            1,
+            s.net_buf.as_mut_ptr(),
+            NET_BUF_SIZE,
         );
         s.conn_id = 0;
         s.conn_present = 0;
@@ -905,13 +918,26 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<MqttState>() as u32
 }
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -922,9 +948,15 @@ pub extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() { return -2; }
-        if state.is_null() { return -5; }
-        if state_size < core::mem::size_of::<MqttState>() { return -6; }
+        if syscalls.is_null() {
+            return -2;
+        }
+        if state.is_null() {
+            return -5;
+        }
+        if state_size < core::mem::size_of::<MqttState>() {
+            return -6;
+        }
 
         let s = &mut *(state as *mut MqttState);
         // Zero-init via memset. The SDK's `__aeabi_memclr` is only compiled for
@@ -945,14 +977,14 @@ pub extern "C" fn module_new(
         s.net_out_chan = out_chan;
 
         // Port 1 in/out = app channels (discovered via dev_channel_port)
-        s.app_in_chan = dev_channel_port(sys, 0, 1);  // in[1]: from the app
+        s.app_in_chan = dev_channel_port(sys, 0, 1); // in[1]: from the app
         s.app_out_chan = dev_channel_port(sys, 1, 1); // out[1]: to the app
         s.conn_id = 0;
         s.conn_present = 0;
 
         // Parse params
-        let is_tlv = !params.is_null() && params_len >= 4
-            && *params == 0xFE && *params.add(1) == 0x01;
+        let is_tlv =
+            !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
@@ -1016,13 +1048,22 @@ pub extern "C" fn module_new(
     }
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
-        if state.is_null() { return -1; }
+        if state.is_null() {
+            return -1;
+        }
         let s = &mut *(state as *mut MqttState);
-        if s.syscalls.is_null() { return -1; }
+        if s.syscalls.is_null() {
+            return -1;
+        }
         // Copy pointer to avoid borrow issues
         let sys_ptr = s.syscalls;
         let sys = &*sys_ptr;
@@ -1059,25 +1100,38 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     *payload.as_mut_ptr().add(6) = (s.broker_port >> 8) as u8;
                     *payload.as_mut_ptr().add(7) = dev_requester_tag(sys);
                     let wrote = net_write_frame(
-                        sys, s.net_out_chan, NET_CMD_CONNECT,
-                        payload.as_ptr(), 8,
-                        s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
+                        sys,
+                        s.net_out_chan,
+                        NET_CMD_CONNECT,
+                        payload.as_ptr(),
+                        8,
+                        s.net_buf.as_mut_ptr(),
+                        NET_BUF_SIZE,
                     );
-                    if wrote == 0 { return 0; } // channel full, retry next tick
+                    if wrote == 0 {
+                        return 0;
+                    } // channel full, retry next tick
                     s.state_start_ms = dev_millis(sys);
                     s.phase = MqttPhase::WaitConnect;
                     return 0;
                 }
 
                 MqttPhase::WaitConnect => {
-                    if s.net_in_chan < 0 { return 0; }
+                    if s.net_in_chan < 0 {
+                        return 0;
+                    }
                     let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
                     if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
                         let nbuf = s.net_buf.as_mut_ptr();
-                        let (msg_type, payload_len) = net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+                        let (msg_type, payload_len) =
+                            net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
                         if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
                             // Claim only our own outbound connection by tag.
-                            let tag = if payload_len >= 2 { *nbuf.add(NET_FRAME_HDR + 1) } else { 0 };
+                            let tag = if payload_len >= 2 {
+                                *nbuf.add(NET_FRAME_HDR + 1)
+                            } else {
+                                0
+                            };
                             let me = dev_requester_tag(sys);
                             if tag != 0 && tag != me {
                                 return 0; // another consumer's connection.
@@ -1091,7 +1145,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         if msg_type == NET_MSG_ERROR {
                             // Connect failure carries our tag at payload[2]
                             // ([conn_id][errno][tag]); ignore another consumer's.
-                            let etag = if payload_len >= 3 { *nbuf.add(NET_FRAME_HDR + 2) } else { 0 };
+                            let etag = if payload_len >= 3 {
+                                *nbuf.add(NET_FRAME_HDR + 2)
+                            } else {
+                                0
+                            };
                             if etag == 0 || etag == dev_requester_tag(sys) {
                                 log_err(s, b"[mqtt] connect rejected");
                                 enter_reconnect(s);
@@ -1133,11 +1191,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     handle_rx(s);
 
                     // Check timeout
-                    if s.phase == MqttPhase::WaitConnack {
-                        if dev_millis(sys).wrapping_sub(s.state_start_ms) >= CONNACK_TIMEOUT_MS {
-                            log_err(s, b"[mqtt] connack timeout");
-                            enter_reconnect(s);
-                        }
+                    if s.phase == MqttPhase::WaitConnack
+                        && dev_millis(sys).wrapping_sub(s.state_start_ms) >= CONNACK_TIMEOUT_MS
+                    {
+                        log_err(s, b"[mqtt] connack timeout");
+                        enter_reconnect(s);
                     }
                     return 0;
                 }
@@ -1172,11 +1230,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     handle_rx(s);
 
                     // Check timeout
-                    if s.phase == MqttPhase::WaitSuback {
-                        if dev_millis(sys).wrapping_sub(s.state_start_ms) >= SUBACK_TIMEOUT_MS {
-                            log_err(s, b"[mqtt] suback timeout");
-                            enter_reconnect(s);
-                        }
+                    if s.phase == MqttPhase::WaitSuback
+                        && dev_millis(sys).wrapping_sub(s.state_start_ms) >= SUBACK_TIMEOUT_MS
+                    {
+                        log_err(s, b"[mqtt] suback timeout");
+                        enter_reconnect(s);
                     }
                     return 0;
                 }
@@ -1184,15 +1242,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 MqttPhase::Running => {
                     // 1. Keepalive
                     handle_keepalive(s);
-                    if s.phase != MqttPhase::Running { return 0; }
+                    if s.phase != MqttPhase::Running {
+                        return 0;
+                    }
 
                     // 2. RX from broker
                     handle_rx(s);
-                    if s.phase != MqttPhase::Running { return 0; }
+                    if s.phase != MqttPhase::Running {
+                        return 0;
+                    }
 
                     // 3. TX from channel (app -> publish)
                     handle_tx_from_channel(s);
-                    if s.phase != MqttPhase::Running { return 0; }
+                    if s.phase != MqttPhase::Running {
+                        return 0;
+                    }
 
                     // 4. Net health (MSG_CLOSED/MSG_ERROR handled in handle_rx)
                     check_net_health(s);
@@ -1216,9 +1280,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let mut payload = [0u8; 1];
                         payload[0] = s.conn_id;
                         net_write_frame(
-                            sys, s.net_out_chan, NET_CMD_CLOSE,
-                            payload.as_ptr(), 1,
-                            s.net_buf.as_mut_ptr(), NET_BUF_SIZE,
+                            sys,
+                            s.net_out_chan,
+                            NET_CMD_CLOSE,
+                            payload.as_ptr(),
+                            1,
+                            s.net_buf.as_mut_ptr(),
+                            NET_BUF_SIZE,
                         );
                         s.conn_id = 0;
                     }

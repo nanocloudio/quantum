@@ -133,13 +133,26 @@ pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -202,8 +215,8 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
     }
     let mut env = [0u8; 9 + 24];
     env[0] = 1; // dimensional
-    // tenant/protocol/prg are unset here: these are node-scoped component
-    // counters, not per-tenant series.
+                // tenant/protocol/prg are unset here: these are node-scoped component
+                // counters, not per-tenant series.
     env[8] = metric_id;
     let total = 9 + payload.len();
     if total > env.len() {
@@ -219,9 +232,14 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
     }
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of at least
     // `module_state_size()` bytes, and a `syscalls` table whose function
@@ -336,6 +354,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             emit_metrics(sys, s.out_metrics, METRIC_ID_PREFETCH, &m[..n]);
         }
 
-        if worked > 0 { STEP_BURST } else { 0 }
+        if worked > 0 {
+            STEP_BURST
+        } else {
+            0
+        }
     }
 }

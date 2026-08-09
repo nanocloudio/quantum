@@ -1,8 +1,8 @@
 # Dependency Management
 
-Quantum is a graph of `.fmod` modules loaded by the Fluxor runtime. The deployable surface is the modules tree, not a Cargo binary — but the build, lint, and host-side toolchain are organised as a small Cargo workspace at the repo root that covers `tools/` and `crates/quantum-common/`.
+Quantum is a graph of `.fmod` modules loaded by the Fluxor runtime. The deployable surface is the modules tree, not a Cargo binary, and there is no root Cargo workspace: shared source in `modules/common/` is `#[path]`-mounted by the modules that use it and published to the store as a source artefact, while the host-side tools under `tools/` are standalone crates.
 
-Cross-project dependencies (Fluxor + Clustor) flow through the local Fluxor registry under `~/.fluxor/registry/` per the contract in `standards/dependencies.md`. The registry is local-first; remote distribution layers on top later.
+Cross-project dependencies (Fluxor + Clustor) flow through the local Fluxor OCI store (`$FLUXOR_STORE`, default `~/.local/share/fluxor/store`) per the contract in `standards/dependencies.md`, pinned by digest in `fluxor.lock`. The store is local-first; remote serving layers on top of the same registry:2-shaped constructs.
 
 ## Required Checkouts
 
@@ -14,7 +14,7 @@ fluxor  = "0.0.1"
 clustor = "0.0.1"
 ```
 
-For active cross-repo iteration, list the colocated checkouts in `~/.fluxor/workspace.toml` and the Fluxor CLI reads them in place (the lockfile is bypassed for workspace members; an advisory prints once per `sync`):
+For active cross-repo iteration, list the colocated checkouts in `~/.fluxor/workspace.toml`. Workspace members resolve to their most recently published artefacts (`:latest`) and `fluxor sync` writes the resolved digests through the lockfile; a per-artifact advisory prints when a member's inputs changed since its last publish:
 
 ```toml
 [workspace]
@@ -35,8 +35,8 @@ members = [
 ## Resolving and syncing
 
 ```sh
-fluxor update             # resolve fluxor.lock against the registry
-fluxor sync               # install lockfile-resolved fmods + runtime into target/
+fluxor sync               # resolve fluxor.lock against the store; materialise fmods + runtime into target/
+fluxor update             # (when adopting new upstream publishes) advance pins to the latest digests
 fluxor modules build --target bcm2712   # build Quantum's PIC modules
 ```
 
@@ -47,7 +47,7 @@ fluxor modules build --target bcm2712   # build Quantum's PIC modules
 - Substrate `.fmod` artefacts (Clustor) under the same directory.
 - `fluxor-linux` runtime binary under `target/aarch64-unknown-linux-gnu/release/`.
 
-In live workspace mode the live sources / fmods / runtime are read directly from each workspace member's checkout rather than via the registry, but the layout under `target/` is the same.
+In live workspace mode each member's sources / fmods / runtime resolve to that member's most recently published digests (`:latest`), written through `fluxor.lock`; the layout under `target/` is the same.
 
 ## Toolchain
 
@@ -55,7 +55,7 @@ In live workspace mode the live sources / fmods / runtime are read directly from
 |---|---|---|
 | `rustc` with `aarch64-unknown-none` target | Compiles modules to PIC objects | `rustup target add aarch64-unknown-none` |
 | `rust-lld` | Links module objects against `module.ld` with `--gc-sections --no-undefined` | Ships with the Rust toolchain (`rustup component add llvm-tools-preview` if missing) |
-| `fluxor` host tool | `update`, `sync`, `validate`, `build`, `run`, `rig`, `modules build` | `cargo install --locked --path ../fluxor/tools` |
+| `fluxor` host tool | `update`, `sync`, `validate`, `build`, `run`, `rig`, `modules build` | `make -C ../fluxor install` (bootstrap only — the installed launcher thereafter resolves the CLI from the store) |
 
 Quantum modules build for `aarch64-unknown-none` only — bare-metal `--crate-type=lib` builds with no `std`, no allocator, and no async runtime.
 
@@ -97,16 +97,16 @@ Set `MOSQUITTO_PUB_BIN` / `MOSQUITTO_SUB_BIN` if the binaries are not in `$PATH`
 
 ## Auditing & Hygiene
 
-Reproducibility is enforced by the committed `fluxor.lock` (registry-resolved transitive dependencies, SHA-256-hashed) plus the small in-repo Cargo workspace for the host toolchain crates.
+Reproducibility is enforced by the committed `fluxor.lock` — store-resolved artefacts, pinned by `sha256:` digest.
 
 | Check | Command |
 |---|---|
-| Lockfile consistent with `fluxor.toml` + registry state | Part of `make ci` (the `lockfile-consistency` phase) |
-| Graph YAML matches current module manifests | `fluxor validate configs/quantum-*.yaml` |
+| Lockfile consistent with `fluxor.toml` + store state | Part of `make ci` (the `lockfile-consistency` phase) |
+| Graph YAML matches current module manifests | `fluxor build --check configs/quantum-*.yaml` |
 | Modules compile cleanly for every supported target | `fluxor modules build --all --out target` |
 | Runtime end-to-end behaviour | `tests/integration/module_graph_mqtt.sh && tests/integration/module_graph_load.sh` (after a modules build) |
 
-When upstream cuts a new fluxor or clustor release, re-run `fluxor update && fluxor sync && fluxor modules build --all --out target && fluxor validate configs/quantum-*.yaml` to catch ABI drift in the module SDK or substrate output ports.
+When upstream cuts a new fluxor or clustor release, re-run `fluxor update && fluxor sync && fluxor modules build --all --out target && fluxor build --check configs/quantum-*.yaml` to catch ABI drift in the module SDK or substrate output ports.
 
 ## Policy Reminders
 

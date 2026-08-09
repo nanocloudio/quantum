@@ -13,13 +13,14 @@ version = "0.0.1"
 # the ABI source crate (`fluxor-abi`), and the `fluxor-linux` runtime.
 # clustor provides the substrate modules (`peer_router`, `consensus`,
 # `durability`, `gateway`, …) consumed by quantum's deployment
-# graphs. Both resolve via the local registry under
-# `~/.fluxor/registry/`; PIC modules in `modules/app/*/mod.rs` consume
+# graphs. Both resolve from the local OCI store (`$FLUXOR_STORE`,
+# default `~/.local/share/fluxor/store`), digest-pinned in
+# fluxor.lock; PIC modules in `modules/app/*/mod.rs` consume
 # the materialised SDK source at
 # `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
-# Live workspace mode (`~/.fluxor/workspace.toml`) overrides the
-# version ranges with on-disk source from each listed checkout — see
-# standards/dependencies.md §6.
+# Live workspace mode (`~/.fluxor/workspace.toml`) resolves listed
+# members to their most recently published artefacts (`:latest`),
+# written through fluxor.lock — see standards/dependencies.md §6.
 [dependencies]
 fluxor  = "0.0.1"
 clustor = "0.0.1"
@@ -31,12 +32,10 @@ clustor = "0.0.1"
 targets = ["bcm2712"]
 
 [ci.lints]
-# Workspace members allowed to skip the [lints] workspace = true opt-in
-# audit in phase 1.3.
-
-[[ci.lints.exemption]]
-crate  = "tools/quantum-bench"
-reason = "driver-host bench CLI (quantum-mqtt-loadgen + /metrics scrape); prints JSON to stdout and unwraps on arg parsing, so it inlines a relaxed mirror of [workspace.lints] like clustor-bench. Value matches the workspace member path (the opt-in audit keys on member path, not crate name)."
+# No exemptions: with no root workspace there is no `[lints] workspace =
+# true` opt-in to audit. Each host crate under tools/ inlines the
+# standards/lints.md §1 baseline directly, and `tools/host_crates_e2e.sh`
+# is what enforces it.
 
 [ci.hygiene]
 # `modules/**` always bans inline tests (no_std PIC target, can't run them).
@@ -47,6 +46,17 @@ mode                = "strict"
 max_inline_lines    = 80
 
 # Per-file exemptions live as [[ci.hygiene.exemption]] tables. None today.
+
+[ci.test]
+# Shadow-checkout hard-fail guard (standards/test-tracking.md §7):
+# tests/ is shadow-tracked in .git-shadow/, so a checkout of the
+# primary repo alone has zero files there and the integration surface
+# would be silently absent. The guard fails CI instead.
+#
+# Host-crate gate: quantum has no root Cargo workspace, so `fluxor ci`
+# phase 2 is omitted and the tools/ crates are built, linted and tested
+# by nothing. `tools/host_crates_e2e.sh` closes that hole.
+scripts = ["tools/ci-shadow-guard.sh", "tools/host_crates_e2e.sh"]
 
 [ci.templates]
 # Quantum's configs are concrete YAML (no __KEY__ placeholders today),

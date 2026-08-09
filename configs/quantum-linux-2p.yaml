@@ -213,8 +213,6 @@ wiring:
     to: gateway.credit_supply
   - from: admission.credits
     to: session_processor.flow_in
-  - from: admission.envelope
-    to: flow.envelope_in
   - from: consensus_p0.lag_signal
     to: admission.lag
   - from: consensus_p1.lag_signal

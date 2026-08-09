@@ -184,4 +184,3 @@ pub fn metrics(d: &Dedup, m: &mut [u8; 24]) -> usize {
     m[16..24].copy_from_slice(&d.earliest_index.to_le_bytes());
     24
 }
-

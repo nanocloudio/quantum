@@ -76,7 +76,7 @@ modules:
     # extended TLV tag 14, which the quic module parses into alpn_cfg.
     alpn: mqtt
 
-  # ── Quantum protocol stack (12 modules) ─────────────────
+  # ── Quantum protocol stack (6 modules) ─────────────────
   - name: mqtt_quic_adapter
   - name: protocol
     variant: mqtt
@@ -172,8 +172,6 @@ wiring:
     to: gateway.credit_supply
   - from: admission.credits
     to: session_processor.flow_in
-  - from: admission.envelope
-    to: flow.envelope_in
   - from: consensus.lag_signal
     to: admission.lag
   - from: gateway.rejected

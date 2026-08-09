@@ -22,8 +22,8 @@
 //! own per-step budget.
 
 use super::{
-    MAX_PENDING_CORRELATIONS, MAX_PENDING_DLV, MAX_STASH_ENV, PENDING_ACK_SLOTS,
-    PENDING_DLV_SLOTS, STASH_DEDUP_PENDING, STASH_SLOTS,
+    MAX_PENDING_CORRELATIONS, MAX_PENDING_DLV, MAX_STASH_ENV, PENDING_ACK_SLOTS, PENDING_DLV_SLOTS,
+    STASH_DEDUP_PENDING, STASH_SLOTS,
 };
 
 /// Pending correlation: a tagged Raft proposal waiting for the
@@ -49,8 +49,12 @@ pub struct PendingCorrelation {
 impl PendingCorrelation {
     pub const fn zero() -> Self {
         Self {
-            correlation_id: 0, session_slot: 0, packet_id: 0,
-            op: 0, active: 0, ts_ms: 0,
+            correlation_id: 0,
+            session_slot: 0,
+            packet_id: 0,
+            op: 0,
+            active: 0,
+            ts_ms: 0,
         }
     }
 }
@@ -90,8 +94,10 @@ pub fn stash_alloc(s: &mut Correlate, correlation_id: u64, dedup_key: &[u8]) -> 
         if s.stash_correlation[i] == 0 {
             s.stash_correlation[i] = correlation_id;
             let k = dedup_key.len().min(20);
-            for j in 0..k { s.stash_dedup_key[i][j] = dedup_key[j]; }
-            for j in k..20 { s.stash_dedup_key[i][j] = 0; }
+            s.stash_dedup_key[i][..k].copy_from_slice(&dedup_key[..k]);
+            for j in k..20 {
+                s.stash_dedup_key[i][j] = 0;
+            }
             s.stash_dedup_state[i] = STASH_DEDUP_PENDING;
             s.stash_durable[i] = 0;
             s.stash_env_len[i] = 0;
@@ -109,12 +115,13 @@ pub fn stash_by_dedup_key(s: &Correlate, key: &[u8]) -> Option<usize> {
     if key.len() < 20 {
         return None;
     }
-    (0..STASH_SLOTS)
-        .find(|&i| s.stash_correlation[i] != 0 && s.stash_dedup_key[i][..] == key[..20])
+    (0..STASH_SLOTS).find(|&i| s.stash_correlation[i] != 0 && s.stash_dedup_key[i][..] == key[..20])
 }
 
 pub fn stash_release(s: &mut Correlate, slot: usize) {
-    if slot >= STASH_SLOTS { return; }
+    if slot >= STASH_SLOTS {
+        return;
+    }
     s.stash_correlation[slot] = 0;
     s.stash_dedup_state[slot] = STASH_DEDUP_PENDING;
     s.stash_durable[slot] = 0;
@@ -126,11 +133,17 @@ pub fn stash_occupied(s: &Correlate, slot: usize) -> bool {
 }
 
 pub fn stash_dedup_state(s: &Correlate, slot: usize) -> u8 {
-    if slot < STASH_SLOTS { s.stash_dedup_state[slot] } else { STASH_DEDUP_PENDING }
+    if slot < STASH_SLOTS {
+        s.stash_dedup_state[slot]
+    } else {
+        STASH_DEDUP_PENDING
+    }
 }
 
 pub fn stash_set_dedup_state(s: &mut Correlate, slot: usize, state: u8) {
-    if slot < STASH_SLOTS { s.stash_dedup_state[slot] = state; }
+    if slot < STASH_SLOTS {
+        s.stash_dedup_state[slot] = state;
+    }
 }
 
 pub fn stash_is_durable(s: &Correlate, slot: usize) -> bool {
@@ -138,24 +151,36 @@ pub fn stash_is_durable(s: &Correlate, slot: usize) -> bool {
 }
 
 pub fn stash_mark_durable(s: &mut Correlate, slot: usize) {
-    if slot < STASH_SLOTS { s.stash_durable[slot] = 1; }
+    if slot < STASH_SLOTS {
+        s.stash_durable[slot] = 1;
+    }
 }
 
 pub fn stash_env_len(s: &Correlate, slot: usize) -> usize {
-    if slot < STASH_SLOTS { s.stash_env_len[slot] as usize } else { 0 }
+    if slot < STASH_SLOTS {
+        s.stash_env_len[slot] as usize
+    } else {
+        0
+    }
 }
 
 /// Store the publish envelope. False if it does not fit.
 pub fn stash_set_env(s: &mut Correlate, slot: usize, env: &[u8]) -> bool {
-    if slot >= STASH_SLOTS || env.len() > MAX_STASH_ENV { return false; }
-    for (i, b) in env.iter().enumerate() { s.stash_env[slot][i] = *b; }
+    if slot >= STASH_SLOTS || env.len() > MAX_STASH_ENV {
+        return false;
+    }
+    for (i, b) in env.iter().enumerate() {
+        s.stash_env[slot][i] = *b;
+    }
     s.stash_env_len[slot] = env.len() as u16;
     true
 }
 
 /// Borrow the stashed envelope.
 pub fn stash_env(s: &Correlate, slot: usize) -> &[u8] {
-    if slot >= STASH_SLOTS { return &[]; }
+    if slot >= STASH_SLOTS {
+        return &[];
+    }
     &s.stash_env[slot][..s.stash_env_len[slot] as usize]
 }
 
@@ -194,7 +219,11 @@ pub fn reset(s: &mut Correlate) {
 /// full (the caller must then refuse the operation rather than propose
 /// something it can never match back).
 pub fn allocate(
-    s: &mut Correlate, session_slot: u32, packet_id: u16, op: u8, now: u64,
+    s: &mut Correlate,
+    session_slot: u32,
+    packet_id: u16,
+    op: u8,
+    now: u64,
 ) -> Option<u64> {
     for i in 0..MAX_PENDING_CORRELATIONS {
         if s.pending[i].active == 0 {
@@ -301,7 +330,11 @@ pub fn dlv_is_active(s: &Correlate, slot: usize) -> bool {
 }
 
 pub fn dlv_len(s: &Correlate, slot: usize) -> usize {
-    if slot < PENDING_DLV_SLOTS { s.dlv_len[slot] as usize } else { 0 }
+    if slot < PENDING_DLV_SLOTS {
+        s.dlv_len[slot] as usize
+    } else {
+        0
+    }
 }
 
 /// Copy a stashed envelope out into `dst`. False if the slot is empty or
@@ -314,9 +347,7 @@ pub fn dlv_copy_out(s: &Correlate, slot: usize, dst: &mut [u8]) -> bool {
     if n > dst.len() {
         return false;
     }
-    for i in 0..n {
-        dst[i] = s.dlv_env[slot][i];
-    }
+    dst[..n].copy_from_slice(&s.dlv_env[slot][..n]);
     true
 }
 
@@ -346,7 +377,11 @@ pub fn ack_is_active(s: &Correlate, slot: usize) -> bool {
 }
 
 pub fn ack_get(s: &Correlate, slot: usize) -> Option<[u8; 18]> {
-    if ack_is_active(s, slot) { Some(s.ack_buf[slot]) } else { None }
+    if ack_is_active(s, slot) {
+        Some(s.ack_buf[slot])
+    } else {
+        None
+    }
 }
 
 pub fn ack_free(s: &mut Correlate, slot: usize) {

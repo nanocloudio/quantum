@@ -57,7 +57,13 @@ struct ForwardRoute {
 
 impl ForwardRoute {
     const fn zero() -> Self {
-        Self { ingress_prg: 0, egress_prg: 0, routing_epoch: 0, next_seq: 1, active: 0 }
+        Self {
+            ingress_prg: 0,
+            egress_prg: 0,
+            routing_epoch: 0,
+            next_seq: 1,
+            active: 0,
+        }
     }
 }
 
@@ -73,7 +79,13 @@ struct InflightForward {
 
 impl InflightForward {
     const fn zero() -> Self {
-        Self { forward_seq: 0, egress_prg: 0, is_local: 0, sent_ms: 0, active: 0 }
+        Self {
+            forward_seq: 0,
+            egress_prg: 0,
+            is_local: 0,
+            sent_ms: 0,
+            active: 0,
+        }
     }
 }
 
@@ -81,7 +93,7 @@ impl InflightForward {
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_forward: i32,
-    in_replay: i32,       // in[1]: WAL replay entries for forward_seq reconstruction
+    in_replay: i32,      // in[1]: WAL replay entries for forward_seq reconstruction
     out_local: i32,      // to consensus (same-node)
     out_remote: i32,     // to peer_router (cross-node)
     out_wal_marker: i32, // to consensus for persisting forward state
@@ -104,22 +116,46 @@ struct ModuleState {
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 { core::mem::size_of::<ModuleState>() as u32 }
+pub extern "C" fn module_state_size() -> u32 {
+    core::mem::size_of::<ModuleState>() as u32
+}
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, _ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+pub unsafe extern "C" fn module_new(
+    in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<ModuleState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<ModuleState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
@@ -145,26 +181,39 @@ pub extern "C" fn module_new(
 
 fn get_or_create_route(
     routes: &mut [ForwardRoute; MAX_ROUTES],
-    ingress: u16, egress: u16, epoch: u32,
+    ingress: u16,
+    egress: u16,
+    epoch: u32,
 ) -> usize {
-    for i in 0..MAX_ROUTES {
-        let r = &routes[i];
-        if r.active == 1 && r.ingress_prg == ingress && r.egress_prg == egress && r.routing_epoch == epoch {
-            return i;
-        }
+    if let Some(i) = routes.iter().position(|r| {
+        r.active == 1
+            && r.ingress_prg == ingress
+            && r.egress_prg == egress
+            && r.routing_epoch == epoch
+    }) {
+        return i;
     }
-    for i in 0..MAX_ROUTES {
-        if routes[i].active == 0 {
-            routes[i] = ForwardRoute { ingress_prg: ingress, egress_prg: egress, routing_epoch: epoch, next_seq: 1, active: 1 };
-            return i;
-        }
+    if let Some(i) = routes.iter().position(|r| r.active == 0) {
+        routes[i] = ForwardRoute {
+            ingress_prg: ingress,
+            egress_prg: egress,
+            routing_epoch: epoch,
+            next_seq: 1,
+            active: 1,
+        };
+        return i;
     }
     0
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -176,13 +225,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.replay_phase == 1 && s.in_replay >= 0 {
             loop {
                 let poll = (sys.channel_poll)(s.in_replay, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (_, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_replay, &mut s.buf) };
-                if plen < 16 { continue; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (_, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_replay, &mut s.buf)
+                };
+                if plen < 16 {
+                    continue;
+                }
                 let ingress = u16::from_le_bytes([s.buf[0], s.buf[1]]);
                 let egress = u16::from_le_bytes([s.buf[2], s.buf[3]]);
                 let epoch = u32::from_le_bytes([s.buf[4], s.buf[5], s.buf[6], s.buf[7]]);
-                let seq = u64::from_le_bytes([s.buf[8], s.buf[9], s.buf[10], s.buf[11], s.buf[12], s.buf[13], s.buf[14], s.buf[15]]);
+                let seq = u64::from_le_bytes([
+                    s.buf[8], s.buf[9], s.buf[10], s.buf[11], s.buf[12], s.buf[13], s.buf[14],
+                    s.buf[15],
+                ]);
                 let idx = get_or_create_route(&mut s.routes, ingress, egress, epoch);
                 if seq >= s.routes[idx].next_seq {
                     s.routes[idx].next_seq = seq + 1;
@@ -195,9 +254,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.in_forward >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_forward, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (_, plen) = { worked += 1; wire::channel_read_msg(sys, s.in_forward, &mut s.buf) };
-                if plen < 8 { continue; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (_, plen) = {
+                    worked += 1;
+                    wire::channel_read_msg(sys, s.in_forward, &mut s.buf)
+                };
+                if plen < 8 {
+                    continue;
+                }
                 let plen = plen as usize;
 
                 let ingress = u16::from_le_bytes([s.buf[0], s.buf[1]]);
@@ -213,7 +279,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Build forwarded message: [forward_seq:u64][ingress:u16][egress:u16][epoch:u32][payload...]
                 let body_len = plen - 8;
                 let total = 16 + body_len;
-                if total > MAX_FWD_BUF { continue; }
+                if total > MAX_FWD_BUF {
+                    continue;
+                }
                 let mut fwd = [0u8; MAX_FWD_BUF];
                 fwd[0..8].copy_from_slice(&seq.to_le_bytes());
                 fwd[8..10].copy_from_slice(&ingress.to_le_bytes());
@@ -225,7 +293,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if target >= 0 {
                     let poll_out = (sys.channel_poll)(target, 0x02);
                     if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                        wire::channel_write_msg(sys, target, wire::MSG_FORWARD_REQUEST, &fwd[..total]);
+                        wire::channel_write_msg(
+                            sys,
+                            target,
+                            wire::MSG_FORWARD_REQUEST,
+                            &fwd[..total],
+                        );
                         if is_local {
                             s.local_sent = s.local_sent.wrapping_add(1);
                         } else {
@@ -242,7 +315,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             marker[8..16].copy_from_slice(&seq.to_le_bytes());
                             let p = (sys.channel_poll)(s.out_wal_marker, 0x02);
                             if p > 0 && (p as u32 & 0x02) != 0 {
-                                wire::channel_write_msg(sys, s.out_wal_marker, wire::MSG_CLIENT_PROPOSAL, &marker);
+                                wire::channel_write_msg(
+                                    sys,
+                                    s.out_wal_marker,
+                                    wire::MSG_CLIENT_PROPOSAL,
+                                    &marker,
+                                );
                             }
                         }
 
@@ -289,6 +367,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        if worked > 0 { STEP_BURST } else { 0 }
+        if worked > 0 {
+            STEP_BURST
+        } else {
+            0
+        }
     }
 }

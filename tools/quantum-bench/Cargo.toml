@@ -3,7 +3,7 @@ name = "quantum-bench"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "Off-DUT benchmark harness for Quantum: open-loop per-protocol load generators (driving the real codec path) + binary /metrics scrape/parse. Std-only, no external deps. Mirrors clustor-bench (RFC §5)."
+description = "Off-DUT benchmark harness for Quantum: open-loop per-protocol load generators (driving the real codec path) + binary /metrics scrape/parse. Std-only, no external deps. Mirrors clustor-bench."
 
 # std-only by design: this is the driver-host tool (192.168.1.10), it never runs
 # on fluxor, and keeping it dependency-free means it builds on an offline Pi.

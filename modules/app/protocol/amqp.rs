@@ -9,8 +9,7 @@
 //! `RX_QUOTA` records off `in_raw` and `RESP_QUOTA` off `in_responses`.
 
 use super::abi::SyscallTable;
-use super::{dev_log, dev_millis, dev_channel_port, wire};
-
+use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 const FRAME_METHOD: u8 = 1;
 const FRAME_HEADER: u8 = 2;
@@ -87,8 +86,13 @@ struct PendingPub {
 impl PendingPub {
     const fn zero() -> Self {
         Self {
-            body: [0; MAX_BODY], rk: [0; MAX_RK],
-            body_size: 0, received: 0, channel: 0, state: P_NONE, rk_len: 0,
+            body: [0; MAX_BODY],
+            rk: [0; MAX_RK],
+            body_size: 0,
+            received: 0,
+            channel: 0,
+            state: P_NONE,
+            rk_len: 0,
         }
     }
 }
@@ -123,9 +127,14 @@ impl AConn {
             buf: [0; RASM],
             pending: [PendingPub::zero(); MAX_PENDING],
             pub_seq: [0; MAX_CHANNELS as usize + 1],
-            chan_mask: 0, confirm_mask: 0,
-            prefetch: [0; MAX_CHANNELS as usize + 1], ctag_seq: 0,
-            len: 0, conn_id: 0, active: 0, saw_header: 0,
+            chan_mask: 0,
+            confirm_mask: 0,
+            prefetch: [0; MAX_CHANNELS as usize + 1],
+            ctag_seq: 0,
+            len: 0,
+            conn_id: 0,
+            active: 0,
+            saw_header: 0,
         }
     }
 }
@@ -151,12 +160,12 @@ pub struct Amqp {
     scratch: [u8; OUT_BUF],
 }
 
-
-
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
 pub fn init(s: &mut Amqp) {
-    for c in s.conns.iter_mut() { *c = AConn::zero(); }
+    for c in s.conns.iter_mut() {
+        *c = AConn::zero();
+    }
     s.frames_decoded = 0;
     s.publishes_forwarded = 0;
     s.responses_encoded = 0;
@@ -174,9 +183,13 @@ pub fn init(s: &mut Amqp) {
 /// rationale.
 /// # Safety
 unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -> bool {
-    if chan < 0 { return false; }
+    if chan < 0 {
+        return false;
+    }
     let total = 1 + bytes.len();
-    if total > OUT_BUF { return false; }
+    if total > OUT_BUF {
+        return false;
+    }
     let mut out = [0u8; OUT_BUF];
     out[0] = conn_id;
     out[1..total].copy_from_slice(bytes);
@@ -186,7 +199,9 @@ unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -
 
 fn find_conn(s: &mut Amqp, conn_id: u8) -> usize {
     for i in 0..ACONNS {
-        if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id { return i; }
+        if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
+            return i;
+        }
     }
     for i in 0..ACONNS {
         if s.conns[i].active == 0 {
@@ -210,12 +225,18 @@ fn find_conn(s: &mut Amqp, conn_id: u8) -> usize {
 /// (built in `s.frame`) and send to the client.
 /// # Safety
 unsafe fn send_frame(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, ftype: u8, channel: u16, payload: &[u8],
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    ftype: u8,
+    channel: u16,
+    payload: &[u8],
 ) {
     // 7-byte header + payload + frame-end octet.
     let total = 7 + payload.len() + 1;
-    if total > OUT_BUF { return; }
+    if total > OUT_BUF {
+        return;
+    }
     s.frame[0] = ftype;
     s.frame[1..3].copy_from_slice(&channel.to_be_bytes());
     s.frame[3..7].copy_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -230,22 +251,40 @@ unsafe fn send_frame(
 /// Method frame: payload = `[class:i16 BE][method:i16 BE][args]`.
 /// # Safety
 unsafe fn send_method(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, channel: u16, class: u16, method: u16, args: &[u8],
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    channel: u16,
+    class: u16,
+    method: u16,
+    args: &[u8],
 ) {
     let mut pay = [0u8; ARG_BUF];
-    if 4 + args.len() > ARG_BUF { return; }
+    if 4 + args.len() > ARG_BUF {
+        return;
+    }
     pay[0..2].copy_from_slice(&class.to_be_bytes());
     pay[2..4].copy_from_slice(&method.to_be_bytes());
     pay[4..4 + args.len()].copy_from_slice(args);
-    send_frame(s, sys, conn_id, FRAME_METHOD, channel, &pay[..4 + args.len()]);
+    send_frame(
+        s,
+        sys,
+        conn_id,
+        FRAME_METHOD,
+        channel,
+        &pay[..4 + args.len()],
+    );
 }
 
 /// Basic.Ack (multiple=0) or Basic.Nack (multiple=0, requeue=0).
 /// # Safety
 unsafe fn send_ack_nack(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, channel: u16, delivery_tag: u64, ack: bool,
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    channel: u16,
+    delivery_tag: u64,
+    ack: bool,
 ) {
     let mut args = [0u8; 9];
     args[0..8].copy_from_slice(&delivery_tag.to_be_bytes());
@@ -258,7 +297,7 @@ unsafe fn send_ack_nack(
 /// publish assemblies. Used by Channel.Close and server-initiated
 /// channel closes.
 fn reset_channel_state(conn: &mut AConn, channel: u16) {
-    if channel >= 1 && channel <= MAX_CHANNELS {
+    if (1..=MAX_CHANNELS).contains(&channel) {
         conn.chan_mask &= !(1u32 << channel);
         conn.confirm_mask &= !(1u32 << channel);
         conn.prefetch[channel as usize] = 0;
@@ -275,17 +314,27 @@ fn reset_channel_state(conn: &mut AConn, channel: u16) {
 /// paths.
 /// # Safety
 unsafe fn close_channel_406(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, ci: usize, channel: u16, class: u16, method: u16,
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    ci: usize,
+    channel: u16,
+    class: u16,
+    method: u16,
 ) {
     let text: &[u8] = b"PRECONDITION_FAILED";
     let mut args = [0u8; 32];
     let mut p = 0usize;
-    args[p..p + 2].copy_from_slice(&406i16.to_be_bytes()); p += 2;
-    args[p] = text.len() as u8; p += 1;
-    args[p..p + text.len()].copy_from_slice(text); p += text.len();
-    args[p..p + 2].copy_from_slice(&(class as i16).to_be_bytes()); p += 2;
-    args[p..p + 2].copy_from_slice(&(method as i16).to_be_bytes()); p += 2;
+    args[p..p + 2].copy_from_slice(&406i16.to_be_bytes());
+    p += 2;
+    args[p] = text.len() as u8;
+    p += 1;
+    args[p..p + text.len()].copy_from_slice(text);
+    p += text.len();
+    args[p..p + 2].copy_from_slice(&(class as i16).to_be_bytes());
+    p += 2;
+    args[p..p + 2].copy_from_slice(&(method as i16).to_be_bytes());
+    p += 2;
     reset_channel_state(&mut s.conns[ci], channel);
     send_method(s, sys, conn_id, channel, 20, 40, &args[..p]);
 }
@@ -299,9 +348,13 @@ fn put_dec(buf: &mut [u8], off: usize, mut v: u32) -> usize {
         tmp[n] = b'0' + (v % 10) as u8;
         n += 1;
         v /= 10;
-        if v == 0 { break; }
+        if v == 0 {
+            break;
+        }
     }
-    for i in 0..n { buf[off + i] = tmp[n - 1 - i]; }
+    for i in 0..n {
+        buf[off + i] = tmp[n - 1 - i];
+    }
     off + n
 }
 
@@ -311,8 +364,12 @@ fn put_dec(buf: &mut [u8], off: usize, mut v: u32) -> usize {
 /// Shared by the Basic.GetOk and Basic.Deliver paths.
 /// # Safety
 unsafe fn send_content(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, channel: u16, body_off: usize, body_len: usize,
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    channel: u16,
+    body_off: usize,
+    body_len: usize,
 ) {
     // Content header: class 60, weight 0, body-size, property-flags 0.
     let mut hdr = [0u8; 14];
@@ -326,7 +383,9 @@ unsafe fn send_content(
     // 7-byte header + payload + frame-end octet.
     if body_len > 0 {
         let total = 7 + body_len + 1;
-        if total > OUT_BUF { return; }
+        if total > OUT_BUF {
+            return;
+        }
         s.frame[0] = FRAME_BODY;
         s.frame[1..3].copy_from_slice(&channel.to_be_bytes());
         s.frame[3..7].copy_from_slice(&(body_len as u32).to_be_bytes());
@@ -346,27 +405,27 @@ unsafe fn send_content(
 // ── Publish assembly ────────────────────────────────────────────────────────
 
 fn pending_for_channel(conn: &mut AConn, channel: u16) -> Option<usize> {
-    for i in 0..MAX_PENDING {
-        if conn.pending[i].state != P_NONE && conn.pending[i].channel == channel {
-            return Some(i);
-        }
-    }
-    None
+    conn.pending
+        .iter()
+        .position(|p| p.state != P_NONE && p.channel == channel)
 }
 
 fn pending_free(conn: &mut AConn) -> Option<usize> {
-    for i in 0..MAX_PENDING {
-        if conn.pending[i].state == P_NONE { return Some(i); }
-    }
-    None
+    conn.pending.iter().position(|p| p.state == P_NONE)
 }
 
 /// Take the next delivery-tag for a confirm-mode channel; 0 otherwise.
 fn next_delivery_tag(conn: &mut AConn, channel: u16) -> u64 {
-    if channel == 0 || channel > MAX_CHANNELS { return 0; }
-    if conn.confirm_mask & (1u32 << channel) == 0 { return 0; }
+    if channel == 0 || channel > MAX_CHANNELS {
+        return 0;
+    }
+    if conn.confirm_mask & (1u32 << channel) == 0 {
+        return 0;
+    }
     let ch = channel as usize;
-    if conn.pub_seq[ch] == 0 { conn.pub_seq[ch] = 1; }
+    if conn.pub_seq[ch] == 0 {
+        conn.pub_seq[ch] = 1;
+    }
     let t = conn.pub_seq[ch];
     conn.pub_seq[ch] = conn.pub_seq[ch].wrapping_add(1);
     t
@@ -410,7 +469,10 @@ unsafe fn forward_publish(s: &mut Amqp, sys: &SyscallTable, conn_id: u8, ci: usi
     s.conns[ci].pending[pi].state = P_NONE;
     let out = s.out_proposals;
     let w = wire::channel_write_msg(
-        sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..1 + env_len],
+        sys,
+        out,
+        wire::MSG_SESSION_PROPOSAL,
+        &s.scratch[..1 + env_len],
     );
     if w > 0 {
         s.publishes_forwarded = s.publishes_forwarded.wrapping_add(1);
@@ -425,9 +487,13 @@ unsafe fn forward_publish(s: &mut Amqp, sys: &SyscallTable, conn_id: u8, ci: usi
 /// Read a shortstr (`u8 len + bytes`) from `a[off..]`. Returns
 /// `(next_off, str_off, str_len)` or None on truncation.
 fn shortstr(a: &[u8], off: usize) -> Option<(usize, usize, usize)> {
-    if off >= a.len() { return None; }
+    if off >= a.len() {
+        return None;
+    }
     let l = a[off] as usize;
-    if off + 1 + l > a.len() { return None; }
+    if off + 1 + l > a.len() {
+        return None;
+    }
     Some((off + 1 + l, off + 1, l))
 }
 
@@ -437,8 +503,12 @@ fn shortstr(a: &[u8], off: usize) -> Option<(usize, usize, usize)> {
 /// if the conn state was reset (caller must stop extracting).
 /// # Safety
 unsafe fn handle_method(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, ci: usize, channel: u16, m: &[u8],
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    ci: usize,
+    channel: u16,
+    m: &[u8],
 ) -> bool {
     if m.len() < 4 {
         s.parse_errors = s.parse_errors.wrapping_add(1);
@@ -471,7 +541,7 @@ unsafe fn handle_method(
         (10, 51) => {}
         // Channel.Open → Channel.OpenOk (reserved longstr = u32 0)
         (20, 10) => {
-            if channel >= 1 && channel <= MAX_CHANNELS {
+            if (1..=MAX_CHANNELS).contains(&channel) {
                 s.conns[ci].chan_mask |= 1u32 << channel;
                 s.conns[ci].confirm_mask &= !(1u32 << channel);
                 s.conns[ci].prefetch[channel as usize] = 0;
@@ -514,9 +584,8 @@ unsafe fn handle_method(
         // consume-start proposals (0 = unlimited).
         (60, 10) => {
             // args: prefetch-size i32, prefetch-count i16 BE, global bit.
-            if a.len() >= 6 && channel >= 1 && channel <= MAX_CHANNELS {
-                s.conns[ci].prefetch[channel as usize] =
-                    u16::from_be_bytes([a[4], a[5]]);
+            if a.len() >= 6 && (1..=MAX_CHANNELS).contains(&channel) {
+                s.conns[ci].prefetch[channel as usize] = u16::from_be_bytes([a[4], a[5]]);
             }
             send_method(s, sys, conn_id, channel, 60, 11, &[]);
         }
@@ -556,15 +625,18 @@ unsafe fn handle_method(
                 let seq = s.conns[ci].ctag_seq;
                 s.conns[ci].ctag_seq = seq.wrapping_add(1);
                 let mut p = 0usize;
-                tag[p..p + 5].copy_from_slice(b"ctag-"); p += 5;
+                tag[p..p + 5].copy_from_slice(b"ctag-");
+                p += 5;
                 p = put_dec(&mut tag, p, conn_id as u32);
-                tag[p] = b'-'; p += 1;
+                tag[p] = b'-';
+                p += 1;
                 p = put_dec(&mut tag, p, channel as u32);
-                tag[p] = b'-'; p += 1;
+                tag[p] = b'-';
+                p += 1;
                 p = put_dec(&mut tag, p, seq as u32);
                 tag_len = p;
             }
-            let prefetch = if channel >= 1 && channel <= MAX_CHANNELS {
+            let prefetch = if (1..=MAX_CHANNELS).contains(&channel) {
                 s.conns[ci].prefetch[channel as usize]
             } else {
                 0
@@ -579,7 +651,9 @@ unsafe fn handle_method(
             // op=3: [prefix][flags][prefetch:u16 LE][tag_len:u16 LE][tag]
             //       [q_len:u16 LE][queue]
             let total = 13 + 1 + 2 + 2 + tag_len + 2 + ql;
-            if total > OUT_BUF { return false; }
+            if total > OUT_BUF {
+                return false;
+            }
             s.scratch[0] = conn_id;
             s.scratch[1] = PROTO_AMQP;
             s.scratch[2] = OP_CONSUME;
@@ -593,9 +667,8 @@ unsafe fn handle_method(
             s.scratch[qb..qb + 2].copy_from_slice(&(ql as u16).to_le_bytes());
             s.scratch[qb + 2..qb + 2 + ql].copy_from_slice(&a[qo..qo + ql]);
             let out = s.out_proposals;
-            let w = wire::channel_write_msg(
-                sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..total],
-            );
+            let w =
+                wire::channel_write_msg(sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..total]);
             if w > 0 {
                 s.consumes_started = s.consumes_started.wrapping_add(1);
             }
@@ -631,7 +704,10 @@ unsafe fn handle_method(
             s.scratch[15..15 + tl].copy_from_slice(&tag[..tl]);
             let out = s.out_proposals;
             let w = wire::channel_write_msg(
-                sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..15 + tl],
+                sys,
+                out,
+                wire::MSG_SESSION_PROPOSAL,
+                &s.scratch[..15 + tl],
             );
             if w > 0 {
                 s.consumes_cancelled = s.consumes_cancelled.wrapping_add(1);
@@ -656,7 +732,10 @@ unsafe fn handle_method(
                 let n = xl.min(MAX_RK);
                 rk[..n].copy_from_slice(&a[xo..xo + n]);
                 rk_len = n;
-                if rk_len < MAX_RK { rk[rk_len] = b'.'; rk_len += 1; }
+                if rk_len < MAX_RK {
+                    rk[rk_len] = b'.';
+                    rk_len += 1;
+                }
             }
             let n = rl.min(MAX_RK - rk_len);
             rk[rk_len..rk_len + n].copy_from_slice(&a[ro..ro + n]);
@@ -687,7 +766,9 @@ unsafe fn handle_method(
                 return false;
             };
             let env_len = 1 + 14 + ql;
-            if env_len > OUT_BUF { return false; }
+            if env_len > OUT_BUF {
+                return false;
+            }
             s.scratch[0] = conn_id;
             s.scratch[1] = PROTO_AMQP;
             s.scratch[2] = OP_GET;
@@ -709,9 +790,7 @@ unsafe fn handle_method(
                 s.parse_errors = s.parse_errors.wrapping_add(1);
                 return false;
             }
-            let dt = u64::from_be_bytes([
-                a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-            ]);
+            let dt = u64::from_be_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
             let bits = a[8];
             // flags: bit0 = multiple, bit1 = requeue-requested.
             let flags = match method {
@@ -727,16 +806,14 @@ unsafe fn handle_method(
             s.scratch[5..13].copy_from_slice(&dt.to_le_bytes());
             s.scratch[13] = flags;
             let out = s.out_proposals;
-            let w = wire::channel_write_msg(
-                sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..14],
-            );
+            let w = wire::channel_write_msg(sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..14]);
             if w > 0 {
                 s.client_acks_forwarded = s.client_acks_forwarded.wrapping_add(1);
             }
         }
         // Confirm.Select → Confirm.SelectOk, mark confirm mode
         (85, 10) => {
-            if channel >= 1 && channel <= MAX_CHANNELS {
+            if (1..=MAX_CHANNELS).contains(&channel) {
                 s.conns[ci].confirm_mask |= 1u32 << channel;
                 if s.conns[ci].pub_seq[channel as usize] == 0 {
                     s.conns[ci].pub_seq[channel as usize] = 1;
@@ -752,12 +829,31 @@ unsafe fn handle_method(
 }
 
 /// Handle one complete frame at `conn.buf[pay_off..pay_off+size]`.
+/// One parsed AMQP frame header: its type, the channel it targets, and
+/// where its payload sits in the reassembly buffer.
+#[derive(Clone, Copy)]
+struct FrameHdr {
+    ftype: u8,
+    channel: u16,
+    pay_off: usize,
+    size: usize,
+}
+
 /// Returns true if the conn state was reset.
 /// # Safety
 unsafe fn handle_frame(
-    s: &mut Amqp, sys: &SyscallTable,
-    conn_id: u8, ci: usize, ftype: u8, channel: u16, pay_off: usize, size: usize,
+    s: &mut Amqp,
+    sys: &SyscallTable,
+    conn_id: u8,
+    ci: usize,
+    f: FrameHdr,
 ) -> bool {
+    let FrameHdr {
+        ftype,
+        channel,
+        pay_off,
+        size,
+    } = f;
     match ftype {
         FRAME_METHOD => {
             // Copy the method payload out of the reassembly buffer so
@@ -768,7 +864,9 @@ unsafe fn handle_frame(
             let mut mbuf = [0u8; ARG_BUF];
             let n = size.min(ARG_BUF);
             core::ptr::copy_nonoverlapping(
-                s.conns[ci].buf.as_ptr().add(pay_off), mbuf.as_mut_ptr(), n,
+                s.conns[ci].buf.as_ptr().add(pay_off),
+                mbuf.as_mut_ptr(),
+                n,
             );
             handle_method(s, sys, conn_id, ci, channel, &mbuf[..n])
         }
@@ -786,11 +884,11 @@ unsafe fn handle_frame(
             }
             let mut h = [0u8; 12];
             core::ptr::copy_nonoverlapping(
-                s.conns[ci].buf.as_ptr().add(pay_off), h.as_mut_ptr(), 12,
+                s.conns[ci].buf.as_ptr().add(pay_off),
+                h.as_mut_ptr(),
+                12,
             );
-            let body_size = u64::from_be_bytes([
-                h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11],
-            ]);
+            let body_size = u64::from_be_bytes([h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11]]);
             if body_size as usize > MAX_BODY {
                 // Oversize: nack in confirm mode (the publish still
                 // consumed a sequence number), else count and discard.
@@ -826,7 +924,9 @@ unsafe fn handle_frame(
             if st == P_DISCARD {
                 let p = &mut s.conns[ci].pending[pi];
                 p.received = p.received.saturating_add(size as u64);
-                if p.received >= p.body_size { p.state = P_NONE; }
+                if p.received >= p.body_size {
+                    p.state = P_NONE;
+                }
                 return false;
             }
             if st != P_BODY {
@@ -873,13 +973,20 @@ unsafe fn send_connection_start(s: &mut Amqp, sys: &SyscallTable, conn_id: u8) {
     let locales = b"en_US";
     let mut args = [0u8; 32];
     let mut p = 0usize;
-    args[p] = 0; p += 1; // version-major
-    args[p] = 9; p += 1; // version-minor
-    args[p..p + 4].copy_from_slice(&0u32.to_be_bytes()); p += 4; // empty table
-    args[p..p + 4].copy_from_slice(&(mechanisms.len() as u32).to_be_bytes()); p += 4;
-    args[p..p + mechanisms.len()].copy_from_slice(mechanisms); p += mechanisms.len();
-    args[p..p + 4].copy_from_slice(&(locales.len() as u32).to_be_bytes()); p += 4;
-    args[p..p + locales.len()].copy_from_slice(locales); p += locales.len();
+    args[p] = 0;
+    p += 1; // version-major
+    args[p] = 9;
+    p += 1; // version-minor
+    args[p..p + 4].copy_from_slice(&0u32.to_be_bytes());
+    p += 4; // empty table
+    args[p..p + 4].copy_from_slice(&(mechanisms.len() as u32).to_be_bytes());
+    p += 4;
+    args[p..p + mechanisms.len()].copy_from_slice(mechanisms);
+    p += mechanisms.len();
+    args[p..p + 4].copy_from_slice(&(locales.len() as u32).to_be_bytes());
+    p += 4;
+    args[p..p + locales.len()].copy_from_slice(locales);
+    p += locales.len();
     send_method(s, sys, conn_id, 0, 10, 10, &args[..p]);
 }
 
@@ -901,13 +1008,16 @@ unsafe fn send_connection_start(s: &mut Amqp, sys: &SyscallTable, conn_id: u8) {
 pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u8]) {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-
         // Stage the record exactly as the channel read did:
         // `frame` holds `[conn_id][tcp chunk]`.
         let n = payload.len();
-        if n > s.frame.len() { return; }
+        if n > s.frame.len() {
+            return;
+        }
         s.frame[..n].copy_from_slice(payload);
-        if n < 1 { return; }
+        if n < 1 {
+            return;
+        }
         let conn_id = s.frame[0];
 
         // Connection closed: release this conn's reassembly + all its
@@ -925,13 +1035,13 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
             // that type already carries "MQTT DISCONNECT packet" on the
             // shared codec_in fan-in). session_processor cancels this
             // conn's push consumers on it.
-            let mut cb = [conn_id];
-            wire::channel_write_msg(
-                sys, s.out_proposals, wire::MSG_CONN_CLOSED, &mut cb,
-            );
+            let cb = [conn_id];
+            wire::channel_write_msg(sys, s.out_proposals, wire::MSG_CONN_CLOSED, &cb);
             return;
         }
-        if n <= 1 { return; }
+        if n <= 1 {
+            return;
+        }
         let data_len = n - 1;
         let ci = find_conn(s, conn_id);
 
@@ -959,7 +1069,9 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
             // Protocol header "AMQP\x00\x00\x09\x01" must be the
             // first bytes on the conn.
             if s.conns[ci].saw_header == 0 {
-                if avail < 8 { break; }
+                if avail < 8 {
+                    break;
+                }
                 if s.conns[ci].buf[off..off + 8] == HDR_AMQP {
                     s.conns[ci].saw_header = 1;
                     off += 8;
@@ -974,14 +1086,16 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
                 conn_reset = true;
                 break;
             }
-            if avail < 8 { break; }
+            if avail < 8 {
+                break;
+            }
             let ftype = s.conns[ci].buf[off];
-            let channel = u16::from_be_bytes([
-                s.conns[ci].buf[off + 1], s.conns[ci].buf[off + 2],
-            ]);
+            let channel = u16::from_be_bytes([s.conns[ci].buf[off + 1], s.conns[ci].buf[off + 2]]);
             let size = u32::from_be_bytes([
-                s.conns[ci].buf[off + 3], s.conns[ci].buf[off + 4],
-                s.conns[ci].buf[off + 5], s.conns[ci].buf[off + 6],
+                s.conns[ci].buf[off + 3],
+                s.conns[ci].buf[off + 4],
+                s.conns[ci].buf[off + 5],
+                s.conns[ci].buf[off + 6],
             ]) as usize;
             if size > MAX_FSIZE {
                 // Client ignored our frame-max — unrecoverable
@@ -993,7 +1107,9 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
             }
             // 7-byte header + payload + frame-end octet.
             let total = 7 + size + 1;
-            if avail < total { break; }
+            if avail < total {
+                break;
+            }
             if s.conns[ci].buf[off + 7 + size] != FRAME_END {
                 s.parse_errors = s.parse_errors.wrapping_add(1);
                 s.conns[ci] = AConn::zero();
@@ -1002,14 +1118,27 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
                 break;
             }
             s.frames_decoded = s.frames_decoded.wrapping_add(1);
-            if handle_frame(s, sys, conn_id, ci, ftype, channel, off + 7, size) {
+            if handle_frame(
+                s,
+                sys,
+                conn_id,
+                ci,
+                FrameHdr {
+                    ftype,
+                    channel,
+                    pay_off: off + 7,
+                    size,
+                },
+            ) {
                 conn_reset = true;
                 break;
             }
             off += total;
             avail -= total;
         }
-        if conn_reset { return; }
+        if conn_reset {
+            return;
+        }
         // Compact leftover fragment to the front.
         if off > 0 && avail > 0 {
             core::ptr::copy(
@@ -1018,7 +1147,9 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
                 avail,
             );
         }
-        if off > 0 { s.conns[ci].len = avail as u16; }
+        if off > 0 {
+            s.conns[ci].len = avail as u16;
+        }
     }
 }
 
@@ -1065,8 +1196,14 @@ pub unsafe fn on_response(s: &mut Amqp, sys: &SyscallTable, payload: &[u8]) {
                     return;
                 }
                 let tag = u64::from_le_bytes([
-                    s.scratch[5], s.scratch[6], s.scratch[7], s.scratch[8],
-                    s.scratch[9], s.scratch[10], s.scratch[11], s.scratch[12],
+                    s.scratch[5],
+                    s.scratch[6],
+                    s.scratch[7],
+                    s.scratch[8],
+                    s.scratch[9],
+                    s.scratch[10],
+                    s.scratch[11],
+                    s.scratch[12],
                 ]);
                 let ack = s.scratch[13] == 0;
                 send_ack_nack(s, sys, conn_id, channel, tag, ack);
@@ -1079,11 +1216,20 @@ pub unsafe fn on_response(s: &mut Amqp, sys: &SyscallTable, payload: &[u8]) {
                 }
                 let result = s.scratch[5];
                 let tag = u64::from_le_bytes([
-                    s.scratch[6], s.scratch[7], s.scratch[8], s.scratch[9],
-                    s.scratch[10], s.scratch[11], s.scratch[12], s.scratch[13],
+                    s.scratch[6],
+                    s.scratch[7],
+                    s.scratch[8],
+                    s.scratch[9],
+                    s.scratch[10],
+                    s.scratch[11],
+                    s.scratch[12],
+                    s.scratch[13],
                 ]);
                 let remaining = u32::from_le_bytes([
-                    s.scratch[14], s.scratch[15], s.scratch[16], s.scratch[17],
+                    s.scratch[14],
+                    s.scratch[15],
+                    s.scratch[16],
+                    s.scratch[17],
                 ]);
                 if result != 0 {
                     // Basic.GetEmpty: reserved shortstr (empty).
@@ -1111,8 +1257,14 @@ pub unsafe fn on_response(s: &mut Amqp, sys: &SyscallTable, payload: &[u8]) {
                     return;
                 }
                 let tag = u64::from_le_bytes([
-                    s.scratch[5], s.scratch[6], s.scratch[7], s.scratch[8],
-                    s.scratch[9], s.scratch[10], s.scratch[11], s.scratch[12],
+                    s.scratch[5],
+                    s.scratch[6],
+                    s.scratch[7],
+                    s.scratch[8],
+                    s.scratch[9],
+                    s.scratch[10],
+                    s.scratch[11],
+                    s.scratch[12],
                 ]);
                 let tl = u16::from_le_bytes([s.scratch[14], s.scratch[15]]) as usize;
                 if tl > MAX_CTAG || 16 + tl > n {

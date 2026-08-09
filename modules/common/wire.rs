@@ -13,20 +13,20 @@
 
 // ── Clustor substrate types (duplicated for consistency) ────────────────────
 
-pub const MSG_CLIENT_PROPOSAL: u8     = 0x10;
-pub const MSG_CLIENT_RESPONSE: u8     = 0x11;
-pub const MSG_ADMIN_COMMAND: u8       = 0x12;
-pub const MSG_ADMIN_RESPONSE: u8      = 0x13;
-pub const MSG_PROPOSAL_ASSIGNED: u8   = 0x14;
+pub const MSG_CLIENT_PROPOSAL: u8 = 0x10;
+pub const MSG_CLIENT_RESPONSE: u8 = 0x11;
+pub const MSG_ADMIN_COMMAND: u8 = 0x12;
+pub const MSG_ADMIN_RESPONSE: u8 = 0x13;
+pub const MSG_PROPOSAL_ASSIGNED: u8 = 0x14;
 
-pub const MSG_WAL_ENTRY: u8           = 0x20;
-pub const MSG_DURABILITY_PROOF: u8    = 0x22;
-pub const MSG_COMMITTED_BATCH: u8     = 0x23;
+pub const MSG_WAL_ENTRY: u8 = 0x20;
+pub const MSG_DURABILITY_PROOF: u8 = 0x22;
+pub const MSG_COMMITTED_BATCH: u8 = 0x23;
 /// Per-entry body stream from `consensus.committed_entries`.
 /// Body: `[term:u64 LE][index:u64 LE][entry_body...]`. Quantum's
 /// session_processor consumes this on `entries_in` to drive the
 /// apply-side state machine (P0 of `docs/partitioning.md`).
-pub const MSG_COMMITTED_ENTRY: u8     = 0x24;
+pub const MSG_COMMITTED_ENTRY: u8 = 0x24;
 
 /// Apply-pipeline reset notice (mirrors Clustor's value). Emitted by
 /// the substrate when the apply index has rewound — snapshot install,
@@ -40,50 +40,50 @@ pub const MSG_COMMITTED_ENTRY: u8     = 0x24;
 /// §Apply-pipeline reset for per-module policy.
 pub const MSG_APPLY_PIPELINE_RESET: u8 = 0x2B;
 
-pub const MSG_CP_PROOF: u8            = 0x30;
-pub const MSG_CACHE_STATE: u8         = 0x31;
+pub const MSG_CP_PROOF: u8 = 0x30;
+pub const MSG_CACHE_STATE: u8 = 0x31;
 
-pub const MSG_THROTTLE_CREDITS: u8    = 0x40;
-pub const MSG_THROTTLE_ENVELOPE: u8   = 0x41;
-pub const MSG_LAG_SIGNAL: u8          = 0x42;
+pub const MSG_THROTTLE_CREDITS: u8 = 0x40;
+pub const MSG_THROTTLE_ENVELOPE: u8 = 0x41;
+pub const MSG_LAG_SIGNAL: u8 = 0x42;
 
-pub const MSG_METRICS: u8             = 0x70;
-pub const MSG_PLACEMENT_UPDATE: u8    = 0x80;
+pub const MSG_METRICS: u8 = 0x70;
+pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;
 
 // ── Quantum-specific message types ──────────────────────────────────────────
 
 // Protocol transport
-pub const MSG_PROTOCOL_MQTT: u8       = 0x90;
-pub const MSG_PROTOCOL_KAFKA: u8      = 0x91;
-pub const MSG_PROTOCOL_AMQP: u8       = 0x92;
+pub const MSG_PROTOCOL_MQTT: u8 = 0x90;
+pub const MSG_PROTOCOL_KAFKA: u8 = 0x91;
+pub const MSG_PROTOCOL_AMQP: u8 = 0x92;
 
 // Codec-to-session
-pub const MSG_SESSION_PROPOSAL: u8    = 0x98;
-pub const MSG_SESSION_RESPONSE: u8    = 0x99;
-pub const MSG_SESSION_CONNECT: u8     = 0x9A;
-pub const MSG_SESSION_DISCONNECT: u8  = 0x9B;
+pub const MSG_SESSION_PROPOSAL: u8 = 0x98;
+pub const MSG_SESSION_RESPONSE: u8 = 0x99;
+pub const MSG_SESSION_CONNECT: u8 = 0x9A;
+pub const MSG_SESSION_DISCONNECT: u8 = 0x9B;
 
 // Dedupe
-pub const MSG_DEDUP_CHECK: u8         = 0xA0;
-pub const MSG_DEDUP_RESULT: u8        = 0xA1;
+pub const MSG_DEDUP_CHECK: u8 = 0xA0;
+pub const MSG_DEDUP_RESULT: u8 = 0xA1;
 
 // Topic routing
-pub const MSG_TOPIC_PUBLISH: u8       = 0xA8;
-pub const MSG_TOPIC_SUBSCRIBE: u8     = 0xA9;
-pub const MSG_TOPIC_UNSUBSCRIBE: u8   = 0xAC;
-pub const MSG_TOPIC_DELIVER: u8       = 0xAA;
-pub const MSG_TOPIC_FORWARD: u8       = 0xAB;
+pub const MSG_TOPIC_PUBLISH: u8 = 0xA8;
+pub const MSG_TOPIC_SUBSCRIBE: u8 = 0xA9;
+pub const MSG_TOPIC_UNSUBSCRIBE: u8 = 0xAC;
+pub const MSG_TOPIC_DELIVER: u8 = 0xAA;
+pub const MSG_TOPIC_FORWARD: u8 = 0xAB;
 /// Session teardown notice. Body: `[session_slot:u32 LE]`. Sent by
 /// session_processor on DISCONNECT so topic_engine can purge any
 /// subscriptions still keyed to the now-defunct slot; otherwise a future
 /// client reusing the slot would inherit them.
-pub const MSG_SESSION_DROP: u8        = 0xAD;
+pub const MSG_SESSION_DROP: u8 = 0xAD;
 
 // Messaging infrastructure
-pub const MSG_OFFLINE_ENQUEUE: u8     = 0xB0;
-pub const MSG_OFFLINE_DRAIN: u8       = 0xB1;
-pub const MSG_RETAINED_WRITE: u8      = 0xB2;
-pub const MSG_RETAINED_READ: u8       = 0xB3;
+pub const MSG_OFFLINE_ENQUEUE: u8 = 0xB0;
+pub const MSG_OFFLINE_DRAIN: u8 = 0xB1;
+pub const MSG_RETAINED_WRITE: u8 = 0xB2;
+pub const MSG_RETAINED_READ: u8 = 0xB3;
 /// Reconnect notice from session_processor → the messaging module's
 /// offline component.
 /// Body: `[session_slot:u32 LE]`. Triggers a drain of every queued
@@ -91,7 +91,7 @@ pub const MSG_RETAINED_READ: u8       = 0xB3;
 /// subscriber receives the messages it would have seen had it stayed
 /// online. Routed on the same messaging bus as the other infrastructure
 /// ops; the offline component filters by msg_type.
-pub const MSG_OFFLINE_RECONNECT: u8   = 0xB4;
+pub const MSG_OFFLINE_RECONNECT: u8 = 0xB4;
 
 /// Apply-pipeline reset fan-out from `session_processor` to every
 /// apply-derived module. Body: `[reset_index:u64 LE]`. Fires when the
@@ -102,39 +102,39 @@ pub const MSG_OFFLINE_RECONNECT: u8   = 0xB4;
 /// handlers (topic_engine, and messaging's dedup / retained / offline
 /// components) clear all apply-derived state; snapshot install
 /// repopulates it.
-pub const MSG_APPLY_RESET_FANOUT: u8  = 0xB5;
+pub const MSG_APPLY_RESET_FANOUT: u8 = 0xB5;
 
 // Consumer groups & transactions
-pub const MSG_GROUP_OP: u8            = 0xB8;
-pub const MSG_GROUP_ASSIGN: u8        = 0xB9;
-pub const MSG_TXN_OP: u8              = 0xBA;
-pub const MSG_TXN_RESULT: u8          = 0xBB;
+pub const MSG_GROUP_OP: u8 = 0xB8;
+pub const MSG_GROUP_ASSIGN: u8 = 0xB9;
+pub const MSG_TXN_OP: u8 = 0xBA;
+pub const MSG_TXN_RESULT: u8 = 0xBB;
 
 // Flow control (Quantum-specific)
-pub const MSG_ACK_REGISTER: u8        = 0xC0;
-pub const MSG_ACK_EMIT: u8            = 0xC1;
-pub const MSG_ACK_REDELIVER: u8       = 0xC2;
-pub const MSG_BP_SIGNAL: u8           = 0xC3;
-pub const MSG_PREFETCH_CREDIT: u8     = 0xC4;
-pub const MSG_DELIVERY_LAG: u8        = 0xC5;
+pub const MSG_ACK_REGISTER: u8 = 0xC0;
+pub const MSG_ACK_EMIT: u8 = 0xC1;
+pub const MSG_ACK_REDELIVER: u8 = 0xC2;
+pub const MSG_BP_SIGNAL: u8 = 0xC3;
+pub const MSG_PREFETCH_CREDIT: u8 = 0xC4;
+pub const MSG_DELIVERY_LAG: u8 = 0xC5;
 
 // Control plane (Quantum-specific)
-pub const MSG_TENANT_RECORD: u8       = 0xD0;
-pub const MSG_TENANT_QUOTA: u8        = 0xD1;
-pub const MSG_TENANT_DISCONNECT: u8   = 0xD2;
-pub const MSG_CAPABILITIES: u8        = 0xD3;
-pub const MSG_EPOCH_EVENT: u8         = 0xD4;
+pub const MSG_TENANT_RECORD: u8 = 0xD0;
+pub const MSG_TENANT_QUOTA: u8 = 0xD1;
+pub const MSG_TENANT_DISCONNECT: u8 = 0xD2;
+pub const MSG_CAPABILITIES: u8 = 0xD3;
+pub const MSG_EPOCH_EVENT: u8 = 0xD4;
 
 // Forward coordination
-pub const MSG_FORWARD_REQUEST: u8     = 0xD8;
-pub const MSG_FORWARD_ACK: u8         = 0xD9;
+pub const MSG_FORWARD_REQUEST: u8 = 0xD8;
+pub const MSG_FORWARD_ACK: u8 = 0xD9;
 
 // Operations
-pub const MSG_AUDIT_EVENT: u8         = 0xE0;
-pub const MSG_DR_SNAPSHOT_REQ: u8     = 0xE1;
-pub const MSG_DR_SNAPSHOT_RESP: u8    = 0xE2;
-pub const MSG_DR_PROMOTE: u8          = 0xE3;
-pub const MSG_METRICS_ROLLUP: u8      = 0xE8;
+pub const MSG_AUDIT_EVENT: u8 = 0xE0;
+pub const MSG_DR_SNAPSHOT_REQ: u8 = 0xE1;
+pub const MSG_DR_SNAPSHOT_RESP: u8 = 0xE2;
+pub const MSG_DR_PROMOTE: u8 = 0xE3;
+pub const MSG_METRICS_ROLLUP: u8 = 0xE8;
 
 /// Client-facing frame on the `codec → protocol → peer_router.client_resp`
 /// chain. Payload is `[conn_id:u8][protocol bytes]`. Carries an
@@ -142,7 +142,7 @@ pub const MSG_METRICS_ROLLUP: u8      = 0xE8;
 /// module's byte FIFO — same rationale as the `codec_in` fan-in fix.
 /// `peer_router` ignores the msg_type and just unwraps the conn_id
 /// prefix; `protocol` forwards the envelope verbatim.
-pub const MSG_CLIENT_FRAME: u8        = 0xEA;
+pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 
 /// Transport-level connection-closed notice on the same
 /// `peer_router.cleartext → protocol::router → codec` chain as
@@ -154,7 +154,7 @@ pub const MSG_CLIENT_FRAME: u8        = 0xEA;
 /// lets every protocol release conn-keyed state (AMQP consumers, Kafka
 /// group members) deterministically instead of leaking until a timeout —
 /// and closes the conn_id-reuse cross-delivery hazard.
-pub const MSG_CONN_CLOSED: u8         = 0xEB;
+pub const MSG_CONN_CLOSED: u8 = 0xEB;
 
 // ── Envelope primitives ─────────────────────────────────────────────────────
 
@@ -163,7 +163,9 @@ pub const MAX_PAYLOAD: usize = 0xFFFF;
 
 #[inline]
 pub fn encode_header(buf: &mut [u8], msg_type: u8, payload_len: u16) -> i32 {
-    if buf.len() < ENVELOPE_HDR { return -1; }
+    if buf.len() < ENVELOPE_HDR {
+        return -1;
+    }
     buf[0] = msg_type;
     let lb = payload_len.to_le_bytes();
     buf[1] = lb[0];
@@ -199,14 +201,18 @@ pub unsafe fn channel_write_msg(
 ) -> i32 {
     const MAX_MSG: usize = crate::abi::CHANNEL_BUFFER_SIZE;
     let total = ENVELOPE_HDR + payload.len();
-    if total > MAX_MSG { return -1; }
+    if total > MAX_MSG {
+        return -1;
+    }
     let mut buf = [0u8; MAX_MSG];
     encode_header(&mut buf[..ENVELOPE_HDR], msg_type, payload.len() as u16);
     if !payload.is_empty() {
         buf[ENVELOPE_HDR..total].copy_from_slice(payload);
     }
     let w = (sys.channel_write)(chan, buf.as_ptr(), total);
-    if w < total as i32 { return -1; }
+    if w < total as i32 {
+        return -1;
+    }
     total as i32
 }
 
@@ -220,23 +226,31 @@ pub unsafe fn channel_read_msg(
 ) -> (u8, u16) {
     let mut hdr = [0u8; ENVELOPE_HDR];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), ENVELOPE_HDR);
-    if n < ENVELOPE_HDR as i32 { return (0, 0); }
+    if n < ENVELOPE_HDR as i32 {
+        return (0, 0);
+    }
     let (msg_type, payload_len) = decode_header(&hdr);
     let plen = payload_len as usize;
-    if plen == 0 { return (msg_type, 0); }
+    if plen == 0 {
+        return (msg_type, 0);
+    }
     if plen > buf.len() {
         let mut discard = [0u8; 256];
         let mut remaining = plen;
         while remaining > 0 {
             let chunk = remaining.min(256);
             let r = (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
-            if r <= 0 { break; }
+            if r <= 0 {
+                break;
+            }
             remaining -= r as usize;
         }
         return (0, 0);
     }
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen { return (0, 0); }
+    if (n2 as usize) < plen {
+        return (0, 0);
+    }
     (msg_type, payload_len)
 }
 
@@ -249,7 +263,9 @@ pub const TAGGED_PROPOSAL_HDR: usize = 8;
 /// Returns total bytes written or -1 if `dst` is too small.
 pub fn encode_tagged_proposal(dst: &mut [u8], correlation_id: u64, body: &[u8]) -> i32 {
     let total = TAGGED_PROPOSAL_HDR + body.len();
-    if dst.len() < total { return -1; }
+    if dst.len() < total {
+        return -1;
+    }
     dst[0..8].copy_from_slice(&correlation_id.to_le_bytes());
     dst[8..total].copy_from_slice(body);
     total as i32
@@ -306,7 +322,9 @@ pub fn encode_dedup_key(buf: &mut [u8], tenant: u32, stream_hash: u64, epoch: u3
 #[inline]
 pub fn decode_dedup_key(buf: &[u8]) -> (u32, u64, u32, u32) {
     let tenant = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let stream_hash = u64::from_le_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
+    let stream_hash = u64::from_le_bytes([
+        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+    ]);
     let epoch = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
     let msg_id = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
     (tenant, stream_hash, epoch, msg_id)
@@ -322,7 +340,9 @@ pub fn encode_topic_key(buf: &mut [u8], tenant: u32, topic_hash: u64) {
 #[inline]
 pub fn decode_topic_key(buf: &[u8]) -> (u32, u64) {
     let tenant = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let topic_hash = u64::from_le_bytes([buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]]);
+    let topic_hash = u64::from_le_bytes([
+        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+    ]);
     (tenant, topic_hash)
 }
 
@@ -349,17 +369,21 @@ pub fn mqtt_topic_match(pattern: &[u8], topic: &[u8]) -> bool {
             return pi == pattern.len() - 1 && (pi == 0 || pattern[pi - 1] == b'/');
         } else if pc == b'+' {
             // Matches single topic level
-            while ti < topic.len() && topic[ti] != b'/' { ti += 1; }
+            while ti < topic.len() && topic[ti] != b'/' {
+                ti += 1;
+            }
             pi += 1;
-            if pi < pattern.len() {
-                if pi < pattern.len() && pattern[pi] == b'/' {
-                    if ti >= topic.len() || topic[ti] != b'/' { return false; }
-                    ti += 1;
-                    pi += 1;
+            if pi < pattern.len() && pi < pattern.len() && pattern[pi] == b'/' {
+                if ti >= topic.len() || topic[ti] != b'/' {
+                    return false;
                 }
+                ti += 1;
+                pi += 1;
             }
         } else {
-            if ti >= topic.len() || topic[ti] != pc { return false; }
+            if ti >= topic.len() || topic[ti] != pc {
+                return false;
+            }
             ti += 1;
             pi += 1;
         }
@@ -593,9 +617,15 @@ pub fn encode_qprop_header(dst: &mut [u8], op: u8, tenant: u32, session_slot: u3
 /// (currently only QOP_PUBLISH V2, see `QPROP_VERSION_V2`).
 #[inline]
 pub fn encode_qprop_header_v(
-    dst: &mut [u8], version: u8, op: u8, tenant: u32, session_slot: u32,
+    dst: &mut [u8],
+    version: u8,
+    op: u8,
+    tenant: u32,
+    session_slot: u32,
 ) -> i32 {
-    if dst.len() < QPROP_HEADER_LEN { return -1; }
+    if dst.len() < QPROP_HEADER_LEN {
+        return -1;
+    }
     dst[0] = version;
     dst[1] = op;
     dst[2..6].copy_from_slice(&tenant.to_le_bytes());
@@ -608,9 +638,13 @@ pub fn encode_qprop_header_v(
 /// the version is recognised; `None` otherwise.
 #[inline]
 pub fn decode_qprop_header(buf: &[u8]) -> Option<(u8, u8, u32, u32)> {
-    if buf.len() < QPROP_HEADER_LEN { return None; }
+    if buf.len() < QPROP_HEADER_LEN {
+        return None;
+    }
     let version = buf[0];
-    if version != QPROP_VERSION_V1 && version != QPROP_VERSION_V2 { return None; }
+    if version != QPROP_VERSION_V1 && version != QPROP_VERSION_V2 {
+        return None;
+    }
     let op = buf[1];
     let tenant = u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]);
     let session_slot = u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]);
@@ -640,8 +674,10 @@ pub struct PeeledQProp {
 pub fn peel_qprop(buf: &[u8]) -> Option<PeeledQProp> {
     let (version, op, tenant, session_slot) = decode_qprop_header(buf)?;
     Some(PeeledQProp {
-        version, op, tenant, session_slot,
+        version,
+        op,
+        tenant,
+        session_slot,
         op_body_offset: QPROP_HEADER_LEN,
     })
 }
-

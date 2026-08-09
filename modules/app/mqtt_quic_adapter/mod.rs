@@ -31,11 +31,7 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow"
-)]
+#[allow(unused_imports, dead_code, reason = "see file-level allow")]
 #[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
@@ -100,22 +96,46 @@ struct ModuleState {
 
 #[no_mangle]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 { core::mem::size_of::<ModuleState>() as u32 }
+pub extern "C" fn module_state_size() -> u32 {
+    core::mem::size_of::<ModuleState>() as u32
+}
 
+/// PIC module ABI entry: one-time process-wide init, before any instance
+/// exists.
+///
+/// # Safety
+/// `syscalls` is a kernel-owned table whose function pointers reach live
+/// kernel routines for the lifetime of the process.
 #[no_mangle]
 #[link_section = ".text.module_init"]
-pub extern "C" fn module_init(_syscalls: *const c_void) {}
+pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// PIC module ABI entry: construct module state in `state` (kernel-allocated
+/// from the manifest-declared `state_size`).
+///
+/// # Safety
+/// `state` / `params` / `syscalls` are kernel-owned buffers passed across the
+/// module ABI. The kernel guarantees `state` is at least `state_size` bytes,
+/// `params` is at least `params_len` bytes, and `state` is zero-initialised.
 #[no_mangle]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, _ctrl_chan: i32,
-    _params: *const u8, _params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+pub unsafe extern "C" fn module_new(
+    in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    _params: *const u8,
+    _params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<ModuleState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<ModuleState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
@@ -132,9 +152,14 @@ pub extern "C" fn module_new(
     }
 }
 
+/// PIC module ABI entry: run one scheduler step against this instance.
+///
+/// # Safety
+/// `state` is the kernel-owned buffer a prior `module_new` initialised, and is
+/// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -149,10 +174,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // `[session_id:4][stream_id:4][data]`.
         for _ in 0..8 {
             let poll = (sys.channel_poll)(s.quic_in, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                break;
+            }
             let (mtype, plen) =
                 net_read_frame(sys, s.quic_in, s.rx_buf.as_mut_ptr(), s.rx_buf.len());
-            if mtype == 0 && plen == 0 { break; }
+            if mtype == 0 && plen == 0 {
+                break;
+            }
             let pl = plen;
             if mtype != MSG_MUX_STREAM_RX {
                 // STREAM_ACCEPTED / PEER_IDENTITY / STREAM_CLOSED / DATAGRAM_RX
@@ -161,7 +190,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // the MQTT control channel rides the bidi stream, not datagrams.
                 continue;
             }
-            if pl < STREAM_DATA_PREFIX { s.parse_errors += 1; continue; }
+            if pl < STREAM_DATA_PREFIX {
+                s.parse_errors += 1;
+                continue;
+            }
             let base = NET_FRAME_HDR;
             // session_id (provider connection index) → mqtt conn_id; the
             // constrained profile keeps it small (< MAX_CONNS).
@@ -171,12 +203,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 && s.rx_buf[base + SESSION_ID_BYTES + 1] == 0
                 && s.rx_buf[base + SESSION_ID_BYTES + 2] == 0
                 && s.rx_buf[base + SESSION_ID_BYTES + 3] == 0;
-            if !stream0 { s.dropped += 1; continue; }
+            if !stream0 {
+                s.dropped += 1;
+                continue;
+            }
             let data_off = base + STREAM_DATA_PREFIX;
             let data_len = pl - STREAM_DATA_PREFIX;
-            if data_len == 0 { continue; }
+            if data_len == 0 {
+                continue;
+            }
             let total = 1 + data_len;
-            if total > s.frame_buf.len() { s.dropped += 1; continue; }
+            if total > s.frame_buf.len() {
+                s.dropped += 1;
+                continue;
+            }
             s.frame_buf[0] = cid;
             core::ptr::copy_nonoverlapping(
                 s.rx_buf.as_ptr().add(data_off),
@@ -187,9 +227,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // envelope) so per-conn records don't coalesce on the byte FIFO —
             // same framing the router uses on the TCP path.
             let w = wire::channel_write_msg(
-                sys, s.mqtt_out, wire::MSG_CLIENT_FRAME, &s.frame_buf[..total],
+                sys,
+                s.mqtt_out,
+                wire::MSG_CLIENT_FRAME,
+                &s.frame_buf[..total],
             );
-            if w > 0 { s.stream_frames_in += 1; } else { s.dropped += 1; }
+            if w > 0 {
+                s.stream_frames_in += 1;
+            } else {
+                s.dropped += 1;
+            }
         }
 
         // ── Outbound: protocol.frames_out → quic.app_in ───────────
@@ -203,15 +250,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.frames_in >= 0 && s.quic_out >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.frames_in, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
                 let (mtype, plen) = wire::channel_read_msg(sys, s.frames_in, &mut s.frame_buf);
-                if plen < 1 { continue; }
-                if mtype != wire::MSG_CLIENT_FRAME { s.dropped += 1; continue; }
+                if plen < 1 {
+                    continue;
+                }
+                if mtype != wire::MSG_CLIENT_FRAME {
+                    s.dropped += 1;
+                    continue;
+                }
                 let plen = plen as usize;
                 let cid = s.frame_buf[0];
                 let data_len = plen - 1;
                 let payload_len = STREAM_DATA_PREFIX + data_len;
-                if NET_FRAME_HDR + payload_len > s.tx_buf.len() { s.dropped += 1; continue; }
+                if NET_FRAME_HDR + payload_len > s.tx_buf.len() {
+                    s.dropped += 1;
+                    continue;
+                }
                 // payload built at tx_buf[NET_FRAME_HDR..]; net_write_frame
                 // prepends the [msg_type][len] header in place via scratch.
                 let mut payload = [0u8; STREAM_DATA_PREFIX + MAX_PACKET];
@@ -233,7 +290,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.tx_buf.as_mut_ptr(),
                     s.tx_buf.len(),
                 );
-                if w > 0 { s.stream_frames_out += 1; } else { s.dropped += 1; }
+                if w > 0 {
+                    s.stream_frames_out += 1;
+                } else {
+                    s.dropped += 1;
+                }
             }
         }
 
