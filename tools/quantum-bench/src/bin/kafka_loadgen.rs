@@ -23,7 +23,7 @@
 //! the broker sends no response and latency is the send-call cost only.
 //!
 //! Usage:
-//!   quantum-kafka-loadgen --host 192.168.1.9 [--port 9092] --rate 1000 \
+//!   quantum-kafka-loadgen --host <dut-ip> [--port 9092] --rate 1000 \
 //!       [--duration N] [--conns N] [--topic bench] [--batch N] \
 //!       [--value-size B] [--acks -1|0|1] [--pipeline N] [--skip-metadata] \
 //!       [--handshake-only]

@@ -34,7 +34,7 @@ targets = ["bcm2712"]
 [ci.lints]
 # No exemptions: with no root workspace there is no `[lints] workspace =
 # true` opt-in to audit. Each host crate under tools/ inlines the
-# standards/lints.md §1 baseline directly, and `tools/host_crates_e2e.sh`
+# standards/lints.md §1 baseline directly, and `tools/ci/host_crates.sh`
 # is what enforces it.
 
 [ci.hygiene]
@@ -49,19 +49,22 @@ max_inline_lines    = 80
 
 [ci.test]
 # Shadow-checkout hard-fail guard (standards/test-tracking.md §7):
-# tests/ is shadow-tracked in .git-shadow/, so a checkout of the
-# primary repo alone has zero files there and the integration surface
-# would be silently absent. The guard fails CI instead.
+# tests/ and examples/ are shadow-tracked in .git-shadow/, so a checkout
+# of the primary repo alone has zero files there and both the integration
+# surface and the graphs it boots would be silently absent. The guard
+# fails CI instead.
 #
 # Host-crate gate: quantum has no root Cargo workspace, so `fluxor ci`
 # phase 2 is omitted and the tools/ crates are built, linted and tested
-# by nothing. `tools/host_crates_e2e.sh` closes that hole.
-scripts = ["tools/ci-shadow-guard.sh", "tools/host_crates_e2e.sh"]
+# by nothing. `tools/ci/host_crates.sh` closes that hole.
+scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh"]
 
 [ci.templates]
-# Quantum's configs are concrete YAML (no __KEY__ placeholders today),
-# so the template-render phase is a no-op pass over this directory.
-dir = "configs"
+# Quantum's graphs are concrete YAML (no __KEY__ placeholders today), so
+# the template-render phase is a no-op pass over this directory. It is
+# shadow-tracked; the guard above is what stops the phase passing on an
+# empty tree.
+dir = "examples"
 
 [required]
 # Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps

@@ -30,8 +30,8 @@ Quantum's bare-metal build and scenarios live in these files:
 | File | Purpose |
 |---|---|
 | `.fluxor-rig.toml` | `[build.pi5]` recipe — builds Fluxor's pi5 firmware from the sibling `../fluxor` checkout, builds Quantum's PIC modules, runs `fluxor sync` to pull foundation/SDK artefacts, then `fluxor build` to produce a single kernel image |
-| `configs/quantum-pi5-smoke.yaml` | Minimal `modules: []` graph the smoke boots — exercises the dev-host → DUT pipeline through kernel handoff |
-| `configs/quantum-pi5.yaml` | Full-graph pi5 deployment (15 modules); group-fsync is controlled by `durability`'s `fsync_mode` / `group_window_ms` / `group_max_pending`, and `root_path: 1` puts WAL segments and snapshots at the FAT32 root |
+| `examples/rig/pi5_smoke.yaml` | Minimal `modules: []` graph the smoke boots — exercises the dev-host → DUT pipeline through kernel handoff |
+| `examples/rig/pi5.yaml` | Full-graph pi5 deployment (15 modules); group-fsync is controlled by `durability`'s `fsync_mode` / `group_window_ms` / `group_max_pending`, and `root_path: 1` puts WAL segments and snapshots at the FAT32 root |
 | `tests/hardware/quantum_pi5_boot.toml` | Smoke scenario; pass signal is `observe.netboot_fetch` matching `kernel_2712.img` |
 
 ## Running the smoke
@@ -41,7 +41,7 @@ fluxor rig test --scenario tests/hardware/quantum_pi5_boot.toml
 ```
 
 This builds the artefact, acquires the rig lock, stages
-`target/pi5/images/quantum-pi5-smoke.img` into the TFTP root as
+`target/pi5/images/rig/pi5_smoke.img` into the TFTP root as
 `kernel_2712.img`, power-cycles the DUT via the smart plug, watches
 dnsmasq's journal for the netboot fetch, and reports pass/fail. `--plan`
 dry-runs the resolution without touching the rig.
@@ -53,7 +53,7 @@ comes online, stronger pass rules layer on top via the rig profile:
 
 1. **Console regex** — a `console.serial` pass rule, once the RP1 UART
    path is reachable from a bare-metal kernel.
-2. **MQTT CONNECT** — a pass rule against the full `quantum-pi5.yaml`
+2. **MQTT CONNECT** — a pass rule against the full `pi5.yaml`
    graph, once NVMe-backed FAT32 (for the persistent WAL) is wired
    through the kernel image.
 3. **UDP log capture** — a `telemetry.monitor_udp` pass rule against
@@ -70,7 +70,7 @@ not a console.
 
 ## Relationship to the Linux path
 
-The Linux graphs (`quantum-linux*.yaml`) exercise the same Quantum and
+The Linux graphs (`examples/linux/*.yaml`) exercise the same Quantum and
 Clustor application modules on top of the `linux_net` / `linux_fs`
 platform layer. They are the right target for fast local iteration and
 for the integration harnesses ([cli.md](cli.md)), but they are **not**

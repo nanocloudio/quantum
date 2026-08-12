@@ -19,10 +19,18 @@ Cargo.lock
 # own target/, so a leading-slash rule would miss them.
 target/
 # Shadow-tracked (see standards/test-tracking.md) — versioned in
-# .git-shadow/, never pushed to this repo's remote.
+# .git-shadow/, never pushed to this repo's remote. `examples/` joins
+# `tests/` because the graphs carry rig topology (DUT addresses, bench
+# matrices), matching wave and spectra. `.fluxor-rig.toml` is the rig
+# build recipe: local layout, not a shipped artefact.
 /tests/
+/examples/
+/.fluxor-rig.toml
 /.git-shadow/
+
+# Runtime state, created by the graphs and the integration scripts.
 /data/
+/wal/
 /certs/
 
 modules/module.ld

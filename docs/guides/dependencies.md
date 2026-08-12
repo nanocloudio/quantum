@@ -2,7 +2,7 @@
 
 Quantum is a graph of `.fmod` modules loaded by the Fluxor runtime. The deployable surface is the modules tree, not a Cargo binary, and there is no root Cargo workspace: shared source in `modules/common/` is `#[path]`-mounted by the modules that use it and published to the store as a source artefact, while the host-side tools under `tools/` are standalone crates.
 
-Cross-project dependencies (Fluxor + Clustor) flow through the local Fluxor OCI store (`$FLUXOR_STORE`, default `~/.local/share/fluxor/store`) per the contract in `standards/dependencies.md`, pinned by digest in `fluxor.lock`. The store is local-first; remote serving layers on top of the same registry:2-shaped constructs.
+Cross-project dependencies (Fluxor + Clustor) flow through the local Fluxor OCI store (`$FLUXOR_STORE`, default `~/.local/share/fluxor/store`) per the contract in `standards/dependencies.md`, pinned by digest in `fluxor.lock`. The store is local-first, and Registry:2 compatibility is a standing invariant, so remote serving layers on top of the same constructs.
 
 ## Required Checkouts
 
@@ -55,7 +55,7 @@ In live workspace mode each member's sources / fmods / runtime resolve to that m
 |---|---|---|
 | `rustc` with `aarch64-unknown-none` target | Compiles modules to PIC objects | `rustup target add aarch64-unknown-none` |
 | `rust-lld` | Links module objects against `module.ld` with `--gc-sections --no-undefined` | Ships with the Rust toolchain (`rustup component add llvm-tools-preview` if missing) |
-| `fluxor` host tool | `update`, `sync`, `validate`, `build`, `run`, `rig`, `modules build` | `make -C ../fluxor install` (bootstrap only — the installed launcher thereafter resolves the CLI from the store) |
+| `fluxor` host tool | `update`, `sync`, `build`, `run`, `rig`, `modules build` | `make -C ../fluxor install` (bootstrap only — the installed launcher thereafter resolves the CLI from the store) |
 
 Quantum modules build for `aarch64-unknown-none` only — bare-metal `--crate-type=lib` builds with no `std`, no allocator, and no async runtime.
 
@@ -102,11 +102,11 @@ Reproducibility is enforced by the committed `fluxor.lock` — store-resolved ar
 | Check | Command |
 |---|---|
 | Lockfile consistent with `fluxor.toml` + store state | Part of `make ci` (the `lockfile-consistency` phase) |
-| Graph YAML matches current module manifests | `fluxor build --check configs/quantum-*.yaml` |
+| Graph YAML matches current module manifests | `for c in examples/*/*.yaml; do fluxor build --check "$c" || break; done` (one config per invocation) |
 | Modules compile cleanly for every supported target | `fluxor modules build --all --out target` |
 | Runtime end-to-end behaviour | `tests/integration/module_graph_mqtt.sh && tests/integration/module_graph_load.sh` (after a modules build) |
 
-When upstream cuts a new fluxor or clustor release, re-run `fluxor update && fluxor sync && fluxor modules build --all --out target && fluxor build --check configs/quantum-*.yaml` to catch ABI drift in the module SDK or substrate output ports.
+When upstream cuts a new fluxor or clustor release, re-run `fluxor update && fluxor sync && fluxor modules build --all --out target`, then re-check every graph, to catch ABI drift in the module SDK or substrate output ports.
 
 ## Policy Reminders
 

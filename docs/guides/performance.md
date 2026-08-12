@@ -20,7 +20,7 @@ summary:
 |---|---|---|
 | [tests/integration/module_graph_load.sh](../../tests/integration/module_graph_load.sh) | QoS-1 publishes through the full Raft pipeline; asserts every PUBACK returns. `CLIENTS=N MSGS_PER_CLIENT=M` overrides defaults. | PUBACK latency distribution, missing acks, listener TCP retransmits. |
 | [tests/integration/qos1_test.py](../../tests/integration/qos1_test.py) | Single QoS-1 PUBLISH; asserts PUBACK with matching packet_id. Fast-path sanity check that the proposal → batch → WAL → fsync → durability → ack chain is alive. | Pass/fail. |
-| [tests/integration/wal_durability_test.py](../../tests/integration/wal_durability_test.py) | 24 distinct clients across both partitions of `quantum-linux-2p.yaml`; asserts every WAL segment grew. | Per-partition WAL size; durability regressions where unwired downstream back-pressures the WAL writer. |
+| [tests/integration/wal_durability_test.py](../../tests/integration/wal_durability_test.py) | 24 distinct clients across both partitions of `two_partition.yaml`; asserts every WAL segment grew. | Per-partition WAL size; durability regressions where unwired downstream back-pressures the WAL writer. |
 | [ops/scripts/chaos.sh publish-burst N=… M=…](../../ops/scripts/chaos.sh) | Synthetic publish flood across N messages × M topics from a single TCP client. | Throughput (pub/s), runtime resource use, queue depths. |
 | [ops/scripts/chaos.sh connect-storm N=…](../../ops/scripts/chaos.sh) | N parallel CONNECTs. | Listener accept rate, CONNECT → CONNACK latency under load. |
 
@@ -29,7 +29,7 @@ For long-running real-load testing, drive the running graph with external genera
 ## Suggested procedure
 
 1. Build modules for the target hardware (`fluxor modules build --target bcm2712 --out target` here; `make modules TARGET=bcm2712` in `clustor`).
-2. Launch the graph: `fluxor run configs/quantum-linux.yaml` (or `quantum-pi5.yaml` on a Pi 5).
+2. Launch the graph: `fluxor run examples/linux/full.yaml` (or `pi5.yaml` on a Pi 5).
 3. Confirm baseline health: `runtime_smoke.sh`, `/readyz` green, leader elected.
 4. Pin the test tenant to one PRG via the graph YAML (or CP bootstrap seeds).
 5. Run a publish flood at the target rate for ≥5 minutes per QoS level (0, 1, 2). Suggested: `chaos.sh publish-burst N=300000 M=10` per 10-minute window for QoS-0 sustained.
@@ -50,7 +50,7 @@ For long-running real-load testing, drive the running graph with external genera
 
 ## Validated behaviour
 
-The minimal MQTT graph (`configs/quantum-linux-minimal.yaml`) boots and
+The minimal MQTT graph (`examples/linux/minimal.yaml`) boots and
 serves real protocol traffic; `make test-mqtt-suite` exercises the
 following end-to-end against a live graph. These are functional
 validations — throughput and latency are measured per the procedure

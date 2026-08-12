@@ -117,7 +117,7 @@ MQTT/QUIC listeners.
    and `control_plane.bootstrap_placements`. If left empty, the
    runtime creates a `local` tenant with one placement targeting
    `durability.replica_id`.
-4. Launch with `fluxor run configs/<config>.yaml` (or
+4. Launch with `fluxor run examples/<config>.yaml` (or
    `systemctl start quantum`).
 
 ### Multi-node embedded

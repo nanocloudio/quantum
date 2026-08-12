@@ -4,29 +4,33 @@ Quantum is configured by a **graph YAML**: one file describes one
 deployable broker as a set of modules, their parameters, the wiring
 between their ports, and the platform and scheduler settings the runtime
 boots under. There is no separate flat config file — the graph *is* the
-configuration. `fluxor build --check configs/<file>.yaml` checks a graph
-against the current module manifests; `fluxor run configs/<file>.yaml`
+configuration. `fluxor build --check examples/linux/full.yaml` checks a graph
+against the current module manifests; `fluxor run examples/linux/full.yaml`
 boots it.
 
 The architecture the graph expresses is described in
 [architecture.md](../architecture.md); this guide covers the config
 surface an operator edits.
 
-## Shipped configs
+## The graphs
+
+Every graph lives under `examples/`, which is shadow-tracked
+(`../../standards/test-tracking.md`) — a clone of the primary repository has
+none of them.
 
 | File | Target | Purpose |
 |---|---|---|
-| `configs/quantum-pi5.yaml` | pi5 | Full bare-metal deployment graph — 15 modules, the Linux set plus `tls` (see [bring_up.md](bring_up.md)) |
-| `configs/quantum-pi5-smoke.yaml` | pi5 | Minimal `modules: []` graph for the netboot smoke |
-| `configs/quantum-linux.yaml` | linux | Full graph on the Linux platform stack — 14 modules: 7 Clustor substrate + 7 Quantum |
-| `configs/quantum-pi5-bench.yaml` | pi5 | The pi5 graph plus the in-graph load injector — 16 modules |
-| `configs/quantum-pi5-kafka-bench.yaml` | pi5 | Kafka produce bench for the rig — 13 modules |
-| `configs/quantum-linux-2p.yaml` | linux | Two-partition variant for WAL-durability tests — 15 modules |
-| `configs/quantum-linux-minimal.yaml` | linux | Reduced MQTT-only graph for smokes — 13 modules |
-| `configs/quantum-linux-quic.yaml` | linux | MQTT-over-QUIC ingress via `quic` + `mqtt_quic_adapter` — 15 modules |
-| `configs/quantum-linux-md.yaml` | linux | Local multi-domain proxy for the pi5 Kafka bench — 13 modules |
-| `configs/quantum-node0.yaml` … `node2.yaml` | linux | Three-node cluster for replication tests — 12 modules each |
-| `configs/consensus-bench-pi5.yaml` | pi5 | Consensus/WAL bench, no protocol surface — 8 modules |
+| `examples/linux/full.yaml` | linux | Full graph on the Linux platform stack — 14 modules: 7 Clustor substrate + 7 Quantum |
+| `examples/linux/minimal.yaml` | linux | Reduced MQTT-only graph for smokes — 13 modules |
+| `examples/linux/quic.yaml` | linux | MQTT-over-QUIC ingress via `quic` + `mqtt_quic_adapter` — 15 modules |
+| `examples/linux/two_partition.yaml` | linux | Two-partition variant for WAL-durability tests — 15 modules |
+| `examples/linux/multi_domain.yaml` | linux | Local twin of the pi5 multi-domain layout — 13 modules |
+| `examples/linux/node0.yaml` … `node2.yaml` | linux | Three-node cluster for replication tests — 12 modules each |
+| `examples/rig/pi5.yaml` | pi5 | Full bare-metal deployment graph — 15 modules, the Linux set plus `tls` (see [bring_up.md](bring_up.md)) |
+| `examples/rig/pi5_bench.yaml` | pi5 | The pi5 graph plus the in-graph load injector — 16 modules |
+| `examples/rig/pi5_kafka_bench.yaml` | pi5 | Kafka produce bench for the rig — 13 modules |
+| `examples/rig/pi5_consensus_bench.yaml` | pi5 | Consensus/WAL bench, no protocol surface — 8 modules |
+| `examples/rig/pi5_smoke.yaml` | pi5 | Minimal `modules: []` graph for the netboot smoke |
 
 ## Anatomy of a graph
 
@@ -71,9 +75,9 @@ The `platform` block and the transport modules differ by target:
 
 - **Linux** (`target: linux`) uses `platform.net: {}` and the
   `linux_net` module for sockets. `gateway` frames the client and HTTP
-  request paths, `operations` serves the diagnostic surface, and
-  multi-listener graphs add `protocol` to merge protocol and HTTP
-  responses onto `peer_router.client_resp`.
+  request paths and `operations` serves the diagnostic surface; both
+  `protocol.frames_out` and `gateway.responses` fan into
+  `peer_router.client_resp`, which the graph merges.
 - **Bare-metal** (`target: pi5`, the board over `bcm2712` silicon) uses the on-device
   stack — `ip`, `tls`, `gateway` — described in
   [architecture.md](../architecture.md#module-reference) and brought up
@@ -130,7 +134,7 @@ drivers default to (override with `QUANTUM_HOST` / `QUANTUM_PORT`, or
 All three protocols live in the one `protocol` module, whose router
 demuxes each connection by ALPN tag (falling back to `mqtt`) and hands it
 to the owning codec. A graph that names `protocol` with no `variant:` —
-as `quantum-linux-minimal.yaml` does — gets the `full` variant and serves
+as `minimal.yaml` does — gets the `full` variant and serves
 all three.
 
 To serve fewer, select a variant in the graph YAML; the codecs a

@@ -91,7 +91,7 @@ define_params! {
     ModuleState;
 
     // Broker address advertised in Kafka Metadata responses. Must be the
-    // address CLIENTS can reach (e.g. 192.168.1.9 on the rig), not the
+    // address CLIENTS can reach (the rig DUT's address, say), not the
     // bind address. Default 127.0.0.1 keeps local dev working.
     1, advertised_host, str, 0
         => |s, d, len| {

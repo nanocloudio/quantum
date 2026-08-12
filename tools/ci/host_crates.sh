@@ -19,7 +19,7 @@
 # `[ci.test] scripts` in fluxor.toml is what makes this run.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench")
 

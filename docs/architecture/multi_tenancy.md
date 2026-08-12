@@ -72,7 +72,7 @@ loop.
 
 ## Implementation status
 
-**Tenancy is not plumbed end to end.** Every graph in `configs/`
+**Tenancy is not plumbed end to end.** Every graph in `examples/`
 currently produces exactly one tenant (id 0), and the mechanisms below
 describe the design rather than what runs today.
 

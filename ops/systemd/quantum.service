@@ -15,7 +15,7 @@ Group=quantum
 Environment=QUANTUM_ROOT=/opt/quantum
 Environment=FLUXOR_BIN=/opt/quantum/bin/fluxor
 Environment=FLUXOR_LINUX_BIN=/opt/quantum/bin/fluxor-linux
-Environment=QUANTUM_CONFIG=/etc/quantum/quantum-pi5.yaml
+Environment=QUANTUM_CONFIG=/etc/quantum/pi5.yaml
 Environment=RUST_LOG=info
 
 # Working directory must contain target/{bcm2712,linux}/modules/ symlinks

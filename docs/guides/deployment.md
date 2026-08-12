@@ -70,7 +70,7 @@ Defaults:
 Environment=QUANTUM_ROOT=/opt/quantum
 Environment=FLUXOR_BIN=/opt/quantum/bin/fluxor
 Environment=FLUXOR_LINUX_BIN=/opt/quantum/bin/fluxor-linux
-Environment=QUANTUM_CONFIG=/etc/quantum/quantum-pi5.yaml
+Environment=QUANTUM_CONFIG=/etc/quantum/pi5.yaml
 ExecStart=/opt/quantum/bin/fluxor run ${QUANTUM_CONFIG}
 Restart=on-failure
 RestartSec=5s
@@ -95,7 +95,7 @@ sudo systemctl edit quantum
 
 ```ini
 [Service]
-Environment=QUANTUM_CONFIG=/etc/quantum/quantum-linux.yaml
+Environment=QUANTUM_CONFIG=/etc/quantum/full.yaml
 ```
 
 Then `sudo systemctl restart quantum`.

@@ -4,7 +4,7 @@ Quantum speaks standard MQTT 3.1/3.1.1/5.0 on the wire (`protocol`'s mqtt compon
 
 ## Prerequisites
 
-- A running Quantum graph with the MQTT listener exposed. The minimal graph (`fluxor run configs/quantum-linux-minimal.yaml`) binds `127.0.0.1:9090` cleartext; production graphs bind TLS.
+- A running Quantum graph with the MQTT listener exposed. The minimal graph (`fluxor run examples/linux/minimal.yaml`) binds `127.0.0.1:9090` cleartext; production graphs bind TLS.
 - `mosquitto_pub` / `mosquitto_sub` installed. Override path with `MOSQUITTO_PUB_BIN` / `MOSQUITTO_SUB_BIN` if not in `$PATH`.
 - Paho MQTT C/Python sample client for advanced scenarios (QUIC, MQTT 5 takeover). Override path with `PAHO_SAMPLE`.
 - TLS assets (client cert + key + CA) matching the listener configuration when targeting a TLS listener.
@@ -63,7 +63,7 @@ mosquitto_pub -h <host> -p <port> -t tenant/state -m online -r --will-topic tena
 
 ### 4. QUIC QoS-2 resume (Paho)
 
-QUIC requires the `quic` listener to be wired in the graph (not present in `quantum-linux-minimal.yaml`). Once present:
+QUIC requires the `quic` listener to be wired in the graph (not present in `minimal.yaml`). Once present:
 
 - Connect via Paho with ALPN `mqtt-quic`, `clean_start=false`.
 - Force-disconnect mid-inflight; reconnect.
@@ -101,7 +101,7 @@ response) by an integration test under `tests/integration/`, run via
 
 ## Notes on QUIC
 
-- **MQTT-over-QUIC** is bridged by the `mqtt_quic_adapter` module, which sits between Fluxor's `quic` foundation module and `protocol`'s mqtt component without changing either side. `configs/quantum-linux-quic.yaml` wires it on UDP 4443; the graph validates and boots (UDP binds, Raft leader elected). The end-to-end smoke (`tests/integration/module_graph_mqtt_quic.sh`, the last leg of `make test-mqtt-suite`) drives a CONNECT + QoS 1 PUBLISH over a QUIC bidi stream using `aioquic`, and skips (exit 77) when `aioquic` is not installed — `pip install aioquic` runs it locally.
+- **MQTT-over-QUIC** is bridged by the `mqtt_quic_adapter` module, which sits between Fluxor's `quic` foundation module and `protocol`'s mqtt component without changing either side. `examples/linux/quic.yaml` wires it on UDP 4443; the graph validates and boots (UDP binds, Raft leader elected). The end-to-end smoke (`tests/integration/module_graph_mqtt_quic.sh`, the last leg of `make test-mqtt-suite`) drives a CONNECT + QoS 1 PUBLISH over a QUIC bidi stream using `aioquic`, and skips (exit 77) when `aioquic` is not installed — `pip install aioquic` runs it locally.
 - ALPN `mqtt-quic` is the routing tag the `protocol` router looks for; the router's `default_protocol = mqtt` falls back to MQTT-over-TLS on unknown ALPN.
 - 0-RTT should be disabled except for CONNECT (the codec rejects 0-RTT data for non-CONNECT packets).
 - Certificate material must permit QUIC ALPN selection.

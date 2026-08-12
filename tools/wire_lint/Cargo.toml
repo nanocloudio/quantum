@@ -14,7 +14,7 @@ sha2   = "0.10.9"
 # Quantum has no root Cargo workspace (the deployable surface is modules/,
 # and host crates stand alone under tools/), so the standards/lints.md §1
 # baseline is inlined here rather than inherited. Keep in sync with the
-# sibling tools; `tools/host_crates_e2e.sh` is what enforces it in CI.
+# sibling tools; `tools/ci/host_crates.sh` is what enforces it in CI.
 [lints.rust]
 unsafe_code               = "deny"
 unused_must_use           = "deny"

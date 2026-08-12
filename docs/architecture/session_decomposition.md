@@ -23,7 +23,7 @@ Three payoffs, in descending order of value:
    and is the larger half of the win — but only once the state is
    separable along a seam that a `#[cfg]` can cut.
 2. **Multi-partition.** [partitioning.md](partitioning.md) states the
-   apply loop is per-PRG, and `quantum-linux-2p.yaml` runs two
+   apply loop is per-PRG, and `two_partition.yaml` runs two
    consensus/durability pairs. But `module_new` takes no params
    (`_params`, `_params_len` are both ignored) and tenant is hardcoded
    (`let tenant: TenantId = 0;`). Per-instance state keyed by
@@ -271,7 +271,7 @@ the previous is verified.
    turned out to be the wrong diagnosis. The partition-scoped state is
    already keyed per instance — `store`'s log is keyed by
    `(topic, partition)`, `consumers`' offsets by
-   `(group, topic, partition)` — and `quantum-linux-2p.yaml` runs one
+   `(group, topic, partition)` — and `two_partition.yaml` runs one
    `session_processor` across two partitions deliberately, so the module
    does not want a partition identity of its own.
 
@@ -308,7 +308,7 @@ the previous is verified.
    | amqp | 24,860 | 50,088 | **74,948** |
 
    An MQTT-only deployment loads **53% less code**. Verified
-   functionally, not just by build: `quantum-linux-2p.yaml` (both
+   functionally, not just by build: `two_partition.yaml` (both
    modules at `variant: mqtt`) boots and passes the pubsub round-trip
    with Kafka and AMQP compiled out.
 

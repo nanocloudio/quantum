@@ -2,7 +2,7 @@
 
 Quantum is a multi-protocol message broker (MQTT 3.1/3.1.1/5.0, Kafka, AMQP 0-9-1) built as a graph of cooperative modules on the [Fluxor](../fluxor) runtime, layered on top of the [Clustor](../clustor) Raft substrate. There is no monolithic Rust binary: the runtime is `fluxor-linux` (or the bare-metal equivalent), and every operational concern — codecs, session state, dedupe, retained store, forward coordination, control-plane enforcement, audit, metrics — is a position-independent `.fmod` module loaded by that runtime.
 
-14 modules across 6 execution domains: 7 Clustor substrate modules (`peer_router`, `consensus`, `durability`, `gateway`, `admission`, `control_plane`, `operations`) and **7 Quantum application modules**. Bare-metal deployments add the Fluxor `tls` foundation module for a 15-module graph. The full architecture — layers, execution domains, module reference, and message graph — lives in [docs/architecture.md](docs/architecture.md).
+14 modules across 6 execution domains: 7 Clustor substrate modules (`peer_router`, `consensus`, `durability`, `gateway`, `admission`, `control_plane`, `operations`) and **7 Quantum application modules**. Bare-metal deployments add the Fluxor `tls` foundation module for a 15-module graph. `mqtt_quic_adapter` joins them for QUIC ingress. `modules/app/` holds five further modules that no broker graph wires in: the outbound protocol clients (`kafka_client`, `amqp_client`, `nats_client`, each with a demonstration graph under `examples/`, plus `mqtt_client`, which has none yet) and `capability_registry`. The full architecture — layers, execution domains, module reference, and message graph — lives in [docs/architecture.md](docs/architecture.md).
 
 ---
 
@@ -92,7 +92,7 @@ graph TD
 - **Consensus** is Clustor's stock pipeline: `consensus` batches proposals, appends to `durability` (per-entry or group fsync controlled by its `fsync_mode` param), fuses the quorum durability proof into a commit horizon, and delivers ordered applies. Quantum's `session_processor` is the apply callback.
 - **Ops** modules run on the cooperative core: CP polling, tenant policy enforcement, DR orchestration, audit signing, dimensional metric rollup, HTTP surface.
 
-The full module reference and message graph live in [docs/architecture.md](docs/architecture.md); the canonical wireable graph is in [configs/](configs/).
+The full module reference and message graph live in [docs/architecture.md](docs/architecture.md); the canonical wireable graph is in [examples/](examples/).
 
 ---
 
@@ -181,34 +181,67 @@ else is the `fluxor` CLI or a script invoked directly:
 | `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
 | `tests/integration/module_graph_mqtt.sh` | E2E: spin up the graph, run MQTT/AMQP/Kafka smoke against it |
 | `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
-| `fluxor build --check configs/quantum-*.yaml` | Validate the shipped graph YAMLs against current module manifests |
+| `fluxor build --check examples/linux/full.yaml` | Validate one graph YAML against current module manifests (one per invocation) |
 ---
 
 ## Run
 
-Graph configs live under [configs/](configs/):
+Graphs live under [examples/](examples/) — `linux/` for the Linux runtime,
+`rig/` for bare-metal pi5, plus the outbound client graphs. Each is described in
+[examples/README.md](examples/README.md).
 
-| Config | Topology |
+| Graph | Topology |
 |---|---|
-| `quantum-linux.yaml` | Full single-node graph (14 modules) |
-| `quantum-linux-minimal.yaml` | MQTT-only single-node graph (13) — smallest smoke target |
-| `quantum-linux-quic.yaml` | MQTT-over-QUIC ingress (15) |
-| `quantum-linux-2p.yaml` | 2-partition WAL test config (15) |
-| `quantum-linux-md.yaml` | Multi-domain Kafka bench, local proxy for the Pi 5 layout (13) |
-| `quantum-node0.yaml` / `node1.yaml` / `node2.yaml` | 3-node Raft cluster (12 each) |
-| `quantum-pi5.yaml` | Production Pi 5 4-core layout (15) |
-| `quantum-pi5-bench.yaml` | Pi 5 graph plus the in-graph load injector (16) |
-| `quantum-pi5-kafka-bench.yaml` | Kafka produce bench for the rig (13) |
-| `quantum-pi5-smoke.yaml` | Empty graph — exercises bring-up through kernel handoff |
-| `consensus-bench-pi5.yaml` | Consensus/WAL bench, no protocol surface (8) |
+| `linux/full.yaml` | Full single-node graph (14 modules) |
+| `linux/minimal.yaml` | MQTT-only single-node graph (13) — smallest smoke target |
+| `linux/quic.yaml` | MQTT-over-QUIC ingress (15) |
+| `linux/two_partition.yaml` | 2-partition WAL test config (15) |
+| `linux/multi_domain.yaml` | Local twin of the Pi 5 multi-domain layout (13) |
+| `linux/node0.yaml` / `node1.yaml` / `node2.yaml` | 3-node Raft cluster (12 each) |
+| `rig/pi5.yaml` | Production Pi 5 4-core layout (15) |
+| `rig/pi5_bench.yaml` | Pi 5 graph plus the in-graph load injector (16) |
+| `rig/pi5_kafka_bench.yaml` | Kafka produce bench for the rig (13) |
+| `rig/pi5_smoke.yaml` | Empty graph — exercises bring-up through kernel handoff |
+| `rig/pi5_consensus_bench.yaml` | Consensus/WAL bench, no protocol surface (8) |
+
+`examples/` is shadow-tracked (see [Tests](#tests) below), so a fresh clone of
+this repository has none of it.
 
 Launch the runtime:
 
 ```sh
-fluxor run configs/quantum-linux-minimal.yaml
+fluxor run examples/linux/minimal.yaml
 ```
 
 `fluxor run` validates the YAML against the target's constraints, generates `target/linux/<config-name>/{config.bin, modules.bin}` (graph wiring + packed `.fmod` table), and exec's `fluxor-linux` against them. The default MQTT listener binds `127.0.0.1:9090` on the minimal graph; production graphs bind the listener configured in the YAML.
+
+---
+
+## Tests
+
+Per the team's test-tracking standard (`../standards/test-tracking.md`, alongside
+this checkout), `tests/` and `examples/` are versioned in a second, local-only
+Git repo rooted at `.git-shadow/`. It shares this working tree and has no path to
+the GitHub remote, so rig topology and unpublished performance numbers stay off a
+public history without losing version control over them. `.fluxor-rig.toml`, the
+rig build recipe, is tracked there for the same reason.
+
+For contributors holding that repo: shadow edits are invisible to `git status` on
+the primary, so run `git shadow status` alongside it out of habit
+(`git shadow log --oneline -20` for recent history). `fluxor ci` hard-fails when
+the shadow checkout is missing rather than reporting green having run nothing.
+
+Staging **new** files needs `-f` — the primary `.gitignore` outranks the shadow
+exclude — and MUST keep the exclude pathspec, or `-f` force-adds every cargo blob
+under `examples/client/target/`:
+
+```sh
+git shadow add -Af tests examples ':(exclude)*target/*'
+```
+
+These are single git commands, so they are not make targets
+(`../standards/make.md` §1: a target that renames one command is bloat). The
+Makefile is the lifecycle alone.
 
 ---
 
@@ -271,7 +304,7 @@ sudo systemctl edit quantum
 
 ```ini
 [Service]
-Environment=QUANTUM_CONFIG=/etc/quantum/quantum-pi5.yaml
+Environment=QUANTUM_CONFIG=/etc/quantum/pi5.yaml
 ```
 
 See [docs/guides/deployment.md](docs/guides/deployment.md) for the full deployment guide and [docs/guides/high_availability.md](docs/guides/high_availability.md) for rolling-restart and load-balancer integration.
@@ -283,21 +316,32 @@ See [docs/guides/deployment.md](docs/guides/deployment.md) for the full deployme
 | Path | Type | Description |
 |---|---|---|
 | `modules/` | Module source | Quantum `.fmod` source trees (one per module, each with `mod.rs` + optional `manifest.toml`) plus `modules/common/` — helpers `#[path]`-mounted by the modules that use them, and published to the store as the `quantum/src/quantum-common` source artefact |
-| `tools/` | Host crates + scripts | Standalone Cargo crates (`telemetry_guard`, `wire_lint`, `quantum-bench`) and the CI gate scripts |
-| `configs/` | Graph YAML | Fluxor graph definitions for every supported deployment topology |
-| `fluxor.toml` + `fluxor.lock` | Project manifest + lockfile | `[project]`, `[dependencies] fluxor / clustor`, `[ci]`, `[required]`. Lockfile records the digest-pinned resolution against the local store. |
-| `.fluxor-rig.toml` | Rig build recipe | `[build.pi5]` orchestrates firmware + module + kernel-image construction for `fluxor rig test` against `tests/hardware/` scenarios |
+| `tools/ci/` | CI gates | `shadow_guard.sh` (shadow checkout present), `host_crates.sh` (fmt/clippy/test for the host crates) — both wired as `[ci.test]` scripts |
+| `tools/load/` | Load drivers | `kafka_rig.sh` — produce matrix against a DUT, one provenance-stamped JSON per point |
+| `tools/{quantum-bench,telemetry_guard,wire_lint}/` | Host crates | Standalone Cargo crates; see [tools/README.md](tools/README.md) |
+| `docs/` | Documentation | Architecture spec, deployment, HA, runbooks, CLI, interop |
+| `wire/` | Wire schemas | `mqtt.json`, `amqp.json`, `kafka.json`, `quic.json`, `catalog.json` |
+| `telemetry/` | Assets | Telemetry catalog, shape-checked by `telemetry_guard` |
 | `ops/scripts/` | Operator tooling | `install.sh` (systemd install), `chaos.sh` (fault injection) |
 | `ops/systemd/` | Unit files | `quantum.service` |
-| `tests/integration/` | E2E drivers | Bash + stdlib-Python scripts: smoke, multi-node, pubsub, QoS-1, WAL durability, load, multi-protocol |
-| `tests/hardware/` | Rig scenarios | `fluxor rig test` configs (e.g. `quantum_pi5_boot.toml`) |
-| `docs/` | Documentation | Architecture spec, deployment, HA, runbooks, CLI, interop |
-| `wire/` | Wire schemas | `mqtt.json`, `amqp.json`, `kafka.json`, `catalog.json` |
-| `telemetry/` | Assets | Telemetry catalog |
-| `certs/` | Dev TLS | Development certificate material (do not ship in production) |
-| `data/` | Runtime | WAL segments, snapshots, CP storage (gitignored except for seed material) |
+| `fluxor.toml` + `fluxor.lock` | Project manifest + lockfile | `[project]`, `[dependencies] fluxor / clustor`, `[ci]`, `[required]`. Lockfile records the digest-pinned resolution against the local store. |
 
-There is no root Cargo workspace and no `crates/`. Each module under `modules/app/` builds as a standalone PIC object packed into a `.fmod` by `fluxor modules build`, and shared source in `modules/common/` is `#[path]`-mounted rather than linked. The host crates under `tools/` stand alone, each carrying the `standards/lints.md` baseline inline; `tools/host_crates_e2e.sh` builds, lints, and tests them as a `fluxor ci` gate.
+Shadow-tracked, and so absent from a clone of this repository (see
+[Tests](#tests)):
+
+| Path | Type | Description |
+|---|---|---|
+| `examples/` | Graph YAML | Every graph Quantum boots — `linux/`, `rig/`, and the outbound client graphs |
+| `tests/integration/` | E2E drivers | Bash + stdlib-Python: smoke, multi-node, pubsub, QoS, WAL durability, load, multi-protocol |
+| `tests/hardware/` | Rig scenarios | `fluxor rig test` configs (e.g. `quantum_pi5_boot.toml`) |
+| `.fluxor-rig.toml` | Rig build recipe | `[build.pi5]` orchestrates firmware + module + kernel-image construction for those scenarios |
+
+Gitignored and local: `data/` (snapshots, CP storage) and `wal/` (WAL segments)
+are created at runtime — the integration scripts make and clear `wal/` on each
+run — and `certs/` holds development certificate material, generated once and
+never used in production.
+
+There is no root Cargo workspace and no `crates/`. Each module under `modules/app/` builds as a standalone PIC object packed into a `.fmod` by `fluxor modules build`, and shared source in `modules/common/` is `#[path]`-mounted rather than linked. The host crates under `tools/` stand alone, each carrying the `standards/lints.md` baseline inline; `tools/ci/host_crates.sh` builds, lints, and tests them as a `fluxor ci` gate.
 
 ---
 

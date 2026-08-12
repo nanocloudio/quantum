@@ -15,9 +15,9 @@ There is no `quantum` binary. Quantum ships a graph of `.fmod` modules that the 
 ### Validate a graph YAML
 
 ```sh
-fluxor build --check configs/quantum-linux.yaml
+fluxor build --check examples/linux/full.yaml
 # one config per invocation — loop to check them all:
-for c in configs/quantum-*.yaml; do fluxor build --check "$c" || break; done
+for c in examples/*/*.yaml; do fluxor build --check "$c" || break; done
 ```
 
 Checks the YAML against current module manifests: domain assignments, port connectivity, arena sizing, scheduler tier compatibility, and `MAX_MODULES` / `MAX_GRAPH_EDGES` budgets.
@@ -25,7 +25,7 @@ Checks the YAML against current module manifests: domain assignments, port conne
 ### Build the binary blobs without running
 
 ```sh
-fluxor build configs/quantum-node0.yaml
+fluxor build examples/linux/node0.yaml
 # emits the config + modules wire blobs under target/
 ```
 
@@ -34,7 +34,7 @@ Useful for CI / packaging — pre-builds the wire blobs that `fluxor run` would 
 ### Launch the runtime
 
 ```sh
-fluxor run configs/quantum-linux-minimal.yaml
+fluxor run examples/linux/minimal.yaml
 ```
 
 `fluxor run` is the operator entry point: validate → build blobs → exec `fluxor-linux <config.bin> <modules.bin>`. The runtime stays in the foreground; logs go to stdout/stderr.
@@ -121,5 +121,5 @@ script invoked directly:
 | `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
 | `tests/integration/module_graph_mqtt.sh` | Multi-protocol E2E against a running graph |
 | `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
-| `fluxor build --check configs/<one>.yaml` | Validate a graph YAML (one per invocation) |
+| `fluxor build --check examples/linux/full.yaml` | Validate one graph YAML (one per invocation) |
 | `make help` | Print the lifecycle plus the CLI commands/scripts that are deliberately not targets |

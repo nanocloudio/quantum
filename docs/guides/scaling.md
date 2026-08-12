@@ -92,7 +92,7 @@ PRG falls out of ready.
 ### Shrink admin API (mTLS)
 
 Shrink plans are managed through Clustor's `operations` admin surface,
-which `quantum-linux.yaml` and `quantum-pi5.yaml` reach via
+which `full.yaml` and `pi5.yaml` reach via
 `gateway.admin_req → operations.admin_req`, returning on
 `operations.responses → gateway.admin_responses`.
 

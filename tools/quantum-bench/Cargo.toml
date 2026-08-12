@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 description = "Off-DUT benchmark harness for Quantum: open-loop per-protocol load generators (driving the real codec path) + binary /metrics scrape/parse. Std-only, no external deps. Mirrors clustor-bench."
 
-# std-only by design: this is the driver-host tool (192.168.1.10), it never runs
+# std-only by design: this is the driver-host tool (never the DUT), it does not run
 # on fluxor, and keeping it dependency-free means it builds on an offline Pi.
 # Networking is raw std::net; JSON + the latency histogram are hand-rolled in
 # lib.rs (copied from clustor-bench — protocol-agnostic).

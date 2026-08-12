@@ -52,10 +52,26 @@ echo "==> setting up target/ symlinks"
 ln -sfn "${PREFIX}/modules" "${PREFIX}/target/bcm2712/modules"
 ln -sfn "${PREFIX}/modules" "${PREFIX}/target/linux/modules"
 
+# Graphs are shadow-tracked (standards/test-tracking.md), so a clone of the
+# primary repository has no examples/ — an operator installs the graph they
+# actually run. CONFIGS names it/them; the defaults are what examples/ ships
+# when the shadow checkout is present, and a missing one is not fatal.
 echo "==> installing configs"
-cp "${QUANTUM_ROOT}/configs/quantum-pi5.yaml" "${CONFIG_DIR}/"
-cp "${QUANTUM_ROOT}/configs/quantum-linux-minimal.yaml" "${CONFIG_DIR}/"
-cp "${QUANTUM_ROOT}/configs/quantum-linux.yaml" "${CONFIG_DIR}/"
+CONFIGS=${CONFIGS:-"examples/rig/pi5.yaml examples/linux/minimal.yaml examples/linux/full.yaml"}
+staged=0
+for c in $CONFIGS; do
+    src="$c"
+    [ -f "$src" ] || src="${QUANTUM_ROOT}/$c"
+    if [ -f "$src" ]; then
+        cp "$src" "${CONFIG_DIR}/"
+        staged=$((staged + 1))
+    else
+        echo "    skip: $c not present"
+    fi
+done
+if [ "$staged" -eq 0 ]; then
+    echo "    no graph installed — pass CONFIGS=/path/to/graph.yaml" >&2
+fi
 
 echo "==> installing systemd unit"
 install -m 0644 "${QUANTUM_ROOT}/ops/systemd/quantum.service" \

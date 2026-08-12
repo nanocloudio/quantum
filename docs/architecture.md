@@ -21,7 +21,7 @@ durability cascade. Each concern (messaging entities, partitioning,
 per-protocol adapters, security, and so on) has its own normative
 document under [architecture/](architecture/); this document links to
 them rather than restating their contracts. The canonical, wireable
-graph lives in [configs/](../configs/).
+graph lives in [examples/](../examples/).
 
 ## System model
 
@@ -232,10 +232,10 @@ behaviour on the other.
 
 ## Message graph
 
-The canonical, wireable graph is defined in [configs/](../configs/) —
-`configs/quantum-pi5.yaml` is the full bare-metal deployment,
-`configs/quantum-linux.yaml` the Linux equivalent, and
-`configs/quantum-linux-minimal.yaml` a reduced MQTT-only graph for
+The canonical, wireable graph is defined in [examples/](../examples/) —
+`examples/rig/pi5.yaml` is the full bare-metal deployment,
+`examples/linux/full.yaml` the Linux equivalent, and
+`examples/linux/minimal.yaml` a reduced MQTT-only graph for
 smoke testing. The wiring below is the *shape* of that graph; the YAML
 is authoritative for exact ports and channel parameters.
 

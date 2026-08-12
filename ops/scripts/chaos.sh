@@ -8,7 +8,7 @@
 #   slow-publisher   Send 1 packet every K ms for N rounds
 #   topic-fanout     One publisher → N subscribers
 #
-# Requires the runtime to be running (start with `fluxor run configs/quantum-linux-minimal.yaml` first).
+# Requires the runtime to be running (start with `fluxor run examples/linux/minimal.yaml` first).
 
 set -euo pipefail
 

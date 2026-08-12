@@ -30,7 +30,7 @@ covers one concern and assumes the reader has read this overview.
 [architecture.md](architecture.md) is the top-level structural
 reference — the layers, execution domains, module reference, message
 graph, and durability cascade; the canonical wireable graph lives in
-[configs/](../configs/). The documents below drill into one concern
+[examples/](../examples/). The documents below drill into one concern
 each.
 
 - [architecture.md](architecture.md) — layers, execution domains, module reference, message graph, durability cascade

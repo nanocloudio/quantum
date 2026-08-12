@@ -49,8 +49,9 @@ blobs from outside it. Two supported approaches:
 
 1. **Record a scenario.** Launch the minimal graph, drive it with
    `ops/scripts/chaos.sh publish-burst` or a `pubsub_test.py`-style
-   driver, then snapshot the `data/` directory and commit it. This
-   yields real, replay-able state.
+   driver, then snapshot the `data/` directory. It is gitignored, so a
+   snapshot that must be kept belongs under `tests/` in the shadow repo.
+   This yields real, replay-able state.
 2. **Bootstrap via CP YAML.** Define tenants and placements
    deterministically with `control_plane.bootstrap_tenants` +
    `bootstrap_placements`. This covers tenant/PRG layout but not
