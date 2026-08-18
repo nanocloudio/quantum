@@ -29,7 +29,10 @@ const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
 const PKT_DISCONNECT: u8 = 14;
 
-const MAX_PACKET: usize = 4096;
+// Raised 4096 -> 8192 for lattice CDC egress (CDC RFC C-1): a CDC
+// envelope carries up to a 4 KiB row image plus identity framing, and
+// the C-1 frame budget is envelope + MAX_VALUE_LEN.
+const MAX_PACKET: usize = 8192;
 /// Envelope-sized buffer for response messages from session_processor:
 /// `[conn_id][mtype][proto][pkt_type][flags][body]` where body may be a
 /// full MAX_PACKET-sized MQTT publish. Also sized to hold the encoded

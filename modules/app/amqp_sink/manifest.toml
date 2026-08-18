@@ -1,0 +1,66 @@
+version          = "0.1.0"
+type             = "Protocol"
+timer_class      = "wall_clock"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# amqp_sink — AMQP 0-9-1 PUBLISHER exposing the generic
+# `stream.sink.ordered_ack` surface: ordered publishes in, durable acks
+# + link-state signals out. Sibling of mqtt_sink/kafka_sink; any
+# producer graph composes it by deployment pin. Wire fragment for the
+# surface is currently owned by lattice `modules/common/cdc_wire.rs`
+# (frames inlined byte-for-byte; that owner's conformance vectors are
+# the cross-repo check).
+#
+# Contract mapping (the surface's terms):
+#   term 1  ack = durable acceptance → PUBLISHER CONFIRMS
+#           (confirm.select; basic.ack), which this broker gates on
+#           Clustor quorum durability — a confirm is a durable accept.
+#   term 2  per-key order in a connection → one channel, serialized
+#           publishes: confirm tags are sequential in publish order.
+#   term 3  no silent drops → every publish is confirmed, nacked
+#           (typed refusal), or invalidated by LINK_DOWN.
+#   term 4  backpressure by channel → publish_in drained only while
+#           connected with confirm-window room (the broker allows at
+#           most 8 pending publishes per connection).
+#   term 5  broadcast → one queue is ONE ordering unit, so
+#           FLAG_BROADCAST degenerates to a plain publish.
+#
+# Payload ceiling: this broker caps an AMQP publish body at 1800 bytes;
+# larger payloads get the typed OVERSIZE refusal (never truncation).
+
+capabilities = ["stream.sink.ordered_ack"]
+
+# in[0]/out[0]: net_proto to the IP module (TCP client to the broker).
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "NetProto"
+buffer_size = 16384
+max_record = 1600
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "NetProto"
+buffer_size = 16384
+max_record = 1600
+
+# in[1]: MSG_CDC_PUBLISH `SinkPublish` frames from the producer.
+[[ports]]
+name = "publish_in"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8192
+
+# out[1]: MSG_CDC_ACK `SinkAck` frames (replies + link-state).
+[[ports]]
+name = "ack_out"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "byte counters ride the shared telemetry ring like mqtt_sink; module-scope metric ids arrive with the metrics port in a later slice"
