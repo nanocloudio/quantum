@@ -1,14 +1,13 @@
 # Quantum project configuration consumed by the `fluxor` CLI.
-# See ~/Development/nanocloudio/standards/{ci,tests,fluxor-modules,dependencies}.md.
 
-# Project identity (standards/dependencies.md §2.1). Required for
+# Project identity. Required for
 # `fluxor publish`; downstream projects reference quantum by this
 # name.
 [project]
 name    = "quantum"
 version = "0.0.1"
 
-# Cross-project dependencies (standards/dependencies.md §2.2).
+# Cross-project dependencies.
 # fluxor provides foundation modules (`ip`, `tls`, `linux_net`, …),
 # the ABI source crate (`fluxor-abi`), and the `fluxor-linux` runtime.
 # clustor provides the substrate modules (`peer_router`, `consensus`,
@@ -20,7 +19,7 @@ version = "0.0.1"
 # `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
 # Live workspace mode (`~/.fluxor/workspace.toml`) resolves listed
 # members to their most recently published artefacts (`:latest`),
-# written through fluxor.lock — see standards/dependencies.md §6.
+# written through fluxor.lock.
 [dependencies]
 fluxor  = "0.0.1"
 clustor = "0.0.1"
@@ -34,7 +33,7 @@ targets = ["bcm2712"]
 [ci.lints]
 # No exemptions: with no root workspace there is no `[lints] workspace =
 # true` opt-in to audit. Each host crate under tools/ inlines the
-# standards/lints.md §1 baseline directly, and `tools/ci/host_crates.sh`
+# shared lint baseline directly, and `tools/ci/host_crates.sh`
 # is what enforces it.
 
 [ci.hygiene]
@@ -48,7 +47,7 @@ max_inline_lines    = 80
 # Per-file exemptions live as [[ci.hygiene.exemption]] tables. None today.
 
 [ci.test]
-# Shadow-checkout hard-fail guard (standards/test-tracking.md §7):
+# Shadow-checkout hard-fail guard:
 # tests/ and examples/ are shadow-tracked in .git-shadow/, so a checkout
 # of the primary repo alone has zero files there and both the integration
 # surface and the graphs it boots would be silently absent. The guard
@@ -71,5 +70,4 @@ dir = "examples"
 # only when fluxor's `modules/sdk/wire/wire.rs::ABI_VERSION` changes
 # (module headers / channel hints / contract ids break). The
 # installed `fluxor` CLI must implement this exact ABI version.
-# See standards/fluxor-modules.md §5.
 fluxor = { abi = 1 }

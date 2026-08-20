@@ -1,10 +1,18 @@
 # Partitioning & Routing
 
 How Quantum shards tenants across Partition Raft Groups (PRGs), how
-CP-Raft places PRGs on nodes, and how routing decisions remain
-consistent across rebalances. Assumes familiarity with the entities
-and invariants in [messaging_model.md](messaging_model.md), in
-particular **ROUTING-EPOCH**.
+the control plane places PRGs on nodes, and how routing decisions
+remain consistent across rebalances. Assumes familiarity with the
+entities and invariants in [messaging_model.md](messaging_model.md),
+in particular **ROUTING-EPOCH**.
+
+**Status: partly wired.** Multi-partition graphs run today —
+`partition_router` fans proposals across partitions, `wal_index` and
+durability proofs are partition-keyed end to end, and
+`forward_coordinator` implements the cross-PRG forward fence. The
+control-plane side — placement, rebalance, epoch migration — is the
+target design, pending a real control plane
+([control_plane.md](control_plane.md)).
 
 ## System model
 
@@ -16,22 +24,13 @@ particular **ROUTING-EPOCH**.
 | **Session Processor** | Adapter logic, dedupe, offline queues, Will / retained features. All durable state mutation occurs inside the Raft apply loop. Helpers may precompute, but every mutation commits through the same apply path. |
 | **Control Agent** | Per-node helper (`control_plane` + `governance`'s tenants component): syncs CP-Raft objects, publishes health, manages certificates, requests rebalance actions. |
 
-### Environment
-
-- Linux ≥ 5.15 with `io_uring`.
-- NVMe SSDs with write barriers enabled.
-- Clocks synchronised via PHC/PTP. Excessive skew fences all PRGs on
-  the affected node from leadership and from emitting any protocol
-  ACK that requires quorum durability until clocks recover.
-
 ### Assumptions
 
-- Additional PRGs scale linearly with session count and publish load.
-- CP-Raft outages shorter than `controlplane.cache_grace_ms` retain
-  cached metadata; longer outages trigger strict fallback per
-  Clustor §9.1.
-- Follower reads inherit the same gating: if Clustor refuses
-  `ReadIndex`, adapters fail closed with `ControlPlaneUnavailable`.
+- Additional PRGs scale linearly with session count and publish
+  load.
+- Control-plane outages shorter than the cache grace window retain
+  cached metadata; longer outages trigger strict fallback (see
+  [control_plane.md](control_plane.md) Cache states).
 
 ## Sharding
 
@@ -47,8 +46,9 @@ the same PRG when their hashes align, and on different PRGs (with
 cross-PRG forwarding) when they do not.
 
 The hash algorithm and seed are versioned. Any change requires a
-CP-Raft-coordinated routing-epoch migration: every node must drain
-the old hash before the new hash starts producing routing decisions.
+routing-epoch migration coordinated by the control plane: every node
+must drain the old hash before the new hash starts producing routing
+decisions.
 
 ### Production tenant sizing
 
@@ -62,19 +62,20 @@ tenants are dev/test only.
 CP-Raft assigns PRGs to nodes honouring:
 
 - **Locality** — prefer placements close to the tenant's primary client population.
-- **NVMe budget** — respect per-node `io_profile` (`latency_sensitive` / `throughput_heavy` / `balanced`) and `disk_tier` (`nvme` / `ssd` / `hdd` / `any`).
+- **Storage budget** — respect per-node I/O and disk-tier profiles.
 - **Replica anti-affinity** — no two replicas of the same PRG land on the same node (and ideally not the same rack).
 - **Noisy-neighbour constraints** — keep PRGs of the same tenant spread across nodes when possible.
 
-Membership changes follow Clustor §9.9.
+Membership changes are the substrate's concern.
 
 ### Rebalance sequence
 
-1. CP-Raft issues a placement plan with a new routing epoch.
-2. New PRGs (or new replicas of existing PRGs) clone via Clustor
-   learner catch-up — they consume snapshots and WAL frames until
-   they're caught up to the leader.
-3. CP publishes the new routing epoch.
+1. The control plane issues a placement plan with a new routing
+   epoch.
+2. New PRGs (or new replicas of existing PRGs) clone via learner
+   catch-up — they consume snapshots and WAL frames until they are
+   caught up to the leader.
+3. The control plane publishes the new routing epoch.
 4. Listeners begin admitting sessions / topics that map to the new
    PRG layout.
 5. Publishes routed to old PRGs after the epoch flip are rejected
@@ -111,24 +112,23 @@ the publish to the topic PRG via `forward_coordinator`. Mechanics:
   `(ingress_prg, egress_prg, routing_epoch) → monotone_seq` and
   persists this state inside the PRG snapshot.
 - Same-node forwards bypass the network entirely —
-  `forward_coordinator.local_forward` emits directly to
-  `consensus.proposals` on the destination PRG's apply core.
-- Cross-node forwards go through `peer_router.repl_tx`, framed
-  identically to Raft AppendEntries, so they share TLS sessions and
-  connection-pool slots with regular replication traffic.
+  `forward_coordinator.local_out` feeds the destination partition's
+  proposal path directly.
+- Cross-node forwards leave on `forward_coordinator.remote_out`
+  through `peer_router`, sharing connections with regular
+  replication traffic.
 - On replay, `forward_seq` lets the destination PRG detect and drop
   duplicates from before the failover.
 
-The forwarding path is protocol-agnostic: the envelope
-(`WorkloadForwardEnvelope`) carries a schema ID plus the payload
-bytes and capability bits, so MQTT, Kafka, and AMQP all use the same
-forward primitive.
+The forwarding path is protocol-agnostic: the forward envelope
+carries the `(ingress, egress, epoch, seq)` tuple plus opaque payload
+bytes, so MQTT, Kafka, and AMQP all use the same forward primitive.
 
 ## Operator surfaces
 
-- **Routing snapshot.** `gateway` `/admin` lists the current epoch, placements, and CP cache freshness.
-- **Drain a node.** `operations` accepts a drain command that stops session admission but keeps existing sessions alive; combine with leader transfer for rolling restarts.
-- **Move a PRG.** Issue a placement plan via `operations`; CP-Raft validates anti-affinity and emits a new epoch.
-
-See [guides/high_availability.md](../guides/high_availability.md) for
-the operator-level workflows that exercise these surfaces.
+The rebalance workflow above is driven through the control plane's
+admin surface once a real control plane lands; today the implemented
+admin operations are the substrate's (`freeze`, `thaw`,
+`transfer-leader`, `durability-mode`, `snapshot`). See
+[guides/high_availability.md](../guides/high_availability.md) for
+the operator-level restart workflow.

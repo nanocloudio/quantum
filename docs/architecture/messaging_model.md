@@ -21,24 +21,22 @@ sits on top.
 | **Session Processor** | Messaging state machine (the `session_processor` module). Handles connection binding, QoS / ack handshakes, inflight replay, offline queues, protocol reason codes. Plugs into Clustor's `consensus` apply path. |
 | **session_epoch** | Monotone counter per `(tenant_id, stream_id)` fencing session state; increments on clean reconnect or fenced takeover. |
 | **stream_id** | Protocol-defined logical stream identifier (MQTT `client_id`, Kafka producer ID, AMQP container ID). |
-| **dedupe entry** | `(tenant_id, stream_id, session_epoch, message_id)` map rejecting duplicates until `dedupe_ttl` expires. Owned by `messaging`'s dedup component. |
+| **dedupe entry** | `(tenant_id, stream_id, session_epoch, message_id)` map rejecting duplicates until the dedupe TTL expires. Owned by `messaging`'s dedup component. |
 | **offline queue** | Persistent FIFO storing durable deliveries for disconnected or throttled sessions. Owned by `messaging`'s offline component. |
 | **forward_seq** | Idempotence key for cross-PRG forwarding; monotonically increasing per `(ingress PRG, egress PRG, routing_epoch)` and persisted so replay fences duplicates. Owned by `forward_coordinator`. |
 | **dirty_epoch** | Routing-epoch mismatch condition; adapters map it to protocol-specific outcomes (reject, disconnect, retry). |
 
 ## Default timers
 
-All timers are operator-configurable in the graph YAML; tenants may
-override within operator-policy bounds.
-
-| Timer | Default | Maximum |
+| Timer | Value | Where |
 |---|---|---|
-| `session_ttl_default_ms` | 259 200 000 (72h) | 604 800 000 (7d) |
-| `dedupe_ttl_default_ms` | 259 200 000 (72h) | 604 800 000 (7d) |
-| `offline_queue_ttl_default_ms` | 259 200 000 (72h) | 604 800 000 (7d) |
+| Dedupe TTL | 72h (259 200 000 ms) | `messaging`'s dedup component; entries expire and are swept by periodic GC |
+| Offline-queue TTL | 72h (259 200 000 ms) | `messaging`'s offline component; expired entries are swept and the retention floor republished |
+| Session expiry | Per session, from the MQTT 5 Session Expiry Interval; MQTT 3.1.1 persistent sessions never expire | `session_processor` |
 
-The 72h / 7d window covers the longest realistic disconnect-and-resume
-scenarios while keeping dedupe and offline-queue state arenas bounded.
+The 72h window covers the longest realistic disconnect-and-resume
+scenarios while keeping dedupe and offline-queue state arenas
+bounded. The TTLs are module constants, not graph parameters.
 
 ## Entities
 
@@ -49,7 +47,6 @@ session_record {
     tenant_id
     stream_id
     session_epoch
-    auth_chain_digest
     connected_at
     keep_alive_ms?
     protocol_state          // adapter-specific
@@ -79,13 +76,14 @@ that haven't been acknowledged by the destination PRG.
 ```
 retained_record {
     subject
-    payload_ref             // content-addressed
+    payload                 // stored inline
     updated_at
 }
 ```
 
-Owned by `messaging`'s retained component. Payload references are content-addressed
-so identical retained payloads across topics share storage.
+Owned by `messaging`'s retained component. Payloads are stored
+inline, topic-indexed and wildcard-matched for new-subscription
+delivery.
 
 ### Dedupe entry
 
@@ -98,24 +96,23 @@ DedupeKey → DedupeState {
 }
 ```
 
-Owned by `messaging`'s dedup component (16-shard partitioned map). Entries expire
-after `dedupe_ttl_default_ms`. The earliest non-expired index per PRG
-(`earliest_dedupe_index`) is the WAL compaction floor for dedupe
-state.
+Owned by `messaging`'s dedup component (16-shard partitioned map).
+Entries expire after the dedupe TTL. The earliest non-expired entry
+per PRG is the WAL compaction floor for dedupe state.
 
 ### Offline queue entry
 
 ```
 offline_entry {
     sequence
-    payload_ref             // content-addressed
+    payload                 // stored inline
     expiry_at
 }
 ```
 
-Owned by `messaging`'s offline component. The earliest non-expired index per PRG
-(`earliest_offline_queue_index`) is the WAL compaction floor for
-queued state. Bounded by per-tenant quota policy.
+Owned by `messaging`'s offline component, a bounded per-session FIFO.
+The earliest non-expired entry per PRG is the WAL compaction floor
+for queued state.
 
 ## Invariants
 
@@ -132,11 +129,10 @@ isn't in the WAL (or a snapshot derived from it), it didn't happen.
 
 ### DETERMINISTIC-REPLAY
 
-Replay from WAL + snapshot deterministically reconstructs all durable
-messaging state. Compaction must not truncate WAL entries required to
-reconstruct state at or above `earliest_dedupe_index` or
-`earliest_offline_queue_index`. Two nodes that replay the same prefix
-produce byte-identical PRG state.
+Replay from the WAL deterministically reconstructs all durable
+messaging state. Compaction must not truncate WAL entries required
+to reconstruct live dedupe or offline-queue state. Two nodes that
+replay the same prefix produce byte-identical PRG state.
 
 ### ACK-DURABILITY
 
@@ -165,7 +161,7 @@ traffic on the new epoch.
 
 ## Crash model
 
-Per Clustor §§6.2 and 10.5. Quantum adds no new crash-model
+The crash model is clustor's. Quantum adds no new crash-model
 assumptions beyond what the substrate guarantees: write-path ordering
 is fsync-on-quorum, in-flight non-acked messages may be retried by
 the client, and replay reproduces all durable state.

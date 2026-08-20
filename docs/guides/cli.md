@@ -1,125 +1,78 @@
 # Quantum CLI Surface
 
-There is no `quantum` binary. Quantum ships a graph of `.fmod` modules that the `fluxor` and `fluxor-linux` binaries load and execute. Operator and diagnostic workflows are split across:
+There is no `quantum` binary. Quantum ships a graph of `.fmod`
+modules that the `fluxor` and `fluxor-linux` binaries load and
+execute. Operator workflows split across:
 
-1. **`fluxor` tool** — graph validation, build, launch.
-2. **`systemctl` + the bundled systemd unit** — managed runtime lifecycle.
-3. **`make` targets in this repo** — the build/test/lint/ci lifecycle plus `make test-mqtt-suite`.
-4. **Scripts under `ops/scripts/` and `tests/integration/`** — chaos drivers and smoke harnesses.
-5. **Standard MQTT clients** (`mosquitto_pub` / `mosquitto_sub` / Paho) for protocol interop.
+1. **The `fluxor` CLI** — dependency sync, module build, graph
+   validation, launch.
+2. **`systemctl` + the bundled systemd unit** — managed runtime
+   lifecycle.
+3. **Standard protocol clients** (`mosquitto_pub` /
+   `mosquitto_sub`, Kafka and AMQP clients) — the broker speaks the
+   standard wire protocols, so off-the-shelf tooling works.
 
----
-
-## Runtime control
-
-### Validate a graph YAML
+## The fluxor CLI
 
 ```sh
-fluxor build --check examples/linux/full.yaml
-# one config per invocation — loop to check them all:
-for c in examples/*/*.yaml; do fluxor build --check "$c" || break; done
+fluxor sync                              # resolve fluxor.lock against the store;
+                                         # materialise modules + runtime into target/
+fluxor update                            # advance pins to the latest published digests
+fluxor modules build --target bcm2712    # build quantum's .fmod artefacts
+fluxor modules clean                     # remove built .fmod / .elf / .o
+fluxor build --check <graph.yaml>        # validate a graph against module manifests
+fluxor build <graph.yaml>                # pre-build the config + module wire blobs
+fluxor run <graph.yaml>                  # validate, build blobs, exec fluxor-linux
+fluxor run - <<'EOF' … EOF               # same, config from stdin
 ```
 
-Checks the YAML against current module manifests: domain assignments, port connectivity, arena sizing, scheduler tier compatibility, and `MAX_MODULES` / `MAX_GRAPH_EDGES` budgets.
+`fluxor build --check` validates one config per invocation: domain
+assignments, port connectivity, arena sizing, scheduler tier
+compatibility, and graph budgets.
 
-### Build the binary blobs without running
+`fluxor run` is the operator entry point: validate → build blobs →
+exec `fluxor-linux`. The runtime stays in the foreground; logs go to
+stderr.
 
-```sh
-fluxor build examples/linux/node0.yaml
-# emits the config + modules wire blobs under target/
-```
+## Managed runtime
 
-Useful for CI / packaging — pre-builds the wire blobs that `fluxor run` would otherwise generate on launch.
-
-### Launch the runtime
-
-```sh
-fluxor run examples/linux/minimal.yaml
-```
-
-`fluxor run` is the operator entry point: validate → build blobs → exec `fluxor-linux <config.bin> <modules.bin>`. The runtime stays in the foreground; logs go to stdout/stderr.
-
-For a managed install:
+For a production install ([deployment.md](deployment.md)):
 
 ```sh
-sudo systemctl start quantum         # starts the service
+sudo systemctl start quantum
 sudo systemctl status quantum
-journalctl -u quantum -f             # follow logs
-sudo systemctl reload quantum        # graceful config reload (if supported by your unit override)
+journalctl -u quantum -f
 sudo systemctl stop quantum
 ```
 
-Swap graph configs by editing the systemd unit's `Environment=QUANTUM_CONFIG=...`; see [deployment.md](deployment.md).
+Swap graph configs by overriding the unit's
+`Environment=QUANTUM_CONFIG=…`.
 
----
+## Protocol clients
 
-## Smoke and diagnostic harnesses
-
-These live in [tests/integration/](../../tests/integration/) and require a built graph (`fluxor modules build --target … --out target` here; `make modules TARGET=…` in `clustor`).
-
-| Script | What it does |
-|---|---|
-| `runtime_smoke.sh` | Launches the minimal graph in the background, verifies every module loaded, waits for Raft leader election, sends a probe MQTT 3.1.1 CONNECT, asserts CONNACK. Exit 0 = pass. |
-| `multi_node.sh` | Pre-builds 3 node configs, spawns 3 `fluxor-linux` processes in separate working directories, asserts leader election + log replication across all three. |
-| `module_graph_mqtt.sh` | Multi-protocol E2E: MQTT/AMQP/Kafka byte-for-byte handshake assertions against the running graph. First leg of `make test-mqtt-suite`. |
-| `module_graph_load.sh` | Sustained QoS-1 load (`CLIENTS=2 MSGS_PER_CLIENT=10` default) asserting every PUBACK returns. Also runs inside `make test-mqtt-suite`. |
-| `pubsub_test.py` | Stdlib-only Python: subscriber + publisher, asserts the subscriber sees the payload within a timeout. |
-| `qos1_test.py` | Stdlib-only Python: publishes a QoS-1 message and asserts PUBACK with matching packet_id. Implies the full Raft → WAL → fsync → durability → apply → ack pipeline ran. |
-| `wal_durability_test.py` | Runs against the 2-partition config; asserts every per-partition WAL segment grew, catching durability regressions where an unwired downstream port back-pressures the WAL writer. |
-
-All Python harnesses speak just enough MQTT 3.1.1 on a raw TCP socket — no `paho-mqtt` dependency. Override host/port via `--host` / `--port` flags or `QUANTUM_HOST` / `QUANTUM_PORT` env vars (default `127.0.0.1:9090`).
-
----
-
-## Chaos / fault injection
-
-[ops/scripts/chaos.sh](../../ops/scripts/chaos.sh) drives the running broker with parameterised load patterns:
+The broker binds one listener (default port 9090) and classifies
+each connection from its first bytes, so all three protocols share
+it. MQTT examples (validated against the run guide's graph):
 
 ```sh
-./ops/scripts/chaos.sh connect-storm N=500           # 500 concurrent MQTT CONNECTs
-./ops/scripts/chaos.sh publish-burst N=10000 M=20    # 10k PUBLISHes spread across 20 topics
-./ops/scripts/chaos.sh slow-publisher N=100 K=200    # 1 PUBLISH every 200ms × 100 rounds
-./ops/scripts/chaos.sh topic-fanout                  # 1 publisher → N subscribers
-./ops/scripts/chaos.sh help                          # full mode list
-```
-
-Defaults: `HOST=127.0.0.1`, `PORT=9090`. Override via env. Requires the runtime to be running.
-
----
-
-## Protocol interop with off-the-shelf clients
-
-Quantum speaks standard MQTT 3.1.1 / 5.0, Kafka, and AMQP 0-9-1 on the wire — use whatever client you already trust. For MQTT:
-
-```sh
-# Subscribe (Mosquitto)
+# Subscribe
 mosquitto_sub -h 127.0.0.1 -p 9090 -t 'sensors/#' -q 1
 
-# Publish (Mosquitto)
+# Publish
 mosquitto_pub -h 127.0.0.1 -p 9090 -t 'sensors/room1/temp' -m '23.5' -q 1
 
-# TLS / mTLS variants
-mosquitto_sub -h <host> -p 8883 -t 'tenant/topic' -q 2 \
-    --cafile certs/ca.pem --cert certs/client.pem --key certs/client.key
+# Retained
+mosquitto_pub -h 127.0.0.1 -p 9090 -t 'demo/retained' -q 1 -r -m 'payload'
 ```
 
-See [interop.md](interop.md) for the full Mosquitto / Paho test plan and the four scenarios the build is exercised against (TLS QoS 1/2 round-trip, QUIC resume, shared-subscription distribution, Will + retained).
+Kafka clients complete the ApiVersions handshake and produce/consume
+against the same port; AMQP 0-9-1 clients negotiate
+`Connection.Start` there too. Protocol-level caveats (no Kafka
+transactions, no AMQP exchange types beyond the default exchange)
+are stated in the adapter references under
+[../architecture/](../architecture/).
 
----
+## Make targets
 
-## Repository `make` targets
-
-The Makefile is the lifecycle only (`build` / `test` / `lint` / `ci` /
-`publish` / `clean` — see `make help`) plus one composition,
-`make test-mqtt-suite`. Everything else is the `fluxor` CLI or a
-script invoked directly:
-
-| Command | Purpose |
-|---|---|
-| `fluxor modules build --target bcm2712 --out target` | Build all Quantum `.fmod` artifacts |
-| `fluxor modules build --all --out target` | Build for every supported target (bcm2712) |
-| `fluxor modules clean` | Remove built `.fmod` / `.elf` / `.o` |
-| `tests/integration/module_graph_mqtt.sh` | Multi-protocol E2E against a running graph |
-| `tests/integration/module_graph_load.sh` | Sustained-load + backpressure E2E |
-| `fluxor build --check examples/linux/full.yaml` | Validate one graph YAML (one per invocation) |
-| `make help` | Print the lifecycle plus the CLI commands/scripts that are deliberately not targets |
+The Makefile is the lifecycle only; `make help` lists it. Build,
+publish, and clean are thin aliases over the `fluxor` CLI.

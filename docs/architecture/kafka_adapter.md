@@ -9,14 +9,13 @@ partition model lives in [partitioning.md](partitioning.md).
 
 ## Connection and authentication
 
-- Kafka clients open one TCP connection per broker; Quantum's
-  `protocol`'s router component ALPN-demuxes the stream into `protocol`'s kafka component.
-- SASL identities (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512) map to
-  CP-Raft principals as optional additives to mTLS. mTLS is the
-  primary auth surface; SASL provides per-app identity within the
-  cert-validated transport.
-- Transactional IDs are issued by CP-Raft and persisted in the
-  tenant record so producer fencing survives broker restart.
+- Kafka clients open one TCP connection per broker; `protocol`'s
+  router classifies the stream from its first bytes and hands it to
+  the kafka codec.
+- SASL is not implemented: the ApiVersions table advertises no SASL
+  handshake APIs and connections are accepted without credential
+  validation. Transport security comes from the `tls` module where
+  the graph wires it.
 
 ## Topics, partitions, routing
 
@@ -31,17 +30,16 @@ writes are durable when the WAL entries reach quorum across the
 partition's three voters, regardless of which Kafka broker the
 producer connected to.
 
-The Kafka `Metadata` response advertises one logical broker per node;
-partition leadership is resolved through CP-Raft and exposed to
-clients as the `Leader` field per partition.
+The Kafka `Metadata` response advertises one logical broker per
+node, with this node as leader for the partitions it serves.
 
 ## Produce semantics
 
 | `acks` | Behaviour |
 |---|---|
-| `acks=0` | Edge acceptance only — disabled unless the tenant policy explicitly allows lossy ingest. Default policy denies. |
+| `acks=0` | Fire-and-forget: the produce proposal is untagged and no response is gated on it. |
 | `acks=1` | Mapped to quorum durability. Leader-only acknowledgement is intentionally not supported; `acks=1` and `acks=all` both wait for quorum. |
-| `acks=all` | Quorum durability. Default for production tenants. |
+| `acks=all` | Quorum durability; the ProduceResponse is gated on the durability proof. |
 
 The `acks=1` collapse is deliberate. Leader-only ack is a
 Kafka-historical optimisation that trades durability for latency, and
@@ -50,24 +48,13 @@ the **ACK-DURABILITY** invariant (see
 Producers that need lower latency should reduce `linger.ms` and
 `batch.size`, not weaken the ack contract.
 
-### Idempotent producers
-
-Idempotent producers carry a producer ID + epoch + sequence number.
-Quantum tracks these via the same dedup infrastructure that
-backs MQTT QoS 2:
-
-- Per-`(producer_id, partition)` sequence numbers detect and reject duplicates.
-- Producer epoch fencing (Kafka `INVALID_PRODUCER_EPOCH`) follows the same `session_epoch` mechanism as MQTT.
-- The dedupe window expires after `dedupe_ttl_default_ms` (72h default).
-
-### Transactions — not implemented
+### Idempotent producers and transactions — not implemented
 
 Quantum answers `InitProducerId` so idempotent producers complete
 their handshake and connect, but it issues a producer id without
-enforcing sequence-number dedupe
-([protocol/kafka.rs](../../modules/app/protocol/kafka.rs)
-`API_INIT_PRODUCER_ID`). Retries are therefore **at-least-once, not
-exactly-once**.
+enforcing sequence-number dedupe (`API_INIT_PRODUCER_ID` in
+`modules/app/protocol/kafka.rs`). Retries are therefore
+**at-least-once, not exactly-once**.
 
 There is no transactional path: `BeginTxn` / `EndTxn` are not served,
 no transaction markers are written to the WAL, and
@@ -79,41 +66,34 @@ consume-transform-produce is future work.
 
 `session_processor` serves the group lifecycle APIs (`JoinGroup`,
 `SyncGroup`, `Heartbeat`, `LeaveGroup`, `OffsetCommit`,
-`OffsetFetch`) against its own group and offset tables:
-
-| Timer | Default |
-|---|---|
-| Session timeout | 10s |
-| Rebalance timeout | 60s |
-| Heartbeat interval | 3s |
+`OffsetFetch`) against its own group and offset tables. Partition
+assignment is client-side, per the Kafka group protocol: the elected
+group leader computes it and pushes it via `SyncGroup`; the broker
+stores and echoes membership and assignments and signals staleness
+with `REBALANCE_IN_PROGRESS`. The broker keeps no server-side
+session/heartbeat timers of its own.
 
 Group metadata lives in the session-processor state. Offset commits
 are WAL entries — they survive node failure exactly like session
-records. The default rebalance strategy is `cooperative-sticky`:
-members keep their partitions across most rebalances and only
-relinquish moved partitions, avoiding stop-the-world consumption
-pauses.
-
-Fetch sessions enforce tenant quotas via `ThrottleEnvelope`,
-translated by `flow`'s backpressure component into Kafka's native
-`throttle_time_ms` field.
+records. The OffsetCommitResponse is not gated on durability: a lost
+commit re-consumes from the previous offset, which the
+at-least-once contract already admits.
 
 ## Retention and catch-up
 
-| Retention type | Behaviour |
-|---|---|
-| Time-based | Per-topic, evaluated on compaction; entries past the retention window are eligible for WAL truncation subject to dedupe / offline-queue floors. |
-| Size-based | Same mechanism; the floor is whichever of (time, size) yields the smaller retained window. |
-| Log compaction | Per-topic key-based compaction — the last value per key is retained; suitable for changelog topics. |
+There is no separate "log offset" storage — offsets are WAL indexes
+interpreted through the topic's view of the WAL, and Fetch serves
+from the apply-side message store's bounded ring.
 
-Catch-up reads from snapshots + WAL via Clustor's standard
-`admission`-permitted read path. There is no separate "log offset"
-storage — offsets are WAL indexes interpreted through the topic's
-view of the WAL.
+Per-topic retention policies (time- or size-based) and key-based log
+compaction are not implemented; the ring evicts oldest entries when
+full.
 
 ## Dirty epoch mapping
 
-`dirty_epoch` from CP-Raft maps to Kafka's `NOT_LEADER_OR_FOLLOWER`:
+Status: design target, not wired — routing epochs today come from
+the synthetic control plane. The target mapping is Kafka's
+`NOT_LEADER_OR_FOLLOWER`:
 
 - Produce requests against a stale-epoch view of the partition
   leader receive `NOT_LEADER_OR_FOLLOWER`, prompting the client to

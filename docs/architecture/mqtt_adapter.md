@@ -1,8 +1,9 @@
 # MQTT Adapter
 
 The MQTT adapter (`protocol`'s mqtt component + the MQTT path through
-`session_processor`, `topic_engine`, `messaging`) implements MQTT 3.1, 3.1.1, and 5.0 over TLS/TCP
-and QUIC. This document is the MQTT reference; the Kafka and AMQP
+`session_processor`, `topic_engine`, `messaging`) implements MQTT
+3.1, 3.1.1, and 5.0 over TCP (TLS-terminated where the graph wires
+the `tls` module) and QUIC. This document is the MQTT reference; the Kafka and AMQP
 peers live in [kafka_adapter.md](kafka_adapter.md) and
 [amqp_adapter.md](amqp_adapter.md).
 
@@ -19,22 +20,20 @@ rule:
 |---|---|
 | `clean_start=true` | Increment `session_epoch`, purge prior inflight state, begin fresh session record. |
 | `clean_start=false` | Reuse the stored session record if `session_epoch` matches; resume inflight QoS 1/2 packets and drain the offline queue. |
-| Same `client_id`, different connection | Fenced takeover: increment `session_epoch`, DISCONNECT the prior connection with reason `0x8E` (Session taken over), begin a fresh apply context for the new connection. |
+| Same `client_id`, different connection | Fenced takeover: increment `session_epoch`, drop the prior connection, begin a fresh apply context for the new connection. |
 
-Keep-alive defaults to the client-proposed value × 1.5
-(operator-configurable). Missing PINGREQ within the keep-alive window
-triggers DISCONNECT and Will processing.
+The keep-alive deadline is the client-proposed value × 1.5. A missing
+PINGREQ within that window triggers DISCONNECT and Will processing.
 
-## Authentication and authorization
+## Authentication and authorisation
 
-CP-Raft stores tenant ACLs and feature flags; the manifest flows
-through `control_plane` → `governance`'s tenants component → `session_processor`. Stale
-CP caches force disconnect with `MQTT-5 0x87` (Not authorized) rather
-than risking authorisation against expired policy.
-
-mTLS is mandatory. The client certificate is validated against the
-per-tenant trust bundle; the SPIFFE ID (when present) feeds into
-RBAC.
+Client authentication and per-tenant ACL enforcement are not
+implemented: the control plane emits a synthetic single-tenant record
+today (see [multi_tenancy.md](multi_tenancy.md)), and CONNECT is
+accepted without credential validation. The target model — mTLS
+identity feeding tenant-scoped ACLs — is described in
+[security.md](security.md), which states what is wired and what is
+design.
 
 ## QoS semantics
 
@@ -50,21 +49,17 @@ exact phase a session was in at crash time, so PUBREC / PUBREL /
 PUBCOMP emit only once per message regardless of node failure between
 phases.
 
-Cross-PRG publishes use `ForwardPublish` with `forward_seq` (see
-[partitioning.md](partitioning.md)). Missing `PublishAcked` triggers
-replay; fenced PRGs revert in-flight exchanges to pending state until
-strict fallback clears.
+Cross-PRG publishes carry a `forward_seq` idempotence key (see
+[partitioning.md](partitioning.md)) so replay after failover fences
+duplicates.
 
 ## Shared subscriptions
 
-`$share/<group>/<topic-filter>` groups distribute deliveries by
-hashing the publish identifier with a stable, versioned hash seed
-modulo group size. Best-effort ordering is preserved within a PRG;
-cross-PRG ordering is not guaranteed (see
+`$share/<group>/<topic-filter>` groups distribute each delivery to
+one member by a stable seeded hash modulo group size, so the
+distribution is deterministic for a fixed member set. Ordering is
+preserved within a PRG; cross-PRG ordering is not guaranteed (see
 [partitioning.md](partitioning.md) Routing guarantees).
-
-The hash seed is versioned in the routing manifest so changes to the
-distribution function are observable as a routing-epoch bump.
 
 ## Offline delivery
 
@@ -78,10 +73,9 @@ Sessions with `clean_start=false` accumulate deliveries in
 3. Drained messages re-enter the inflight slots and obey the same
    QoS contract as live publishes.
 
-Per-message expiry inherits the per-session / per-tenant
-`offline_queue_ttl` (default 72h, max 7d). Expired entries are GC'd
-on the next offline sweep and bump
-`earliest_offline_queue_index` so WAL compaction can advance.
+Per-message expiry follows the offline-queue TTL (72h). Expired
+entries are swept and the retention floor republished so WAL
+compaction can advance.
 
 ## Will
 
@@ -97,47 +91,40 @@ CONNECT may include a Will message:
 
 ## Retained messages
 
-Retained payloads live in `messaging`'s retained component (content-addressed,
-snapshot-persisted). New subscriptions receive the current retained
-payload for matching topics immediately after SUBACK. Setting an
-empty payload with `retain=true` clears the retained record.
+Retained payloads live in `messaging`'s retained component, stored
+inline and rebuilt by WAL replay. New subscriptions receive the
+current retained payload for matching topics immediately after
+SUBACK. Setting an empty payload with `retain=true` clears the
+retained record.
 
 ## MQTT 5 features
 
 | Feature | Status |
 |---|---|
-| Topic aliases | Implemented (`topic_alias_max = 65535` per graph default). |
-| Subscription identifiers | Implemented; preserved through forwards. |
-| User properties | Decoded by `protocol`'s mqtt component; passed through `WorkloadForwardEnvelope` to subscribers. |
-| Reason strings | Emitted on error responses; bounded to keep response size predictable. |
-| Server keep-alive | Default 60s; overridable per tenant. |
-| Server reference | Emitted on DISCONNECT during planned drain to hint reconnection to other nodes. |
-| Session expiry interval | Drives `session_ttl_default_ms`; respects the tenant max. |
+| Topic aliases | Implemented; the broker caps aliases at 16 per connection (`min(client topic_alias_maximum, 16)`, 0 for pre-5 clients). |
+| Subscription identifiers | Implemented. |
+| User properties | Decoded by `protocol`'s mqtt component and carried through the publish proposal (V2 body) to subscribers, order intact. |
+| Receive Maximum | Implemented; caps concurrent unacked QoS 1+ deliveries per subscriber. |
+| Session expiry interval | Implemented; drives the session-expiry sweep. |
+| Will delay interval | Implemented; deferred fire, cancelled by reconnect within the delay. |
 
 ## Dirty epoch mapping
 
-Per **ROUTING-EPOCH** in [messaging_model.md](messaging_model.md),
-MQTT maps `dirty_epoch` to:
+Status: design target, not wired — routing epochs today come from
+the synthetic control plane and no rejection path fires. The target
+mapping, per **ROUTING-EPOCH** in
+[messaging_model.md](messaging_model.md):
 
-- During CONNECT: reject with `0x95` (Topic name invalid) if the
-  resolved partition no longer owns the session's topics, or `0x9C`
-  (Use another server) if the node should not handle this session at
-  all.
-- During PUBLISH: NACK with `0x91` (Packet identifier in use) is not
-  used — instead, the connection closes with `0x80` (Unspecified
-  error) to force reconnect under the new epoch.
+- During CONNECT: reject with `0x9C` (Use another server) when the
+  node should not handle this session.
+- During PUBLISH: close the connection to force reconnect under the
+  new epoch.
 
 ## QUIC
 
-The QUIC listener path is structurally identical to TLS/TCP. The
-`tls` module accepts QUIC streams alongside TLS sessions, and
-`protocol`'s router component ALPN-demuxes `mqtt-quic` into the same
-`protocol`'s mqtt component. Resume semantics inherit from QUIC:
-
-- 0-RTT is disabled for non-CONNECT packets (the codec rejects 0-RTT
-  data outside CONNECT).
-- Connection migration is supported by QUIC at the transport layer;
-  the session record is unaffected.
-
-See [guides/interop.md](../guides/interop.md) for QUIC interop
-scenarios.
+MQTT-over-QUIC is bridged by the `mqtt_quic_adapter` module, which
+sits between fluxor's `quic` foundation module and `protocol`'s mqtt
+component without changing either side; the QUIC graph wires it on
+its own UDP listener. `protocol`'s router classifies the bridged
+stream the same way as a TCP connection. Connection migration is a
+QUIC-transport concern; the session record is unaffected.

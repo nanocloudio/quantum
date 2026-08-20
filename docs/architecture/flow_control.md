@@ -6,9 +6,9 @@ modules cooperate: `admission` (substrate, node-wide credits),
 `flow`'s prefetch component (Quantum, per-session credits), and
 `flow`'s backpressure component (Quantum, translation to protocol signals).
 
-The throughput floor and latency targets stated here are the
-normative performance contracts; the harnesses that exercise them
-live in [guides/performance.md](../guides/performance.md).
+The throughput floor and latency figures stated here are design
+contracts the flow-control machinery is sized against, not measured
+results.
 
 ## Normative requirements
 
@@ -17,7 +17,7 @@ live in [guides/performance.md](../guides/performance.md).
 | Default inflight credit per session | 10 QoS 1/2 slots (MQTT) / equivalent for Kafka, AMQP |
 | Per-PRG throughput floor | ≥ 500 publishes/sec sustained at QoS 2 semantics (four-phase handshake) under steady-state load |
 | In-AZ p99 server-side latency | ≤ 10 ms from edge ingress to WAL quorum commit, excluding client RTT |
-| Backpressure signal | `ThrottleEnvelope{reason, backlog, retry_hints}` — adapter translates to protocol-native response |
+| Backpressure signal | A throttle envelope carrying reason and backlog, translated to a protocol-native response |
 
 Adapters enforce the lower of (client credit, tenant policy ceiling).
 Backpressure signals are protocol-native, not generic — clients see
@@ -45,17 +45,11 @@ independent credit pools:
 
 | Credit type | Default cap | Driven by |
 |---|---|---|
-| Entry credits | 4096 (max in flight) | Replication lag in WAL indexes |
-| Byte credits | 64 MiB | Replication lag in bytes |
+| Entry credits | 4096 (max in flight, `entry_credit_max`) | Replication lag in WAL indexes |
+| Byte credits | 64 KiB (`byte_credit_max_kib`) | Replication lag in bytes |
 
-The PID samples every 100ms (default) and adjusts credit availability
-based on the lag error term. Profiles tune the gain triple:
-
-| Profile | When to use |
-|---|---|
-| `Latency` | Low-latency workloads with steady load; aggressive ramp-down on lag. |
-| `Throughput` | Bulk publish workloads; tolerates moderate lag for higher sustained rate. |
-| `WAN` | High-RTT replication paths; integral term dominates to absorb transient lag. |
+The PID samples every 100ms (`sample_period_ms`) and adjusts credit
+availability based on the lag error term.
 
 Anti-windup integral clamping prevents the controller from
 accumulating credit debt during sustained overload. When credits
@@ -71,9 +65,8 @@ credits live per session, with their own state and lifecycle.
 
 | Setting | Default | Source |
 |---|---|---|
-| `default_prefetch_count` | 10 messages | Tenant policy (lowered by client `Receive Maximum` / `prefetch_count` / consumer config) |
-| `adaptive_scaling` | true | Reduces credits when apply-to-delivery lag exceeds threshold |
-| `apply_delivery_lag_threshold` | 1000 entries | Empirical default; raise for bulk consumers, lower for tight-latency consumers |
+| `default_prefetch` | 10 messages | Lowered by client `Receive Maximum` / `prefetch_count` / consumer config |
+| Lag threshold | 4/5 of the prefetch cap (8 with the default window) | Apply-to-delivery lag beyond this halves per-session credits until the lag normalises |
 
 Protocol-specific bindings:
 
@@ -93,11 +86,11 @@ depths, evaluates configurable thresholds, and emits per-protocol
 metrics that operators watch on dashboards.
 
 The component also has an `envelope_in` port and an `on_envelope`
-handler for a substrate-supplied throttle envelope, but **no graph wires
-it**: Clustor retired `admission.envelope` as a dead port (it was
-declared and never written), so today the translation runs on queue
-depths and `gateway.rejected` alone. Reinstating the envelope path needs
-a substrate-side decision about what emits it.
+handler for a substrate-supplied throttle envelope, but no deployment
+graph wires it — the substrate declares no emitter for it — so today
+the translation runs on queue depths and `gateway.rejected` alone.
+Wiring the envelope path needs a substrate-side decision about what
+emits it.
 
 ### Queue depth thresholds
 
@@ -106,15 +99,14 @@ a substrate-side decision about what emits it.
 | Commit-to-apply | 10 000 entries | Emit `TransientBackpressure` → protocol pause-ack signal. |
 | Apply-to-delivery | 5 000 entries | Drop QoS 0 publishes; throttle QoS 1/2. |
 | Retained write buffer | 16 MiB | Block retained writes until drained. |
-| WAL dirty bytes | disabled by default | Block proposal admission if non-zero. |
 
-### Envelope-to-protocol mapping
+### Signal-to-protocol mapping
 
-| Envelope | MQTT 5 | Kafka | AMQP 0-9-1 |
+| Signal class | MQTT 5 | Kafka | AMQP 0-9-1 |
 |---|---|---|---|
-| `TransientBackpressure` | `0x97` (Quota exceeded) reason code | `THROTTLING_QUOTA_EXCEEDED` + `throttle_time_ms` | `Channel.Flow{active=false}` |
-| `PermanentDurability` | DISCONNECT with `0x99` (Payload format invalid) semantics | `connection.close` with `INVALID_CONFIG` | `connection.close{reply-code=resource-error}` |
-| `PermanentEpoch` | `dirty_epoch` rejection per [mqtt_adapter.md](mqtt_adapter.md) | `NOT_LEADER_OR_FOLLOWER` | `link-detach{detach-forced}` |
+| `BP_TRANSIENT` | `0x97` (Quota exceeded) reason code | `THROTTLING_QUOTA_EXCEEDED` + `throttle_time_ms` | `Channel.Flow{active=false}` |
+| `BP_PERMANENT_DURABILITY` | DISCONNECT | `connection.close` | `connection.close{reply-code=resource-error}` |
+| `BP_PERMANENT_EPOCH` | `dirty_epoch` handling per [mqtt_adapter.md](mqtt_adapter.md) | `NOT_LEADER_OR_FOLLOWER` | Connection close |
 
 The translation is mechanical — `flow`'s backpressure component does not
 make policy decisions, it does protocol mapping. Policy lives in
@@ -125,22 +117,18 @@ make policy decisions, it does protocol mapping. Policy lives in
 Every translated signal increments a counter dimensioned by
 `(tenant, protocol, prg, reason)`. Gauges expose current queue depths
 for each tracked queue. These flow through `governance`'s telemetry component to
-`operations` and surface on `/metrics` — they are the primary
-signal operators use to detect that flow control is engaging in
-production. See [observability.md](observability.md).
+`operations` — the signal operators use to detect that flow control
+is engaging. See [observability.md](observability.md).
 
 The three concerns are separate modules because their state and math
 differ: admission control is a node-wide PID loop (sample periods,
 integral windup, gain tuning), prefetch is per-session credit state, and
 backpressure translation is a stateless observation + lookup. See
-[architecture.md](../architecture.md#flow-control--acknowledgement-3)
+[architecture.md](../architecture.md#flow-control-and-acknowledgement)
 for the module boundaries.
 
 ## Operator surfaces
 
-- `/metrics` exposes credit headroom, queue depths, PID error term, replication lag in bytes and entries, and per-protocol backpressure signal counts.
-- `/why` includes flow-control state in the "node not ready" explanation when the runtime is gated by sustained backpressure.
-- `operations` accepts profile changes (`Latency` ↔ `Throughput` ↔ `WAN`) and quota overrides without restart; useful for planned-spike incidents.
+- The metrics export carries credit headroom, queue depths, and per-protocol backpressure signal counts.
 
-The validation workflow that exercises these surfaces under load
-lives in [guides/performance.md](../guides/performance.md).
+

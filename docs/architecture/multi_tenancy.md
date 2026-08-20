@@ -2,9 +2,16 @@
 
 Quantum's tenant isolation model: how resources are scoped, how
 quotas are enforced, how noisy neighbours are contained. Tenant
-records themselves live in CP-Raft (see
+records come from the control plane (see
 [control_plane.md](control_plane.md)); enforcement happens in
-`governance`'s tenants component plus the throttle and backpressure modules.
+`governance`'s tenants component plus the backpressure path.
+
+**Status: partially wired.** The tenant-aware plumbing exists from
+the apply path onwards, but every shipped graph produces exactly one
+tenant today; see [Implementation status](#implementation-status)
+for precisely what runs and what is design. Sections describing
+quota ceilings, bridges, lifecycle and operator surfaces are the
+target design.
 
 ## Namespaces
 
@@ -41,9 +48,9 @@ set tighter quotas internally but cannot exceed the operator ceiling.
 | Retained payload count | retained topics per tenant | `messaging`'s retained component rejects new retained writes past the cap. |
 | PRG count | partitions per tenant | CP-Raft refuses placement plans that exceed the operator ceiling. |
 
-Quota violations surface as `ThrottleEnvelope{reason=QuotaExceeded}`,
-which `flow`'s backpressure component translates into protocol-native
-signals (MQTT `0x97`, Kafka `THROTTLING_QUOTA_EXCEEDED`, AMQP
+Quota violations surface as throttle signals, which `flow`'s
+backpressure component translates into protocol-native responses
+(MQTT `0x97`, Kafka `THROTTLING_QUOTA_EXCEEDED`, AMQP
 `Channel.Flow{active=false}`).
 
 ## Noisy-neighbour control
@@ -72,43 +79,37 @@ loop.
 
 ## Implementation status
 
-**Tenancy is not plumbed end to end.** Every graph in `examples/`
-currently produces exactly one tenant (id 0), and the mechanisms below
-describe the design rather than what runs today.
+**Tenancy is not plumbed end to end.** Every shipped graph produces
+exactly one tenant (id 0), and much of this document describes the
+design rather than what runs today.
 
-What exists: `Session` carries a `tenant` field, the apply path threads
-`p.tenant` from the proposal header, `governance`'s tenants component
-enforces per-tenant token buckets, and the dedup key, retained store and
-metric envelopes are all tenant-scoped. So the *plumbing* is tenant-aware
-from apply onwards.
+What exists: sessions carry a tenant field, the apply path threads
+the tenant from the proposal header, `governance`'s tenants component
+enforces per-tenant token buckets, and the dedup key, retained store
+and metric envelopes are all tenant-scoped. The plumbing is
+tenant-aware from apply onwards, and wherever a session is reachable
+the tenant is read from it rather than assumed.
 
-What is missing is the source. `control_plane.tenant_records` is now
-wired into `governance.records_in` in every graph that carries both, so
-quota enforcement is CP-driven rather than bootstrap-only. But the
-record it delivers is the synthetic default
-`[tenant_id = 0][max_rate = 10000]` — clustor's `control_plane/cp.rs`
-marks it a placeholder — so it populates the quota table without
-establishing which tenant a *client* belongs to.
+What is missing is the source. `control_plane.tenant_records` feeds
+`governance`, but the record it delivers is a synthetic placeholder
+default (tenant id 0), so it populates the quota table without
+establishing which tenant a *client* belongs to. That mapping is the
+actual gap, and it is upstream: nothing assigns a session a tenant
+other than 0 until the control plane emits real tenant data keyed by
+something a CONNECT carries. Three sites in `session_processor` are
+marked `TENANCY GAP` where a tenant has to be chosen and none is
+derivable:
 
-That mapping is the actual gap, and it is upstream: nothing assigns a
-session a tenant other than 0 until the control plane emits real tenant
-data keyed by something a CONNECT carries. Three sites in
-`session_processor` are marked `TENANCY GAP` where a tenant has to be
-chosen and none is derivable:
+- **CONNECT arrival** — no session exists yet, so the tenant would
+  have to come from the control plane (from the client's credential
+  or a connection-level namespace).
+- The two correlation-keyed handlers, which work off a stash keyed
+  by correlation id, not by session.
 
-- **CONNECT arrival** — no session exists yet, so the tenant would have
-  to come from the control plane (from the client's credential or the
-  ALPN/SNI namespace).
-- **`finalise_stash`** and the **PROPOSAL_ASSIGNED** handler — both work
-  off a stash keyed by correlation id, not by session.
-
-Everywhere a session *is* reachable, the tenant is now read from it
-rather than assumed (§8 rule 6: per-instance state, not a module
-constant). Closing the remaining three needs two things Quantum cannot supply on
-its own: real tenant records from the control plane (clustor side), and
-a decision about what a CONNECT is keyed on — client credential, ALPN /
-SNI namespace, or connection-level identity. Until both land, treat the
-sections below as the target design.
+Closing the three needs two things Quantum cannot supply on its own:
+real tenant records from the control plane (a clustor concern), and
+a decision about what a CONNECT is keyed on — client credential,
+connection-level identity, or namespace.
 
 ## Isolation boundaries
 
