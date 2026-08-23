@@ -176,19 +176,9 @@ pub const MSG_DR_SNAPSHOT_RESP: u8 = 0xE2;
 pub const MSG_DR_PROMOTE: u8 = 0xE3;
 pub const MSG_METRICS_ROLLUP: u8 = 0xE8;
 
-/// HTTP request parsed off the shared client port for the admin
-/// surface (clustor `operations`' `request` port; values shared with
-/// clustor's wire vocabulary). Payload:
-///   `[conn_id:u8][method:u8 (G=0x47, P=0x50, ...)][path_len:u8][path bytes][body...]`
-/// The method byte is the verb's first character so the consumer
-/// dispatches without re-parsing.
-pub const MSG_HTTP_REQUEST: u8 = 0x74;
-
-/// HTTP response from the admin surface back to the module that owns
-/// the client port, which frames the wire-level HTTP/1.1 response
-/// itself. Payload:
-///   `[conn_id:u8][status:u16 LE][body_len:u16 LE][body bytes]`
-pub const MSG_HTTP_RESPONSE: u8 = 0x75;
+// 0x74 and 0x75 are reserved — clustor's wire vocabulary reserves the
+// same pair, and the two id spaces meet on shared edges. Do not
+// reassign.
 
 /// Client-facing frame on the `codec → protocol → peer_router.client_resp`
 /// chain. Payload is `[conn_id:u8][protocol bytes]`. Carries an

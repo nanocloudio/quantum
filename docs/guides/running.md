@@ -32,19 +32,21 @@ An MQTT client is needed for the smoke checks; the examples below use
 
 ## Single-node broker
 
-The graph below is a 13-module single-node broker: the clustor
+The graph below is a 14-module single-node broker: the clustor
 substrate (one-voter Raft, WAL, admission) plus quantum's protocol
-stack, serving cleartext MQTT on port 9090. One node is its own
-quorum, so publishes commit at local durability without peer
-traffic.
+stack, serving cleartext MQTT on port 9090, with wave's `http`
+module serving the diagnostic/admin surface on 19090. One node is
+its own quorum, so publishes commit at local durability without
+peer traffic.
 
 From the repository root:
 
 ```sh
 fluxor run - <<'EOF'
 # Quantum single-node broker: MQTT over cleartext TCP on port 9090.
-# Clustor substrate (8 modules) + Quantum protocol stack (5 modules);
-# the linux_net transport endpoint is supplied by the runtime.
+# Clustor substrate (8 modules) + Quantum protocol stack (5 modules)
+# + wave http (diagnostic surface, port 19090); the linux_net
+# transport endpoint is supplied by the runtime.
 
 target: linux
 tick_us: 1000
@@ -83,6 +85,16 @@ modules:
   - name: topic_engine
   - name: messaging
 
+  # Diagnostic/admin HTTP surface (wave). Optional: a headless
+  # broker omits this module and its four edges entirely.
+  - name: http
+    variant: app
+    port: 19090
+    host_tcp: 1
+    routes:
+      - path: "/"
+        app: true
+
 wiring:
   # Transport: linux_net <-> peer_router. Client-path channels are
   # raised from the 8 KiB default so bursts of simultaneous
@@ -101,13 +113,20 @@ wiring:
   - from: peer_router.peer_rx
     to: consensus.ack
 
-  # HTTP/admin leg: protocol parses requests off the shared listener
-  # for operations, and frames operations' message-shaped replies
-  # back into wire-level HTTP/1.1 on frames_out.
-  - from: protocol.http_out
+  # Diagnostic/admin HTTP surface: wave http shares the linux_net
+  # instance (its own port via CMD_BIND) and exchanges
+  # HttpRequest/HttpResponse envelopes with operations. Mailbox mode
+  # (`buffer_group`) is REQUIRED on both envelope edges.
+  - from: linux_net.net_out
+    to: http.net_in
+  - from: http.net_out
+    to: linux_net.net_in
+  - from: http.req_out
     to: operations.request
+    buffer_group: 1
   - from: operations.response
-    to: protocol.http_responses_in
+    to: http.resp_in
+    buffer_group: 2
 
   # Client responses fan in at the transport
   - from: protocol.frames_out
@@ -257,8 +276,8 @@ The second command returns `retained-payload` immediately: the
 retained store replayed the payload to the new subscriber.
 
 ```sh
-# Diagnostic HTTP surface, served on the same listener
-curl -s http://127.0.0.1:9090/readyz
+# Diagnostic HTTP surface (wave http, client port + 10000)
+curl -s http://127.0.0.1:19090/readyz
 ```
 
 `/readyz` answers 200 once WAL replay has completed (503 before

@@ -8,8 +8,9 @@ hardware_targets = ["bcm2712"]
 #
 # Components: router (per-connection classification from the first
 # bytes, pinned for the connection's lifetime), mqtt (3.1 / 3.1.1 / 5.0),
-# kafka (binary protocol), amqp (0-9-1), http (diagnostic-leg adapter:
-# MSG_HTTP_REQUEST out, wire-level HTTP/1.1 framing back in).
+# kafka (binary protocol), amqp (0-9-1). HTTP is deliberately absent —
+# the diagnostic/admin surface is wave's `http` module on its own
+# listener, wired straight to clustor's `operations`.
 #
 # The MQTT-over-QUIC graph selects the `mqtt` variant behind the
 # standalone `mqtt_quic_adapter`, which bridges the QUIC transport to the
@@ -56,16 +57,6 @@ name = "responses_in"
 direction = "input"
 content_type = "OctetStream"
 
-# Admin-surface replies to `http_out` traffic, as MSG_HTTP_RESPONSE
-# `[conn_id][status:u16 LE][body_len:u16 LE][body]`. The http component
-# frames each one as a wire-level HTTP/1.1 response on `frames_out` —
-# the consumer stays message-shaped, this module owns the wire format
-# of the shared client port.
-[[ports]]
-name = "http_responses_in"
-direction = "input"
-content_type = "OctetStream"
-
 # ── outputs ──────────────────────────────────────────────────
 
 # Decoded proposals to the session state machine, PROTO_*-tagged.
@@ -79,14 +70,6 @@ content_type = "OctetStream"
 # is addressed to exactly one connection.
 [[ports]]
 name = "frames_out"
-direction = "output"
-content_type = "OctetStream"
-
-# Records classified as HTTP, parsed into MSG_HTTP_REQUEST
-# `[conn_id][method][path_len][path][body]` for the admin surface's
-# `request` port.
-[[ports]]
-name = "http_out"
 direction = "output"
 content_type = "OctetStream"
 
@@ -105,6 +88,6 @@ content_type = "OctetStream"
 # unclassified), and each codec's decode/encode/error counters.
 metrics = [
     "classified_mqtt", "classified_kafka", "classified_amqp",
-    "classified_http", "unclassified",
+    "unclassified",
     "packets_decoded", "packets_encoded", "parse_errors",
 ]

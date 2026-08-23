@@ -551,10 +551,10 @@ pub fn init(s: &mut Mqtt) {
 
 /// Emit a `[conn_id][bytes]` payload as a `MSG_CLIENT_FRAME`
 /// envelope-framed message to protocol. Framing matters because
-/// `protocol` is a fan-in merge over four writers (mqtt/amqp/
-/// kafka/http) and back-to-back raw writes coalesce on the merge
+/// `protocol` is a fan-in merge over the codec writers (mqtt/amqp/
+/// kafka) and back-to-back raw writes coalesce on the merge
 /// module's byte FIFO, mangling the next frame's `conn_id`. Same
-/// pattern as the `codec_in` fan-in fix already shipped.
+/// pattern as the `codec_in` fan-in.
 /// # Safety
 unsafe fn write_conn_frame(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -> bool {
     if chan < 0 {

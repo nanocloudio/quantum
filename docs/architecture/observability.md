@@ -54,8 +54,10 @@ ring overflow, or transport loss).
 
 ## Diagnostic HTTP endpoints
 
-`operations` serves the diagnostic surface over the request path the
-graph wires to it:
+`operations` owns what each request means; wave's `http` module
+(`app` variant) owns the HTTP mechanics, on its own listener wired
+to `operations`' `request`/`response` envelope ports. A graph that
+needs no admin/debug surface omits the wave module entirely:
 
 | Endpoint | Purpose |
 |---|---|

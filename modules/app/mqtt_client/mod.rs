@@ -208,7 +208,14 @@ struct MqttState {
     subscribe_topic_len: u8,
     subscribe_topic2_len: u8,
     publish_topic_len: u8,
-    conn_id: u8,
+    /// The connection identifier, as the net contract carries it: `u16` little
+    /// endian, in both directions. It was a `u8` here, which meant every
+    /// `CMD_SEND` wrote a one-byte id where the platform reads two — so the
+    /// platform read the id's low byte plus the payload's first byte as the
+    /// connection, matched nothing, and dropped the send. The connection
+    /// opened, nothing was ever transmitted on it, and the failure looked
+    /// exactly like an unresponsive broker.
+    conn_id: u16,
     /// 1 once `MSG_CONNECTED` established the TCP connection — connection
     /// PRESENCE tracked separately from `conn_id`'s value because IP may assign
     /// conn_id 0 (keying off `conn_id != 0` would leak the first connection).
@@ -482,8 +489,8 @@ unsafe fn flush_tx(s: &mut MqttState) -> bool {
     }
     let sys = &*s.syscalls;
     let remaining = (s.tx_len - s.tx_sent) as usize;
-    // Max data per frame: net_buf - frame_hdr(3) - conn_id(1)
-    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    // Max data per frame: net_buf - frame_hdr(3) - conn_id(2)
+    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 2;
     let to_send = if remaining < max_data {
         remaining
     } else {
@@ -493,20 +500,22 @@ unsafe fn flush_tx(s: &mut MqttState) -> bool {
         return true;
     }
 
-    // Build CMD_SEND payload: [conn_id][data...]
+    // Build CMD_SEND payload: [conn_id: u16 LE][data...]
     let scratch = s.net_buf.as_mut_ptr();
     // Assemble payload starting at scratch[NET_FRAME_HDR]
     // net_write_frame will place header at scratch[0..3], payload at scratch[3..]
     // So we build a temporary payload buffer
     let payload_ptr = scratch.add(NET_FRAME_HDR);
-    *payload_ptr = s.conn_id;
+    let id = s.conn_id.to_le_bytes();
+    *payload_ptr = id[0];
+    *payload_ptr.add(1) = id[1];
     let src = s.tx_buf.as_ptr().add(s.tx_sent as usize);
     let mut i = 0;
     while i < to_send {
-        *payload_ptr.add(1 + i) = *src.add(i);
+        *payload_ptr.add(2 + i) = *src.add(i);
         i += 1;
     }
-    let payload_len = 1 + to_send;
+    let payload_len = 2 + to_send;
 
     // Write frame header manually to keep it in one buffer
     let len_le = (payload_len as u16).to_le_bytes();
@@ -702,8 +711,8 @@ unsafe fn handle_rx(s: &mut MqttState) {
 
     // Established-stream isolation: only act on frames for OUR connection.
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
-        && payload_len >= 1
-        && *nbuf.add(NET_FRAME_HDR) != s.conn_id
+        && payload_len >= 2
+        && u16::from_le_bytes([*nbuf.add(NET_FRAME_HDR), *nbuf.add(NET_FRAME_HDR + 1)]) != s.conn_id
     {
         return;
     }
@@ -714,15 +723,16 @@ unsafe fn handle_rx(s: &mut MqttState) {
         return;
     }
 
-    if msg_type == NET_MSG_DATA && payload_len > 1 {
-        // Payload: [conn_id][data...]. A net-level truncation (`full > payload_len`,
+    if msg_type == NET_MSG_DATA && payload_len > 2 {
+        // Payload: [conn_id: u16 LE][data...]. A net-level truncation
+        // (`full > payload_len`,
         // frame bigger than our scratch) means the byte stream is unrecoverable.
         if full > payload_len {
             log_err(s, b"[mqtt] truncated segment; dropping connection");
             enter_reconnect(s);
             return;
         }
-        let data_len = payload_len - 1;
+        let data_len = payload_len - 2;
 
         // INCREMENTAL DRAIN: process already-buffered complete MQTT packets
         // first, freeing the maximum reassembly space before admitting this
@@ -743,7 +753,7 @@ unsafe fn handle_rx(s: &mut MqttState) {
             enter_reconnect(s);
             return;
         }
-        let src = nbuf.add(NET_FRAME_HDR + 1); // skip frame hdr + conn_id
+        let src = nbuf.add(NET_FRAME_HDR + 2); // skip frame hdr + conn_id
         let dst = s.rx_buf.as_mut_ptr().add(s.rx_have as usize);
         let mut i = 0;
         while i < data_len {
@@ -877,14 +887,13 @@ unsafe fn enter_reconnect(s: &mut MqttState) {
     // Send CMD_CLOSE for current connection (presence, not conn_id != 0).
     if s.conn_present != 0 && s.net_out_chan >= 0 {
         let sys = &*s.syscalls;
-        let mut payload = [0u8; 1];
-        payload[0] = s.conn_id;
+        let payload = s.conn_id.to_le_bytes();
         net_write_frame(
             sys,
             s.net_out_chan,
             NET_CMD_CLOSE,
             payload.as_ptr(),
-            1,
+            2,
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
@@ -1125,10 +1134,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let nbuf = s.net_buf.as_mut_ptr();
                         let (msg_type, payload_len) =
                             net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
+                        if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
                             // Claim only our own outbound connection by tag.
-                            let tag = if payload_len >= 2 {
-                                *nbuf.add(NET_FRAME_HDR + 1)
+                            // The tag sits after the two-byte connection id;
+                            // reading it at +1 read the id's high byte, which
+                            // is zero for every connection the platform has
+                            // ever assigned — so this check passed
+                            // unconditionally and claimed other consumers'
+                            // connections too.
+                            let tag = if payload_len >= 3 {
+                                *nbuf.add(NET_FRAME_HDR + 2)
                             } else {
                                 0
                             };
@@ -1136,7 +1151,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             if tag != 0 && tag != me {
                                 return 0; // another consumer's connection.
                             }
-                            s.conn_id = *nbuf.add(NET_FRAME_HDR);
+                            s.conn_id = u16::from_le_bytes([
+                                *nbuf.add(NET_FRAME_HDR),
+                                *nbuf.add(NET_FRAME_HDR + 1),
+                            ]);
                             s.conn_present = 1;
                             log_msg(s, b"[mqtt] tcp connected");
                             s.phase = MqttPhase::MqttConnect;
@@ -1277,14 +1295,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 MqttPhase::Error => {
                     if s.conn_id != 0 && s.net_out_chan >= 0 {
-                        let mut payload = [0u8; 1];
-                        payload[0] = s.conn_id;
+                        let payload = s.conn_id.to_le_bytes();
                         net_write_frame(
                             sys,
                             s.net_out_chan,
                             NET_CMD_CLOSE,
                             payload.as_ptr(),
-                            1,
+                            2,
                             s.net_buf.as_mut_ptr(),
                             NET_BUF_SIZE,
                         );

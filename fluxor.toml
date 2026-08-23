@@ -23,6 +23,11 @@ version = "0.0.1"
 [dependencies]
 fluxor  = "0.0.1"
 clustor = "0.0.1"
+# wave provides the HTTP mechanics for the optional diagnostic/admin
+# surface: graphs that want it wire wave's `http` (`app` variant) in
+# front of clustor's `operations`; graphs that don't carry no wave
+# modules at all.
+wave    = "0.0.1"
 
 [ci]
 # Module targets `fluxor modules build --all` will produce artefacts for.

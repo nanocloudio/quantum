@@ -13,10 +13,12 @@ A deployed broker graph is 14 modules across six execution domains:
 the clustor substrate (`peer_router`, `consensus`, `durability`,
 `gateway`, `admission`, `control_plane`, `operations`) plus quantum's
 application modules (`protocol`, `session_processor`, `topic_engine`,
-`messaging`, `flow`, `forward_coordinator`, `governance`). Bare-metal
-deployments add the fluxor `tls` foundation module. The full
-structural reference — layers, execution domains, module reference,
-message graph — is [docs/architecture.md](docs/architecture.md).
+`messaging`, `flow`, `forward_coordinator`, `governance`). Graphs
+that want the HTTP diagnostic/admin surface add wave's `http` module
+(`app` variant) on its own listener; bare-metal deployments add the
+fluxor `tls` foundation module. The full structural reference —
+layers, execution domains, module reference, message graph — is
+[docs/architecture.md](docs/architecture.md).
 
 ## Why Quantum
 

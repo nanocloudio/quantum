@@ -11,8 +11,9 @@ A deployed broker graph is **14 modules across six execution
 domains**: the 7-module clustor substrate plus 7 quantum modules —
 protocol codecs and routing, a unified session state machine, topic
 and messaging infrastructure, flow control, cross-PRG forwarding,
-governance. Bare-metal deployments add the fluxor `tls` foundation
-module for a 15-module graph.
+governance. Graphs that want the HTTP diagnostic/admin surface add
+wave's `http` module (`app` variant) on its own listener; bare-metal
+deployments add the fluxor `tls` foundation module.
 
 This document is the structural reference: the layering, the
 execution model, every module and what it owns, the message graph,
@@ -109,7 +110,7 @@ consumes them:
 | `gateway` | apply | Generic request envelope and credit-gated admission: consumes tokens on `credit_supply`, emits over-envelope requests on `rejected`. |
 | `admission` | apply | Control-plane proof cache FSM (Fresh/Cached/Stale/Expired) and the dual-token PID controller for proposal admission; emits `credits` and drives `consensus.cp_state`. See [architecture/flow_control.md](architecture/flow_control.md). |
 | `control_plane` | ops | Control-plane bridge emitting proofs, tenant records, capability manifests, and routing epochs. See [architecture/control_plane.md](architecture/control_plane.md) for its current status. |
-| `operations` | ops | Metrics fan-in and the HTTP admin/diagnostic surface (`/readyz`, `/why`, `/metrics`, `/admin`); role-gated admin workflows. |
+| `operations` | ops | Metrics fan-in and the admin/diagnostic surface (`/readyz`, `/why`, `/metrics`, `/admin`) behind wave's `http` module; role-gated admin workflows. |
 
 The single-node graph in the run guide also wires clustor's
 standalone `partition_router` module, which fans untagged proposals
@@ -266,6 +267,7 @@ graph TB
 
     subgraph core0_msg["Core 0 — Ops + Messaging (1ms / 250µs)"]
         control_plane["control_plane<br/><i>CP proofs, tenants,<br/>routing</i>"]
+        http["http (wave)<br/><i>diagnostic listener</i>"]
         operations["operations<br/><i>admin, metrics fan-in</i>"]
         governance["governance<br/><i>tenants · dr · audit · telemetry</i>"]
         messaging["messaging<br/><i>dedup · offline · retained</i>"]
@@ -277,7 +279,7 @@ graph TB
 
     %% peer_router → protocol (cross-core: network → ingest)
     peer_router ==>|"client cleartext"| protocol
-    peer_router ==>|"admin / HTTP"| operations
+    http ==>|"HttpRequest / HttpResponse"| operations
     consensus ==>|RPC out| peer_router
     peer_router ==>|peer RPC| consensus
 

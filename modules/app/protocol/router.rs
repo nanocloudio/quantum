@@ -26,7 +26,6 @@ pub const PROTO_UNKNOWN: u8 = 0;
 pub const PROTO_MQTT: u8 = 1;
 pub const PROTO_KAFKA: u8 = 2;
 pub const PROTO_AMQP: u8 = 3;
-pub const PROTO_HTTP: u8 = 4;
 pub const PROTO_UNSUPPORTED: u8 = 0xFF;
 
 #[repr(C)]
@@ -61,7 +60,6 @@ pub struct Router {
     classified_mqtt: u32,
     classified_kafka: u32,
     classified_amqp: u32,
-    classified_http: u32,
     unclassified: u32,
 }
 
@@ -126,23 +124,6 @@ fn classify(bytes: &[u8]) -> u8 {
     // AMQP: protocol header is exactly "AMQP\x00\x00\x09\x01"
     if bytes.len() >= 8 && &bytes[..4] == b"AMQP" {
         return PROTO_AMQP;
-    }
-
-    // HTTP: starts with method token
-    if bytes.len() >= 4 {
-        let method = &bytes[..4];
-        if method == b"GET "
-            || method == b"POST"
-            || method == b"PUT "
-            || method == b"HEAD"
-            || method == b"DELE"
-            || method == b"OPTI"
-            || method == b"PATC"
-            || method == b"TRAC"
-            || method == b"CONN"
-        {
-            return PROTO_HTTP;
-        }
     }
 
     // Kafka: first 4 bytes are request size (big-endian i32), must be positive
@@ -225,7 +206,6 @@ pub fn route(s: &mut Router, conn_id: u8, mtype: u8, data: &[u8]) -> u8 {
             PROTO_MQTT => s.classified_mqtt = s.classified_mqtt.wrapping_add(1),
             PROTO_KAFKA => s.classified_kafka = s.classified_kafka.wrapping_add(1),
             PROTO_AMQP => s.classified_amqp = s.classified_amqp.wrapping_add(1),
-            PROTO_HTTP => s.classified_http = s.classified_http.wrapping_add(1),
             _ => {}
         }
     }
@@ -238,7 +218,6 @@ pub fn metrics(s: &Router, m: &mut [u8; 24]) -> usize {
     m[0..4].copy_from_slice(&s.classified_mqtt.to_le_bytes());
     m[4..8].copy_from_slice(&s.classified_kafka.to_le_bytes());
     m[8..12].copy_from_slice(&s.classified_amqp.to_le_bytes());
-    m[12..16].copy_from_slice(&s.classified_http.to_le_bytes());
-    m[16..20].copy_from_slice(&s.unclassified.to_le_bytes());
-    20
+    m[12..16].copy_from_slice(&s.unclassified.to_le_bytes());
+    16
 }
