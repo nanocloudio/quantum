@@ -101,13 +101,15 @@ wiring:
   - from: peer_router.peer_rx
     to: consensus.ack
 
-  # HTTP/admin leg
+  # HTTP/admin leg: protocol parses requests off the shared listener
+  # for operations, and frames operations' message-shaped replies
+  # back into wire-level HTTP/1.1 on frames_out.
   - from: protocol.http_out
     to: operations.request
+  - from: operations.response
+    to: protocol.http_responses_in
 
   # Client responses fan in at the transport
-  - from: operations.response
-    to: peer_router.client_resp
   - from: protocol.frames_out
     to: peer_router.client_resp
     buffer_bytes: 65536
@@ -224,8 +226,9 @@ EOF
 packs the module table, and executes `fluxor-linux` in the
 foreground; logs go to stderr. The MQTT listener is
 `peer_router`'s `listen_port` (default 9090, bound on all
-interfaces). WAL segments land under `wal/` and snapshot state under
-`data/` in the working directory; both are recreated on demand.
+interfaces). WAL segments land under `wal/`, Raft metadata under
+`raft/`, and snapshot state under `data/` in the working directory;
+all three are recreated on demand.
 
 ## Smoke checks
 
@@ -253,12 +256,22 @@ mosquitto_sub -h 127.0.0.1 -p 9090 -t 'demo/#' -q 1 -C 1
 The second command returns `retained-payload` immediately: the
 retained store replayed the payload to the new subscriber.
 
+```sh
+# Diagnostic HTTP surface, served on the same listener
+curl -s http://127.0.0.1:9090/readyz
+```
+
+`/readyz` answers 200 once WAL replay has completed (503 before
+that), with the readiness byte as its body; `/why` explains a
+non-ready state and `/metrics` returns the current id-interned
+metrics export.
+
 ## Stopping
 
 `Ctrl+C` in the `fluxor run` terminal stops the runtime. State under
-`wal/` and `data/` persists; the next run replays the WAL and
-recovers durable state (retained messages, persistent sessions).
-Delete both directories for a fresh start.
+`wal/`, `raft/`, and `data/` persists; the next run replays the WAL
+and recovers durable state (retained messages, persistent sessions).
+Delete all three directories for a fresh start.
 
 ## Beyond one node
 

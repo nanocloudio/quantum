@@ -95,6 +95,11 @@ const MAX_STASH_ENV: usize = 2048;
 const STASH_DEDUP_PENDING: u8 = 0;
 const STASH_DEDUP_OK: u8 = 1;
 const STASH_DEDUP_DUPLICATE: u8 = 2;
+/// The dedup component had no room to record this key, so no
+/// duplicate-suppression exists for it. The publish is dropped without
+/// a client-facing ack, leaving the retry with the client, and is
+/// counted as throttled.
+const STASH_DEDUP_REFUSED: u8 = 3;
 
 /// Defer queue for subscriber deliveries that hit backpressure
 /// (prefetch_credit cap, PID exhaustion, or inflight-slot exhaustion).
@@ -110,7 +115,13 @@ const MAX_PENDING_DLV: usize = 4112;
 /// is lost, the ack component never learns about the inflight entry and the
 /// publisher's PUBACK never fires. Each entry is the fixed-size 18-byte
 /// register payload (see PROPOSAL_ASSIGNED handler).
-const PENDING_ACK_SLOTS: usize = 64;
+///
+/// One slot per correlation: a tagged proposal produces exactly one
+/// registration, and `correlate::allocate` reserves a slot for it
+/// before the proposal is accepted. That makes the queue large enough
+/// for every registration the broker can owe, so a saturated edge
+/// parks work instead of discarding it.
+const PENDING_ACK_SLOTS: usize = MAX_PENDING_CORRELATIONS;
 
 // MQTT packet types (mirrored in `protocol::mqtt`)
 const PKT_CONNECT: u8 = 1;
@@ -428,6 +439,17 @@ struct ModuleState {
     publishes: u32,
     applied: u32,
     acks_emitted: u32,
+    /// MQTT completions dropped because the session generation they
+    /// were registered under no longer occupies the slot.
+    acks_stale_epoch: u32,
+    /// Correlations still awaiting an assignment past
+    /// `CORRELATION_TIMEOUT_MS`. Non-zero means the substrate owes an
+    /// assignment it has not delivered.
+    correlations_overdue: u32,
+    /// Steps whose committed-entry drain stopped because an apply
+    /// output edge was full. Rising values mean commits are backing up
+    /// behind a saturated messaging or topic bus.
+    apply_output_stalls: u32,
     qos2_rec: u32,
     qos2_rel: u32,
     qos2_comp: u32,
@@ -2563,6 +2585,33 @@ unsafe fn amqp_delivery_pump(s: &mut ModuleState, sys: &SyscallTable) {
 /// — see the buffer-capacity discussion in `modules/common/wire.rs`.
 ///
 /// # Safety
+/// True when every edge an apply handler can write to has room.
+///
+/// The apply path emits to the messaging bus (dedupe checks, retained
+/// writes, offline ops) and the topic bus (fan-out), and a handler has
+/// no way to defer half its effects. Checking both before the entry is
+/// consumed is what keeps apply-derived state and the committed log in
+/// step: a module advances only on a committed output, which is fluxor's
+/// standing rule for every module in the graph.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn outputs_ready_for_apply(s: &ModuleState, sys: &SyscallTable) -> bool {
+    // SAFETY: caller guarantees `sys` is live.
+    unsafe {
+        for chan in [s.out_messaging, s.out_topic] {
+            if chan < 0 {
+                continue;
+            }
+            let poll = (sys.channel_poll)(chan, 0x02);
+            if poll <= 0 || (poll as u32 & 0x02) == 0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 unsafe fn try_emit(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> bool {
     if chan < 0 {
         return false;
@@ -2655,6 +2704,14 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
         }
         STASH_DEDUP_DUPLICATE => {
             correlate::stash_release(&mut s.correlate, stash_idx);
+            true
+        }
+        STASH_DEDUP_REFUSED => {
+            // No dedupe entry exists, so fanning out would deliver a
+            // message nothing can de-duplicate on retry. Drop it
+            // un-acked: the client still holds it.
+            correlate::stash_release(&mut s.correlate, stash_idx);
+            s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
             true
         }
         _ => {
@@ -2952,7 +3009,7 @@ unsafe fn apply_committed_op(
         wire::QOP_DISCONNECT => apply_qop_disconnect(s, sys, p.tenant, body_start, body_end, now),
         wire::QOP_SUBSCRIBE => apply_qop_subscribe(s, sys, p.tenant, body_start, body_end),
         wire::QOP_UNSUBSCRIBE => apply_qop_unsubscribe(s, sys, p.tenant, body_start, body_end),
-        wire::QOP_PUBREL => apply_qop_pubrel(s, p.tenant, body_start, body_end),
+        wire::QOP_PUBREL => apply_qop_pubrel(s, sys, p.tenant, body_start, body_end),
         wire::QOP_PUBLISH => apply_qop_publish(s, sys, p.tenant, body_start, body_end, p.version),
         // Committed Kafka batches / AMQP messages land in the apply-side
         // message store, which Kafka Fetch and AMQP Basic.Get serve from.
@@ -3212,6 +3269,10 @@ unsafe fn apply_qop_connect(
     } else if !was_active && !clean_start {
         // Follower / replay path under !clean_start: park the durable
         // record so a future reconnect on this node can resurrect it.
+        // `commit_connect` has already made the record present, which is
+        // what a clean-start follower relies on — it has no socket to be
+        // active for and nothing to park, but its QoS 2 flows still need
+        // to find the session.
         sessions::mark_persisted(&mut s.sessions, i);
     }
 
@@ -3632,19 +3693,26 @@ unsafe fn apply_qop_unsubscribe(
     s.applied = s.applied.wrapping_add(1);
 }
 
-/// Apply-side handler for QOP_PUBREL. Records the durable QoS 2
-/// phase transition on the publisher inflight. The propose-side
-/// already set the inflight phase to QOS2_PUBREL before proposing;
-/// apply runs the same mutation on every node so follower state
-/// converges (the inflight slot is the durable record of an
-/// in-progress QoS 2 transaction). MSG_ACK_EMIT then fires PUBCOMP
-/// once durability lands.
+/// Apply-side handler for QOP_PUBREL. Records the committed QoS 2
+/// phase transition on both durable records: the publisher inflight
+/// the state machine reads, and the identity-keyed dedupe entry that
+/// outlives it. The leader's propose side already set the inflight to
+/// QOS2_PUBREL; a follower or a post-restart replay reaches the same
+/// phase from this entry alone, creating the inflight if the flow
+/// reached it without one. MSG_ACK_EMIT then fires PUBCOMP once
+/// durability lands.
+///
+/// Both mutations are idempotent: re-applying a committed PUBREL —
+/// replay, a client retry, a duplicate after the slot was released and
+/// reused — leaves the phase where it already was.
 ///
 /// # Safety
-/// Caller must hold an exclusive `&mut ModuleState` and guarantee
+/// Caller must hold an exclusive `&mut ModuleState`, supply a valid
+/// `&SyscallTable`, and guarantee
 /// `body_start <= body_end <= s.in_buf.len()`.
 unsafe fn apply_qop_pubrel(
     s: &mut ModuleState,
+    sys: &SyscallTable,
     tenant: TenantId,
     body_start: usize,
     body_end: usize,
@@ -3653,7 +3721,11 @@ unsafe fn apply_qop_pubrel(
         return;
     }
     let body_len = body_end - body_start;
-    // [packet_id:u16 BE][stream_hash:u64 LE]
+    // [packet_id:u16 BE][stream_hash:u64 LE][session_epoch:u32 LE]
+    //
+    // The epoch is a trailing field. Entries logged before it existed
+    // are 10 bytes and replay with `logged_epoch == 0`, which falls back
+    // to the session's current epoch exactly as they did when written.
     if body_len < 10 {
         return;
     }
@@ -3668,12 +3740,57 @@ unsafe fn apply_qop_pubrel(
         s.in_buf[body_start + 8],
         s.in_buf[body_start + 9],
     ]);
+    let logged_epoch = if body_len >= 14 {
+        u32::from_le_bytes([
+            s.in_buf[body_start + 10],
+            s.in_buf[body_start + 11],
+            s.in_buf[body_start + 12],
+            s.in_buf[body_start + 13],
+        ])
+    } else {
+        0
+    };
     let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
         return;
     };
-    if let Some(ii) = sessions::inflight_find(&s.sessions, i, packet_id, INFLIGHT_PUB) {
+    let ii = match sessions::inflight_find(&s.sessions, i, packet_id, INFLIGHT_PUB) {
+        Some(ii) => Some(ii),
+        None => sessions::inflight_add(&mut s.sessions, i, packet_id, QOS_2, INFLIGHT_PUB),
+    };
+    // The epoch the flow opened under names its dedupe record. The
+    // logged value is authoritative: it is what the PUBLISH keyed on,
+    // and it survives promotion, where this node's own inflight table
+    // and current session epoch may both differ from the leader's.
+    let mut flow_epoch = if logged_epoch != 0 {
+        logged_epoch
+    } else {
+        sessions::session_epoch(&s.sessions, i)
+    };
+    if let Some(ii) = ii {
         sessions::inflight_set_phase(&mut s.sessions, i, ii, QOS2_PUBREL);
+        // Only consulted for entries logged without an epoch: this
+        // node's inflight table is local state a promoted follower may
+        // not share.
+        if logged_epoch == 0 {
+            if let Some(v) = sessions::inflight_view(&s.sessions, i, ii) {
+                if v.session_epoch != 0 {
+                    flow_epoch = v.session_epoch;
+                }
+            }
+        }
     }
+
+    let mut ph = [0u8; wire::DEDUP_KEY_LEN + 1];
+    wire::encode_dedup_key(
+        &mut ph[..wire::DEDUP_KEY_LEN],
+        tenant,
+        stream_hash,
+        flow_epoch,
+        packet_id as u32,
+    );
+    ph[wire::DEDUP_KEY_LEN] = QOS2_PUBREL;
+    try_emit(sys, s.out_messaging, wire::MSG_DEDUP_PHASE, &ph);
+
     s.applied = s.applied.wrapping_add(1);
 }
 
@@ -3762,11 +3879,38 @@ unsafe fn apply_qop_publish(
     // call, so subsequent mutations to s.out_buf / the stash are safe.
     let topic_hash = wire::fnv1a_64(&s.in_buf[topic_off..topic_off + topic_len]);
 
+    // QoS 2 owes the publisher a PUBREC now and a PUBCOMP after its
+    // PUBREL commits, so the transaction is live from this entry until
+    // that PUBREL applies. The inflight slot is where the QoS 2 state
+    // machine reads its phase, so every node builds one here: the
+    // leader already holds the slot its propose side opened, while a
+    // follower or a post-restart replay creates it in the PUBLISH
+    // phase. Without that, a promoted follower — or this node after a
+    // restart — has no record that the transaction is open and cannot
+    // answer the PUBREL the publisher still owes.
+    if pub_qos == 2 {
+        if let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) {
+            let ii = match sessions::inflight_find(&s.sessions, i, packet_id, INFLIGHT_PUB) {
+                Some(ii) => Some(ii),
+                None => {
+                    sessions::inflight_add(&mut s.sessions, i, packet_id, pub_qos, INFLIGHT_PUB)
+                }
+            };
+            if let Some(ii) = ii {
+                // The epoch this publish named is the one its dedupe
+                // record is keyed by, and a reconnect mid-transaction
+                // moves the session's own epoch on.
+                sessions::inflight_set_epoch(&mut s.sessions, i, ii, session_epoch);
+            }
+        }
+    }
+
     // For QoS 1+, look up correlation_id from the leader's publisher
     // inflight (propose-side allocates correlation + inflight together).
-    // Followers have no inflight here, so correlation_id stays 0 and
-    // QoS 1+ falls back to the direct emit path — leader fan-out is
-    // still gated through the stash via the correlation_id !=0 branch.
+    // A follower's reconstructed inflight carries no correlation, so
+    // correlation_id stays 0 and QoS 1+ falls back to the direct emit
+    // path — leader fan-out is still gated through the stash via the
+    // correlation_id != 0 branch.
     let correlation_id: u64 = if pub_qos > 0 {
         match sessions::find_by_stream(&s.sessions, tenant, stream_hash) {
             Some(i) => match sessions::inflight_find(&s.sessions, i, packet_id, INFLIGHT_PUB) {
@@ -3781,10 +3925,37 @@ unsafe fn apply_qop_publish(
         0
     };
 
-    if pub_qos == 0 || correlation_id == 0 {
-        // QoS 0, or QoS 1+ on a follower (no inflight, no stash needed):
-        // emit MSG_TOPIC_PUBLISH directly. Subscribers tolerate the
-        // duplicate-on-DUP-retry case at the protocol layer.
+    // The dedupe entry is the identity-keyed durable record of the
+    // flow: it outlives the inflight slot and survives its reuse, and
+    // for QoS 2 it carries the phase. Both the leader and the nodes
+    // that only apply record it, so the entry a promoted follower
+    // holds is the same one the leader had.
+    let mut dkey = [0u8; wire::DEDUP_KEY_LEN];
+    if pub_qos > 0 {
+        wire::encode_dedup_key(
+            &mut dkey,
+            tenant,
+            stream_hash,
+            session_epoch,
+            packet_id as u32,
+        );
+    }
+
+    // The check record carries the committed QoS 2 phase, so filing the
+    // entry and recording its phase are one write rather than two
+    // independently-droppable ones. Recording is monotone, so replay and
+    // retries land on the same phase.
+    let mut check = [0u8; wire::DEDUP_KEY_LEN + 1];
+    check[..wire::DEDUP_KEY_LEN].copy_from_slice(&dkey);
+    check[wire::DEDUP_KEY_LEN] = if pub_qos == 2 {
+        QOS2_PUBLISH
+    } else {
+        wire::DEDUP_PHASE_NONE
+    };
+
+    if pub_qos == 0 {
+        // QoS 0 carries no duplicate contract, so it fans out directly
+        // with no dedupe round-trip.
         // MSG_TOPIC_PUBLISH wire shape (matches what topic_engine
         // reads):
         //   [tenant:u32 LE][pub_qos:u8][_pad:u8][topic_len:u16 LE]
@@ -3829,25 +4000,29 @@ unsafe fn apply_qop_publish(
                 &s.out_buf[..topic_pub_len],
             );
         }
+        // QoS 1+ reaching this branch is a node that only applies:
+        // record the dedupe entry it would otherwise never see, so its
+        // duplicate verdict — and, for QoS 2, its phase — matches the
+        // leader's if this node is promoted.
+        if pub_qos > 0 {
+            try_emit(sys, s.out_messaging, wire::MSG_DEDUP_CHECK, &check);
+        }
     } else {
-        // QoS 1+ on the leader: stash op-body, mark durable, emit
-        // dedup_check. finalise_stash builds MSG_TOPIC_PUBLISH on
-        // dedup_result.
-        let mut dkey = [0u8; 20];
-        wire::encode_dedup_key(
-            &mut dkey,
-            tenant,
-            stream_hash,
-            session_epoch,
-            packet_id as u32,
-        );
+        // QoS 1+ takes the same route on every node: stash the op-body,
+        // mark it durable — apply means committed — and file the check.
+        // finalise_stash fans out on the OK verdict and drops on
+        // DUPLICATE. A node applying without a client correlation
+        // stashes under correlation id 0; the verdict is looked up by
+        // dedupe key, so nothing here needs one. Routing followers
+        // through the same decision is what makes the duplicate
+        // suppression broker-wide rather than leader-only.
         if body_len <= MAX_STASH_ENV {
             if let Some(stash_idx) = correlate::stash_alloc(&mut s.correlate, correlation_id, &dkey)
             {
                 let env = core::slice::from_raw_parts(s.in_buf.as_ptr().add(body_start), body_len);
                 correlate::stash_set_env(&mut s.correlate, stash_idx, env);
                 correlate::stash_mark_durable(&mut s.correlate, stash_idx);
-                try_emit(sys, s.out_messaging, wire::MSG_DEDUP_CHECK, &dkey);
+                try_emit(sys, s.out_messaging, wire::MSG_DEDUP_CHECK, &check);
             }
             // If allocate_stash fails (stash table full), the publish
             // is dropped from the fan-out path; the ack component still fires
@@ -4866,21 +5041,42 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 };
                                 // Mark publisher inflight as awaiting PUBREL
                                 // durability so a stray PUBCOMP attempt
-                                // doesn't fire twice.
-                                let inflight_idx = sessions::inflight_find(
+                                // doesn't fire twice. A PUBREL whose flow
+                                // has no live slot — a duplicate arriving
+                                // after completion released it, or a
+                                // transaction whose slot this node rebuilt
+                                // from a later entry — opens one, because
+                                // the PUBCOMP that answers it is emitted
+                                // from the slot. Refuse before proposing
+                                // when the table is full: the publisher
+                                // retries a PUBREL it has not been
+                                // released from.
+                                let inflight_idx = match sessions::inflight_find(
                                     &s.sessions,
                                     si,
                                     packet_id,
                                     INFLIGHT_PUB,
-                                );
-                                if let Some(ii) = inflight_idx {
-                                    sessions::inflight_set_phase(
+                                ) {
+                                    Some(ii) => Some(ii),
+                                    None => sessions::inflight_add(
                                         &mut s.sessions,
                                         si,
-                                        ii,
-                                        QOS2_PUBREL,
-                                    );
-                                }
+                                        packet_id,
+                                        QOS_2,
+                                        INFLIGHT_PUB,
+                                    ),
+                                };
+                                let Some(inflight_ii) = inflight_idx else {
+                                    s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
+                                    continue;
+                                };
+                                sessions::inflight_set_phase(
+                                    &mut s.sessions,
+                                    si,
+                                    inflight_ii,
+                                    QOS2_PUBREL,
+                                );
+                                let inflight_idx = Some(inflight_ii);
 
                                 let tenant = sessions::tenant(&s.sessions, si);
                                 let session_slot = si as u32;
@@ -4911,7 +5107,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
                                 // QOP_PUBREL body:
                                 //   [packet_id:u16 BE][stream_hash:u64 LE]
-                                let qbody_len = 2 + 8;
+                                //   [session_epoch:u32 LE]
+                                let qbody_len = 2 + 8 + 4;
                                 let prop_total = wire::QPROP_TAGGED_HDR_LEN + qbody_len;
                                 let mut emit_ok = false;
                                 if prop_total <= s.out_buf.len() {
@@ -4927,6 +5124,22 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         .copy_from_slice(&packet_id.to_be_bytes());
                                     s.out_buf[off + 2..off + 10]
                                         .copy_from_slice(&stream_hash.to_le_bytes());
+                                    // The epoch the flow opened under. The
+                                    // dedupe key is epoch-derived, so without
+                                    // it a replayed PUBREL cannot name the
+                                    // entry its own PUBLISH created.
+                                    let flow_epoch = sessions::inflight_view(
+                                        &s.sessions,
+                                        session_slot as usize,
+                                        inflight_ii,
+                                    )
+                                    .map(|v| v.session_epoch)
+                                    .filter(|e| *e != 0)
+                                    .unwrap_or_else(|| {
+                                        sessions::session_epoch(&s.sessions, session_slot as usize)
+                                    });
+                                    s.out_buf[off + 10..off + 14]
+                                        .copy_from_slice(&flow_epoch.to_le_bytes());
                                     if try_emit(
                                         sys,
                                         s.out_proposals_tagged,
@@ -5110,6 +5323,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // QOP_* conversion lands. See docs/architecture/apply_path.md.
         if s.in_committed >= 0 {
             for _ in 0..16 {
+                // Reserve the outputs before consuming the entry. A
+                // committed entry is delivered once and never re-sent, so
+                // an apply whose side effects cannot be written would
+                // advance past state this node then never records —
+                // silently diverging from the leader. Requiring the
+                // messaging and topic edges to be writable first leaves
+                // the entry in the channel for a later step instead.
+                if !outputs_ready_for_apply(s, sys) {
+                    s.apply_output_stalls = s.apply_output_stalls.wrapping_add(1);
+                    break;
+                }
                 let poll = (sys.channel_poll)(s.in_committed, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -5200,18 +5424,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     wire::decode_proposal_assigned(&s.in_buf[..wire::PROPOSAL_ASSIGNED_LEN]);
                 if let Some((session_slot, packet_id, _op)) = correlate::take(&mut s.correlate, cid)
                 {
-                    // MSG_ACK_REGISTER (18 bytes):
-                    //   [session_slot:u32 LE][packet_id:u32 LE]
-                    //   [partition_id:u16 LE][wal_index:u64 LE]
+                    // MSG_ACK_REGISTER — shape in `wire::ACK_REGISTER_LEN`.
                     // Both OP_PUBLISH and OP_PUBREL register with the same
                     // payload shape; the publisher inflight's `phase` field
                     // distinguishes them when MSG_ACK_EMIT later fires for
-                    // the same (session_slot, packet_id) tuple.
-                    let mut reg = [0u8; 18];
+                    // the same (session_slot, packet_id) tuple. The epoch
+                    // pins the completion to this session generation.
+                    let reg_epoch = sessions::session_epoch(&s.sessions, session_slot as usize);
+                    let mut reg = [0u8; wire::ACK_REGISTER_LEN];
                     reg[0..4].copy_from_slice(&session_slot.to_le_bytes());
                     reg[4..8].copy_from_slice(&(packet_id as u32).to_le_bytes());
                     reg[8..10].copy_from_slice(&partition_id.to_le_bytes());
                     reg[10..18].copy_from_slice(&wal_index.to_le_bytes());
+                    reg[18..22].copy_from_slice(&reg_epoch.to_le_bytes());
 
                     // Stamp the wal_index onto the inflight slot regardless
                     // of register success — the publisher state machine
@@ -5251,20 +5476,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // drains it next tick. Dropping the register would mean
                     // the ack component never learns of this inflight entry and the
                     // publisher's PUBACK never fires.
-                    if !try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &reg) {
-                        let mut parked = false;
-                        for _ in 0..PENDING_ACK_SLOTS {
-                            if correlate::ack_stash(&mut s.correlate, reg) {
-                                parked = true;
-                                break;
-                            }
-                        }
-                        if !parked {
-                            // Pending-ack queue full: the publisher will
-                            // eventually time out and retry with DUP set;
-                            // the dedup component catches the duplicate.
-                            correlate::note_dropped(&mut s.correlate);
-                        }
+                    //
+                    // The parking slot was reserved when this proposal's
+                    // correlation was allocated — before the publish was
+                    // accepted — so parking succeeds. A failure here is a
+                    // broken reservation invariant, not a capacity
+                    // decision: say so rather than account accepted work
+                    // as dropped.
+                    if !try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &reg)
+                        && !correlate::ack_stash(&mut s.correlate, reg)
+                    {
+                        dev_log(sys, 1, b"[sess] ack register unparked".as_ptr(), 28);
                     }
                 }
             }
@@ -5372,6 +5594,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 if session_slot >= MAX_SESSIONS {
                     continue;
+                }
+                // MQTT completions carry the session generation the
+                // publish was accepted under. MQTT packet ids are
+                // client-chosen, so `(session_slot, packet_id)` alone
+                // matches a delayed or duplicate completion against
+                // whichever client now holds the slot. A mismatch means
+                // the flow this answers is gone; drop it. Epoch 0 is a
+                // registration made before the session had one and is
+                // not matched against.
+                if (plen as usize) >= wire::ACK_EMIT_LEN {
+                    let emit_epoch =
+                        u32::from_le_bytes([s.in_buf[8], s.in_buf[9], s.in_buf[10], s.in_buf[11]]);
+                    let live_epoch = sessions::session_epoch(&s.sessions, session_slot);
+                    if emit_epoch != 0 && emit_epoch != live_epoch {
+                        s.acks_stale_epoch = s.acks_stale_epoch.wrapping_add(1);
+                        continue;
+                    }
                 }
 
                 match mt {
@@ -5491,7 +5730,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         if phase == QOS2_PUBREL {
                             let tenant = sessions::tenant(&s.sessions, session_slot);
                             let stream_hash = sessions::stream_hash(&s.sessions, session_slot);
-                            let qbody_len = 2 + 8;
+                            let qbody_len = 2 + 8 + 4;
                             let prop_total = wire::QPROP_TAGGED_HDR_LEN + qbody_len;
                             if prop_total <= s.out_buf.len() {
                                 s.out_buf[0..8].copy_from_slice(&correlation_id.to_le_bytes());
@@ -5505,6 +5744,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 s.out_buf[off..off + 2].copy_from_slice(&packet_id.to_be_bytes());
                                 s.out_buf[off + 2..off + 10]
                                     .copy_from_slice(&stream_hash.to_le_bytes());
+                                let flow_epoch =
+                                    sessions::inflight_view(&s.sessions, session_slot, ii)
+                                        .map(|v| v.session_epoch)
+                                        .filter(|e| *e != 0)
+                                        .unwrap_or_else(|| {
+                                            sessions::session_epoch(&s.sessions, session_slot)
+                                        });
+                                s.out_buf[off + 10..off + 14]
+                                    .copy_from_slice(&flow_epoch.to_le_bytes());
                                 if try_emit(
                                     sys,
                                     s.out_proposals_tagged,
@@ -5576,12 +5824,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // Phase 5-pre also drains pending ACK_REGISTERs that were
         // deferred by out_forward backpressure (see PROPOSAL_ASSIGNED
         // handler).
-        for i in 0..PENDING_ACK_SLOTS {
-            let Some(payload) = correlate::ack_get(&s.correlate, i) else {
-                continue;
-            };
-            if try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &payload) {
-                correlate::ack_free(&mut s.correlate, i);
+        if correlate::ack_parked(&s.correlate) > 0 {
+            for i in 0..PENDING_ACK_SLOTS {
+                let Some(payload) = correlate::ack_get(&s.correlate, i) else {
+                    continue;
+                };
+                if try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &payload) {
+                    correlate::ack_free(&mut s.correlate, i);
+                }
             }
         }
 
@@ -5657,7 +5907,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // ── Phase 5b: drain dedup / retained / offline / group / txn results.
-        // MSG_DEDUP_RESULT carries `[dedup_key:[u8;20]][duplicate:u8]`. For
+        // MSG_DEDUP_RESULT carries
+        // `[dedup_key:[u8;20]][duplicate:u8][phase:u8]`. For
         // QoS 1+ stashed publishes, this is the dedup half of the
         // commit-gating contract; once both this and durability resolve
         // OK, the stashed envelope is emitted to topic_engine.
@@ -5676,17 +5927,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     wire::MSG_DEDUP_RESULT if plen >= 21 => {
                         let mut key = [0u8; 20];
                         key.copy_from_slice(&s.in_buf[..20]);
-                        let duplicate = s.in_buf[20];
+                        // Verdict byte: 0 new, 1 duplicate, 2 refused
+                        // (dedup shard full — see `dedup::DEDUP_VERDICT_*`).
+                        let verdict = match s.in_buf[20] {
+                            0 => STASH_DEDUP_OK,
+                            1 => STASH_DEDUP_DUPLICATE,
+                            _ => STASH_DEDUP_REFUSED,
+                        };
                         if let Some(stash_idx) = correlate::stash_by_dedup_key(&s.correlate, &key) {
-                            correlate::stash_set_dedup_state(
-                                &mut s.correlate,
-                                stash_idx,
-                                if duplicate != 0 {
-                                    STASH_DEDUP_DUPLICATE
-                                } else {
-                                    STASH_DEDUP_OK
-                                },
-                            );
+                            correlate::stash_set_dedup_state(&mut s.correlate, stash_idx, verdict);
                             if correlate::stash_is_durable(&s.correlate, stash_idx) {
                                 finalise_stash(s, sys, stash_idx);
                             }
@@ -5862,11 +6111,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
                 }
             }
-            // Reclaim correlations whose MSG_PROPOSAL_ASSIGNED never
-            // arrived (see PendingCorrelation.ts_ms). Without this a slow
-            // leak eventually fills the shared table and stalls acks for
-            // MQTT, Kafka, AND AMQP at once.
-            correlate::expire(&mut s.correlate, now, CORRELATION_TIMEOUT_MS);
+            // Surface correlations whose MSG_PROPOSAL_ASSIGNED is overdue.
+            // The substrate emits one per accepted tagged proposal, so an
+            // overdue correlation is a contract violation to alert on, not
+            // a slot to reclaim: freeing it would strand the assignment
+            // still in flight and leave the publish unacknowledged.
+            s.correlations_overdue =
+                correlate::count_overdue(&s.correlate, now, CORRELATION_TIMEOUT_MS);
             for i in 0..MAX_SESSIONS {
                 if !sessions::is_active(&s.sessions, i) {
                     continue;
@@ -5988,14 +6239,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 sessions::set_will_deadline(&mut s.sessions, i, 0);
                 sessions::clear_will(&mut s.sessions, i);
-                sessions::clear_will(&mut s.sessions, i);
             }
         }
 
         // ── Phase 6: metrics (wire envelope) ──
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 && s.out_metrics >= 0 {
             s.last_metrics_ms = now;
-            let mut m = [0u8; 40];
+            let mut m = [0u8; 52];
             m[0..4].copy_from_slice(&s.session_count.to_le_bytes());
             m[4..8].copy_from_slice(&s.connects.to_le_bytes());
             m[8..12].copy_from_slice(&s.disconnects.to_le_bytes());
@@ -6006,6 +6256,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             m[28..32].copy_from_slice(&s.qos2_rec.to_le_bytes());
             m[32..36].copy_from_slice(&s.qos2_rel.to_le_bytes());
             m[36..40].copy_from_slice(&s.qos2_comp.to_le_bytes());
+            // Saturation and fencing signals. Each is an invariant an
+            // operator needs to see rising before it becomes an outage:
+            // apply backing up behind a full output edge, completions
+            // arriving for a slot that has moved on, and assignments the
+            // substrate owes but has not delivered.
+            m[40..44].copy_from_slice(&s.apply_output_stalls.to_le_bytes());
+            m[44..48].copy_from_slice(&s.acks_stale_epoch.to_le_bytes());
+            m[48..52].copy_from_slice(&s.correlations_overdue.to_le_bytes());
             try_emit(sys, s.out_metrics, wire::MSG_METRICS, &m);
         }
 

@@ -37,6 +37,9 @@ pub const DURABILITY_BUDGET: u8 = 64;
 struct InflightEntry {
     session_slot: u32,
     message_id: u32,
+    /// Session generation the publish was accepted under; carried back
+    /// on MSG_ACK_EMIT so a completion cannot land on a reused slot.
+    session_epoch: u32,
     partition_id: u16,
     wal_index: u64,
     sent_ms: u64,
@@ -50,6 +53,7 @@ impl InflightEntry {
         Self {
             session_slot: 0,
             message_id: 0,
+            session_epoch: 0,
             partition_id: 0,
             wal_index: 0,
             sent_ms: 0,
@@ -73,8 +77,19 @@ pub struct Ack {
 
     entries: [InflightEntry; MAX_INFLIGHT],
     acks_emitted: u32,
+    /// ACKs whose write did not land in full, leaving the entry active
+    /// for a later step. Output-side saturation, the counterpart to
+    /// `register_refused` / `full_stalls` on the input side.
+    emit_retries: u32,
     redelivers: u32,
     abandoned: u32,
+    /// Registrations that reached this component with no slot to hold
+    /// them, and steps whose drain stopped because the table was full.
+    /// Both are the saturation signal an operator needs: the first must
+    /// stay at zero, the second is the bounded backpressure that keeps
+    /// it there.
+    register_refused: u32,
+    full_stalls: u32,
 
     /// Per-partition high-water mark of durable wal_index. An inflight
     /// entry acks when `durable_per_partition[entry.partition_id] >=
@@ -92,8 +107,11 @@ pub fn init(a: &mut Ack) {
     a.scan_interval_ms = 100;
     a.last_scan_ms = 0;
     a.acks_emitted = 0;
+    a.emit_retries = 0;
     a.redelivers = 0;
     a.abandoned = 0;
+    a.register_refused = 0;
+    a.full_stalls = 0;
     for i in 0..MAX_INFLIGHT {
         a.entries[i] = InflightEntry::zero();
     }
@@ -102,15 +120,33 @@ pub fn init(a: &mut Ack) {
     }
 }
 
+/// Count one step whose registration drain stopped on a full table.
+pub fn note_full_stall(a: &mut Ack) {
+    a.full_stalls = a.full_stalls.wrapping_add(1);
+}
+
+/// True when every inflight slot is taken. The dispatch table checks
+/// this before consuming a record: a registration this component
+/// cannot hold must stay in the channel, where it backpressures the
+/// session state machine, rather than being read and discarded.
+pub fn is_full(a: &Ack) -> bool {
+    !(0..MAX_INFLIGHT).any(|i| a.entries[i].active == 0)
+}
+
 /// MSG_ACK_REGISTER: `[session_slot:u32][message_id:u32]`
 /// `[partition_id:u16][wal_index:u64]` (18 bytes).
 ///
 /// The session state machine receives MSG_PROPOSAL_ASSIGNED from
 /// consensus carrying `(correlation_id, partition_id, wal_index)` and
 /// forwards `(session_slot, packet_id, partition_id, wal_index)` here.
-pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) {
-    if payload.len() < 18 {
-        return;
+///
+/// Returns false when the registration was not recorded. A malformed
+/// or unroutable payload is refused (there is nothing to track); a
+/// full table is refused too, and counted, though the dispatch gate
+/// above means a caller should never see it.
+pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) -> bool {
+    if payload.len() < wire::ACK_REGISTER_LEN {
+        return false;
     }
     let session_slot = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let message_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
@@ -125,15 +161,16 @@ pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) {
         payload[16],
         payload[17],
     ]);
+    let session_epoch = u32::from_le_bytes([payload[18], payload[19], payload[20], payload[21]]);
     if (partition_id as usize) >= MAX_PARTITIONS {
-        return;
+        return false;
     }
     // wal_index == 0 is reserved as "the proposer never received an
     // assignment back" — drop the register rather than create a phantom
     // inflight that could ack against partition 0's first proof. The
     // proposer will time out and retry.
     if wal_index == 0 {
-        return;
+        return false;
     }
 
     for i in 0..MAX_INFLIGHT {
@@ -141,6 +178,7 @@ pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) {
             a.entries[i] = InflightEntry {
                 session_slot,
                 message_id,
+                session_epoch,
                 partition_id,
                 wal_index,
                 sent_ms: now,
@@ -148,9 +186,11 @@ pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) {
                 attempts: 1,
                 active: 1,
             };
-            return;
+            return true;
         }
     }
+    a.register_refused = a.register_refused.wrapping_add(1);
+    false
 }
 
 /// MSG_DURABILITY_PROOF (19 bytes), fanned in from every partition's
@@ -188,17 +228,28 @@ pub unsafe fn step_acks(a: &mut Ack, sys: &SyscallTable) {
             continue;
         }
 
-        let mut ack = [0u8; 8];
+        let mut ack = [0u8; wire::ACK_EMIT_LEN];
         ack[0..4].copy_from_slice(&a.entries[i].session_slot.to_le_bytes());
         ack[4..8].copy_from_slice(&a.entries[i].message_id.to_le_bytes());
+        ack[8..12].copy_from_slice(&a.entries[i].session_epoch.to_le_bytes());
         if a.out_ack >= 0 {
+            // The entry is released only once the ACK is provably on the
+            // channel. `channel_poll` reports writability, not success —
+            // a short or refused write with the entry already cleared
+            // would drop the client's only completion. On failure the
+            // entry stays active and the next step retries it.
             // SAFETY: caller guarantees `sys` is live.
             unsafe {
                 let poll_out = (sys.channel_poll)(a.out_ack, 0x02);
                 if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    wire::channel_write_msg(sys, a.out_ack, wire::MSG_ACK_EMIT, &ack);
-                    a.entries[i].active = 0;
-                    a.acks_emitted = a.acks_emitted.wrapping_add(1);
+                    let want = (wire::ENVELOPE_HDR + ack.len()) as i32;
+                    let wrote = wire::channel_write_msg(sys, a.out_ack, wire::MSG_ACK_EMIT, &ack);
+                    if wrote == want {
+                        a.entries[i].active = 0;
+                        a.acks_emitted = a.acks_emitted.wrapping_add(1);
+                    } else {
+                        a.emit_retries = a.emit_retries.wrapping_add(1);
+                    }
                 }
             }
         } else {
@@ -254,7 +305,7 @@ pub unsafe fn step_timeouts(a: &mut Ack, sys: &SyscallTable, now: u64) {
 }
 
 /// Fill the component's metric payload. Returns the byte count.
-pub fn metrics(a: &Ack, m: &mut [u8; 24]) -> usize {
+pub fn metrics(a: &Ack, m: &mut [u8; 28]) -> usize {
     m[0..4].copy_from_slice(&a.acks_emitted.to_le_bytes());
     m[4..8].copy_from_slice(&a.redelivers.to_le_bytes());
     m[8..12].copy_from_slice(&a.abandoned.to_le_bytes());
@@ -265,5 +316,8 @@ pub fn metrics(a: &Ack, m: &mut [u8; 24]) -> usize {
         }
     }
     m[12..16].copy_from_slice(&inflight.to_le_bytes());
-    16
+    m[16..20].copy_from_slice(&a.register_refused.to_le_bytes());
+    m[20..24].copy_from_slice(&a.full_stalls.to_le_bytes());
+    m[24..28].copy_from_slice(&a.emit_retries.to_le_bytes());
+    28
 }

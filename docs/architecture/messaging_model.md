@@ -89,9 +89,9 @@ delivery.
 
 ```
 DedupeKey → DedupeState {
-    phase                   // adapter-specific (e.g. MQTT QoS 2 four-phase)
+    phase                   // adapter-specific (e.g. MQTT QoS 2 four-phase),
+                            // or "none" for flows that carry no phase
     publish_index
-    ack_index
     expiry_at
 }
 ```
@@ -99,6 +99,19 @@ DedupeKey → DedupeState {
 Owned by `messaging`'s dedup component (16-shard partitioned map).
 Entries expire after the dedupe TTL. The earliest non-expired entry
 per PRG is the WAL compaction floor for dedupe state.
+
+A check whose shard has no free slot is refused rather than answered:
+with no entry to record, reporting the message as new would deliver and
+acknowledge it while leaving nothing behind to catch its retry. The
+refusal drops the publish un-acknowledged and counts it as throttled,
+so the retry stays with the client.
+
+The phase is written by the apply path on every node, once per
+committed protocol transition, and only ever advances. Replaying a
+transition — after a restart, on a follower, or when a client retries
+— therefore lands on the same phase rather than inventing progress.
+An entry recorded without a phase reads as "none", so a flow that
+gains one later is not confused with one that never had it.
 
 ### Offline queue entry
 

@@ -33,7 +33,10 @@
 //!   1. `forward_in` drain (≤[`FORWARD_BUDGET`]), demuxed by frame type:
 //!      MSG_ACK_REGISTER → `ack::on_register` (≤16/step),
 //!      MSG_LAG_SIGNAL   → `prefetch::on_lag` (≤16/step, emits the
-//!      credit update inline as the standalone module did).
+//!      credit update inline as the standalone module did). The drain
+//!      stops before reading whenever the ack table is full, so a
+//!      registration is never consumed without a slot to hold it; the
+//!      records stay in the channel as backpressure.
 //!   2. `durability_in` drain (≤64/step) → `ack::on_durability`.
 //!   3. `ack::step_acks` — emit MSG_ACK_EMIT for every inflight entry
 //!      its partition's durable high-water mark has reached. Runs ONLY
@@ -256,6 +259,25 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let mut worked = 0u32;
         if s.in_forward >= 0 {
             for _ in 0..FORWARD_BUDGET {
+                // A registration read off the bus with no slot to hold
+                // it would be work the broker has already accepted and
+                // can no longer track. Stop draining instead: the
+                // record stays in the channel, the session state
+                // machine sees the edge back up, and it parks the
+                // registration in the slot it reserved at admission.
+                if ack::is_full(&s.ack) {
+                    ack::note_full_stall(&mut s.ack);
+                    break;
+                }
+                // Every budget decision precedes consumption. A record's
+                // type is not known until it is read, so once ANY
+                // per-type budget is spent this step, the drain stops
+                // rather than take a record it might not be able to
+                // handle. The record stays in the channel for the next
+                // step; nothing is read and discarded.
+                if registers >= ack::REGISTER_BUDGET || lags >= prefetch::LAG_BUDGET {
+                    break;
+                }
                 let poll = (sys.channel_poll)(s.in_forward, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -268,16 +290,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 worked += 1;
                 match mt {
                     wire::MSG_ACK_REGISTER => {
-                        if registers >= ack::REGISTER_BUDGET {
-                            break;
-                        }
                         registers += 1;
-                        ack::on_register(&mut s.ack, &s.buf[..plen], now);
+                        let _ = ack::on_register(&mut s.ack, &s.buf[..plen], now);
                     }
                     wire::MSG_LAG_SIGNAL => {
-                        if lags >= prefetch::LAG_BUDGET {
-                            break;
-                        }
                         lags += 1;
                         prefetch::on_lag(&mut s.prefetch, sys, &s.buf[..plen]);
                     }
@@ -345,7 +361,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── 8: component-tagged telemetry ────────────────────────────
         if now.wrapping_sub(s.last_metrics_ms) >= METRICS_INTERVAL_MS {
             s.last_metrics_ms = now;
-            let mut m = [0u8; 24];
+            let mut m = [0u8; 28];
             let n = ack::metrics(&s.ack, &mut m);
             emit_metrics(sys, s.out_metrics, METRIC_ID_ACK, &m[..n]);
             let n = backpressure::metrics(&s.backpressure, &mut m);

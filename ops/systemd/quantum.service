@@ -17,10 +17,17 @@ Environment=FLUXOR_BIN=/opt/quantum/bin/fluxor
 Environment=FLUXOR_LINUX_BIN=/opt/quantum/bin/fluxor-linux
 Environment=QUANTUM_CONFIG=/etc/quantum/pi5.yaml
 Environment=RUST_LOG=info
+# The CLI resolves modules and the runtime binary from the project
+# root; pin it to the install tree so resolution never depends on the
+# working directory.
+Environment=FLUXOR_PROJECT_ROOT=/opt/quantum
 
-# Working directory must contain target/{bcm2712,linux}/modules/ symlinks
-# pointing to the deployed .fmod artifacts.
-WorkingDirectory=/opt/quantum
+# The runtime writes its durable state (wal/, raft/, data/) relative
+# to the working directory, and `fluxor run` writes the derived
+# config.bin/modules.bin under target/linux/<config>/ there too, so
+# the working directory must be the writable state directory —
+# /opt/quantum is read-only under ProtectSystem=strict.
+WorkingDirectory=/var/lib/quantum
 
 # The fluxor `run` command rebuilds config.bin + modules.bin under
 # target/linux/<config-name>/ then exec's fluxor-linux against them.

@@ -230,7 +230,7 @@ pub fn step(o: &mut Offline, now: u64) {
 }
 
 /// Fill the component's metric payload. Returns the byte count.
-pub fn metrics(o: &Offline, m: &mut [u8; 24]) -> usize {
+pub fn metrics(o: &Offline, m: &mut [u8; super::METRIC_BYTES]) -> usize {
     m[0..4].copy_from_slice(&o.enqueued.to_le_bytes());
     m[4..8].copy_from_slice(&o.drained.to_le_bytes());
     m[8..12].copy_from_slice(&o.expired.to_le_bytes());

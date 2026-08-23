@@ -31,6 +31,7 @@ target/
 # Runtime state, created by the graphs and the integration scripts.
 /data/
 /wal/
+/raft/
 /certs/
 
 modules/module.ld

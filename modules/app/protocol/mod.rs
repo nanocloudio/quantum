@@ -9,6 +9,9 @@
 //!   - [`mqtt`]   — MQTT 3.1 / 3.1.1 / 5.0 codec.
 //!   - [`kafka`]  — Kafka binary-protocol codec.
 //!   - [`amqp`]   — AMQP 0-9-1 codec.
+//!   - [`http`]   — diagnostic-leg adapter: parses HTTP-classified
+//!     records into MSG_HTTP_REQUEST for the admin surface and frames
+//!     its MSG_HTTP_RESPONSE replies as wire-level HTTP/1.1.
 //!
 //! Unlike this project's other composites, these components genuinely
 //! interact: the router names the protocol that owns each inbound record
@@ -42,10 +45,14 @@
 //!      that codec, and PROTO_UNKNOWN means "not yet decidable", which
 //!      drops the record exactly as the standalone router did.
 //!   2. Hand the record to the owning codec's `on_frame`, or — for
-//!      PROTO_HTTP — forward it verbatim on `http_out`.
+//!      PROTO_HTTP — parse it into a MSG_HTTP_REQUEST on `http_out`
+//!      ([`http::forward_request`]).
 //!   3. `mqtt::step` / `kafka::step` / `amqp::step` — each drains its
 //!      share of the shared `responses_in` bus, filtering on its own
-//!      PROTO_* tag, and encodes frames onto `frames_out`.
+//!      PROTO_* tag, and encodes frames onto `frames_out`. The
+//!      `http_responses_in` drain does the same for the admin
+//!      surface's MSG_HTTP_RESPONSE replies
+//!      ([`http::drain_responses`]).
 //!   4. Metrics emission, one component-tagged frame per component,
 //!      once per [`METRICS_INTERVAL_MS`].
 //!
@@ -76,6 +83,7 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/wire.rs"]
 mod wire;
 
+mod http;
 mod router;
 
 #[cfg(feature = "amqp")]
@@ -158,7 +166,9 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_raw: i32,
     in_responses: i32,
+    in_http_responses: i32,
     out_http: i32,
+    out_frames: i32,
     out_metrics: i32,
     last_metrics_ms: u64,
 
@@ -173,6 +183,12 @@ struct ModuleState {
     /// Module-owned read buffer. Each record is read once here and
     /// dispatched to the owning codec as a borrowed payload.
     buf: [u8; router::READ_BUF],
+
+    /// HTTP response staging buffer, owned by the [`http`] component's
+    /// entry points. Separate from `buf` because a MSG_HTTP_RESPONSE
+    /// (up to the `/metrics` export cap) exceeds READ_BUF, and
+    /// `channel_read_msg` discards oversize envelopes wholesale.
+    http_resp: [u8; http::RESP_BUF],
 }
 
 #[no_mangle]
@@ -233,9 +249,11 @@ pub unsafe extern "C" fn module_new(
         // handles; the consumer demuxes by the PROTO_* tag each codec
         // stamps, exactly as it did across the separate edges.
         let out_frames = dev_channel_port(sys, 1, 1);
+        s.out_frames = out_frames;
         s.out_http = dev_channel_port(sys, 1, 2);
         s.out_metrics = dev_channel_port(sys, 1, 3);
         s.in_responses = dev_channel_port(sys, 0, 1);
+        s.in_http_responses = dev_channel_port(sys, 0, 2);
 
         router::init(&mut s.router);
 
@@ -300,21 +318,6 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
     }
 }
 
-/// Forward an HTTP-classified record verbatim on `http_out`.
-///
-/// # Safety
-///
-/// `sys` must point at a live kernel syscall table.
-unsafe fn forward_http(sys: &SyscallTable, chan: i32, payload: &[u8]) {
-    if chan < 0 || payload.is_empty() {
-        return;
-    }
-    // SAFETY: caller guarantees `sys` is live.
-    unsafe {
-        wire::channel_write_msg(sys, chan, wire::MSG_CLIENT_FRAME, payload);
-    }
-}
-
 /// PIC module ABI entry: run one scheduler step against this instance.
 ///
 /// # Safety
@@ -357,7 +360,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     PROTO_KAFKA => kafka::on_frame(&mut s.kafka, sys, mtype, &s.buf[..n]),
                     #[cfg(feature = "amqp")]
                     PROTO_AMQP => amqp::on_frame(&mut s.amqp, sys, mtype, &s.buf[..n]),
-                    PROTO_HTTP => forward_http(sys, s.out_http, &s.buf[..n]),
+                    // MSG_CONN_CLOSED carries no request; the admin
+                    // surface holds no per-connection wire state.
+                    PROTO_HTTP if mtype != wire::MSG_CONN_CLOSED => http::forward_request(
+                        sys,
+                        s.out_http,
+                        s.out_frames,
+                        &mut s.http_resp,
+                        &s.buf[..n],
+                    ),
                     // PROTO_UNKNOWN (needs more bytes), PROTO_UNSUPPORTED,
                     // or a protocol this variant does not carry.
                     _ => {}
@@ -394,6 +405,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
+
+        // ── 3b: admin-surface HTTP responses → wire-level HTTP/1.1 ───
+        worked += http::drain_responses(sys, s.in_http_responses, s.out_frames, &mut s.http_resp);
 
         // ── 4: component-tagged telemetry ────────────────────────────
         if now.wrapping_sub(s.last_metrics_ms) >= METRICS_INTERVAL_MS {

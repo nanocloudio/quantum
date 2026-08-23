@@ -126,7 +126,7 @@ pub unsafe fn step(b: &mut Backpressure, sys: &SyscallTable, now: u64) {
 }
 
 /// Fill the component's metric payload. Returns the byte count.
-pub fn metrics(b: &Backpressure, m: &mut [u8; 24]) -> usize {
+pub fn metrics(b: &Backpressure, m: &mut [u8; 28]) -> usize {
     m[0..4].copy_from_slice(&b.rejections.to_le_bytes());
     m[4..8].copy_from_slice(&b.signals_emitted.to_le_bytes());
     m[8..12].copy_from_slice(&b.current_entry_credits.to_le_bytes());

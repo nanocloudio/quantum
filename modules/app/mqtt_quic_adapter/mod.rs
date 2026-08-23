@@ -4,23 +4,34 @@
 //! without modifying either side. Lives between `quic.app_out` /
 //! `quic.app_in` and `protocol.raw_in` / `protocol.frames_out`.
 //!
-//! Inbound (quic → protocol): strips fluxor's MSG_QUIC_STREAM_DATA
-//! envelope (`[0x13][cid][sid:varint=0][fin][data…]`) and emits the
-//! plain `[cid][data]` shape `protocol.raw_in` already accepts from the
-//! TCP path. STREAM_OPEN, PEER_IDENTITY, and DATAGRAM
-//! envelopes are observed but not propagated this revision — MQTT-over-
-//! QUIC carries its control channel over a single bidi stream (id 0)
-//! per the WG MQTT QUIC mapping draft, and the datagram path is reserved
-//! for an optional unreliable QoS 0 fast-path that quantum doesn't
-//! plumb yet.
+//! Inbound (quic → protocol): takes `MSG_MUX_STREAM_RX` on the session's
+//! MQTT control stream and emits the plain `[cid][data]` shape
+//! `protocol.raw_in` already accepts from the TCP path. PEER_IDENTITY and
+//! DATAGRAM_RX are observed but not propagated — identity is a future
+//! mTLS hook, and the datagram path is reserved for an optional
+//! unreliable QoS 0 fast-path quantum doesn't plumb yet.
 //!
 //! Outbound (protocol → quic): consumes envelope-framed
-//! MSG_CLIENT_FRAME (0xEA) messages from `protocol.frames_out`,
-//! payload shape `[cid][mqtt bytes]`, and re-emits as a raw
-//! MSG_QUIC_STREAM_WRITE envelope (`[0x14][cid][sid=0][fin=0][data…]`)
-//! to `quic.app_in`. The QUIC pump appends `data…` to the named
-//! connection's send buffer and the next module_step flushes it as a
-//! STREAM frame.
+//! MSG_CLIENT_FRAME (0xEA) messages from `protocol.frames_out`, payload
+//! shape `[cid][mqtt bytes]`, and re-emits as `CMD_MUX_STREAM_SEND` on
+//! that same stream. The QUIC engine appends `data…` to the stream's send
+//! buffer and the next module_step flushes it as a STREAM frame.
+//!
+//! # Stream handles are learned, never assumed
+//!
+//! MQTT-over-QUIC carries its control channel over one bidirectional
+//! stream per connection (the WG MQTT QUIC mapping draft), so there is
+//! exactly one stream to track per session — but WHICH handle the
+//! transport gives it is the transport's to decide. This adapter latches
+//! it from the `MSG_MUX_STREAM_ACCEPTED` that announces the stream.
+//!
+//! The contract's `stream_id` is an opaque local handle, deliberately
+//! not derivable from the QUIC wire id, so it cannot be computed and
+//! must be read from the announcement. Guessing it is silent in both
+//! directions: inbound packets are discarded as "wrong stream", and
+//! outbound writes address a stream that does not exist. Neither
+//! reports an error, because both are legal questions to ask about a
+//! stream that is simply not there.
 
 #![no_std]
 #![allow(
@@ -47,18 +58,54 @@ mod wire;
 // every message is a net-protocol frame `[msg_type:u8][len:u16 LE]
 // [payload]`, and stream payloads are prefixed with
 // `[session_id:u32 LE][stream_id:u32 LE]`. In the QUIC v1 constrained
-// profile the session_id IS the provider's connection index (small)
-// and the single application stream is the client-initiated bidi
-// stream 0. Constants duplicated here to avoid cross-repo header
-// sharing; they're part of the foundation module's public contract.
-const MSG_MUX_STREAM_ACCEPTED: u8 = 0xC3; // [session][stream][flags]
+// profile the session_id IS the provider's connection index, small
+// enough to use as the MQTT conn_id; the stream_id is an opaque
+// handle (see the module docs above). Constants duplicated here to
+// avoid cross-repo header sharing; they're part of the foundation
+// module's public contract.
+const MSG_MUX_SESSION_OPENED: u8 = 0xC0; // [session][status][flags][alpn]
+const MSG_MUX_SESSION_CLOSED: u8 = 0xC1; // [session][reason]
+const MSG_MUX_STREAM_ACCEPTED: u8 = 0xC3; // [session][stream][flags][quic_id]
 const MSG_MUX_STREAM_RX: u8 = 0xC5; // [session][stream][data]
 const MSG_MUX_STREAM_CLOSED: u8 = 0xC4;
+const MSG_MUX_STREAM_RESET: u8 = 0xCA;
 const MSG_MUX_DATAGRAM_RX: u8 = 0xC7;
 const MSG_MUX_PEER_IDENTITY: u8 = 0xC8;
 const CMD_MUX_STREAM_SEND: u8 = 0xB4; // [session][stream][data]
+const CMD_MUX_STREAM_ACK: u8 = 0xB5; // [session][stream][bytes]
 const SESSION_ID_BYTES: usize = 4;
 const STREAM_DATA_PREFIX: usize = 8; // session_id(4) + stream_id(4)
+/// `MSG_MUX_STREAM_ACCEPTED` body after the prefix: `[flags][quic_id:8]`.
+const STREAM_ACCEPTED_BODY: usize = 1 + 8;
+/// Bit 1 of a stream's flags: unidirectional.
+const STREAM_FLAG_UNI: u8 = 1 << 1;
+
+/// Sessions tracked at once. Matches the QUIC engine's connection pool,
+/// so a session the transport can carry always has somewhere to live.
+const MAX_SESSIONS: usize = 4;
+
+/// One QUIC session and the MQTT control stream on it.
+#[derive(Clone, Copy)]
+struct SessionSlot {
+    live: bool,
+    session_id: u32,
+    /// The transport's opaque handle for the control stream, learned from
+    /// `MSG_MUX_STREAM_ACCEPTED`. `have_stream` distinguishes "not yet
+    /// announced" from a legitimately zero handle.
+    stream: u32,
+    have_stream: bool,
+}
+
+impl SessionSlot {
+    const fn empty() -> Self {
+        Self {
+            live: false,
+            session_id: 0,
+            stream: 0,
+            have_stream: false,
+        }
+    }
+}
 
 /// Largest MQTT control packet we will forward in either direction.
 /// Matches the mqtt codec's `MAX_PACKET` so the adapter cannot become the
@@ -89,9 +136,41 @@ struct ModuleState {
     dropped: u32,
     parse_errors: u32,
 
+    sessions: [SessionSlot; MAX_SESSIONS],
+
     rx_buf: [u8; QUIC_RX_BUF],
     tx_buf: [u8; QUIC_TX_BUF],
     frame_buf: [u8; FRAME_BUF],
+}
+
+/// Find a session by its transport id.
+fn session_find(s: &ModuleState, session_id: u32) -> Option<usize> {
+    let mut i = 0;
+    while i < MAX_SESSIONS {
+        if s.sessions[i].live && s.sessions[i].session_id == session_id {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find or claim a slot for a session.
+fn session_slot(s: &mut ModuleState, session_id: u32) -> Option<usize> {
+    if let Some(i) = session_find(s, session_id) {
+        return Some(i);
+    }
+    let mut i = 0;
+    while i < MAX_SESSIONS {
+        if !s.sessions[i].live {
+            s.sessions[i] = SessionSlot::empty();
+            s.sessions[i].live = true;
+            s.sessions[i].session_id = session_id;
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 #[no_mangle]
@@ -147,6 +226,7 @@ pub unsafe extern "C" fn module_new(
         s.stream_frames_out = 0;
         s.dropped = 0;
         s.parse_errors = 0;
+        s.sessions = [SessionSlot::empty(); MAX_SESSIONS];
         dev_log(sys, 3, b"[mqtt_quic] init".as_ptr(), 16);
         0
     }
@@ -183,30 +263,100 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
             let pl = plen;
-            if mtype != MSG_MUX_STREAM_RX {
-                // STREAM_ACCEPTED / PEER_IDENTITY / STREAM_CLOSED / DATAGRAM_RX
-                // are observed but not propagated: the mqtt codec auto-creates a
-                // conn slot on first byte, identity is a future mTLS hook, and
-                // the MQTT control channel rides the bidi stream, not datagrams.
-                continue;
-            }
-            if pl < STREAM_DATA_PREFIX {
+            let base = NET_FRAME_HDR;
+            if pl < SESSION_ID_BYTES {
                 s.parse_errors += 1;
                 continue;
             }
-            let base = NET_FRAME_HDR;
-            // session_id (provider connection index) → mqtt conn_id; the
-            // constrained profile keeps it small (< MAX_CONNS).
-            let cid = s.rx_buf[base];
-            // Only stream 0 (the MQTT control stream) carries packets.
-            let stream0 = s.rx_buf[base + SESSION_ID_BYTES] == 0
-                && s.rx_buf[base + SESSION_ID_BYTES + 1] == 0
-                && s.rx_buf[base + SESSION_ID_BYTES + 2] == 0
-                && s.rx_buf[base + SESSION_ID_BYTES + 3] == 0;
-            if !stream0 {
-                s.dropped += 1;
+            let session = u32::from_le_bytes([
+                s.rx_buf[base],
+                s.rx_buf[base + 1],
+                s.rx_buf[base + 2],
+                s.rx_buf[base + 3],
+            ]);
+
+            // Session lifecycle. Tracked so the control stream's handle
+            // has somewhere to be recorded, and so a closed session's
+            // slot is returned rather than held for a connection that is
+            // gone.
+            if mtype == MSG_MUX_SESSION_OPENED {
+                let _ = session_slot(s, session);
                 continue;
             }
+            if mtype == MSG_MUX_SESSION_CLOSED {
+                if let Some(i) = session_find(s, session) {
+                    s.sessions[i] = SessionSlot::empty();
+                }
+                continue;
+            }
+            if pl < STREAM_DATA_PREFIX {
+                if mtype == MSG_MUX_PEER_IDENTITY || mtype == MSG_MUX_DATAGRAM_RX {
+                    continue;
+                }
+                s.parse_errors += 1;
+                continue;
+            }
+            let stream = u32::from_le_bytes([
+                s.rx_buf[base + SESSION_ID_BYTES],
+                s.rx_buf[base + SESSION_ID_BYTES + 1],
+                s.rx_buf[base + SESSION_ID_BYTES + 2],
+                s.rx_buf[base + SESSION_ID_BYTES + 3],
+            ]);
+
+            if mtype == MSG_MUX_STREAM_ACCEPTED {
+                // Latch the control stream's handle. MQTT-over-QUIC uses
+                // one bidirectional stream per connection; a
+                // unidirectional one is not it, and taking its handle
+                // would send every MQTT packet down a stream the peer
+                // cannot answer on.
+                if pl < STREAM_DATA_PREFIX + STREAM_ACCEPTED_BODY {
+                    s.parse_errors += 1;
+                    continue;
+                }
+                let flags = s.rx_buf[base + STREAM_DATA_PREFIX];
+                if flags & STREAM_FLAG_UNI != 0 {
+                    continue;
+                }
+                if let Some(i) = session_slot(s, session) {
+                    if !s.sessions[i].have_stream {
+                        s.sessions[i].stream = stream;
+                        s.sessions[i].have_stream = true;
+                        // One line per connection, naming the handle this
+                        // adapter will address for the rest of the
+                        // session. An operator debugging a silent session
+                        // otherwise has no way to see whether the control
+                        // stream was ever identified.
+                        dev_log(sys, 3, b"[mqtt_quic] stream up".as_ptr(), 21);
+                    }
+                }
+                continue;
+            }
+            if mtype == MSG_MUX_STREAM_CLOSED || mtype == MSG_MUX_STREAM_RESET {
+                if let Some(i) = session_find(s, session) {
+                    if s.sessions[i].have_stream && s.sessions[i].stream == stream {
+                        s.sessions[i].have_stream = false;
+                    }
+                }
+                continue;
+            }
+            if mtype != MSG_MUX_STREAM_RX {
+                // PEER_IDENTITY / DATAGRAM_RX and anything else are
+                // observed but not propagated.
+                continue;
+            }
+            // Only the MQTT control stream carries packets. Which stream
+            // that is was learned from its accepted event, never assumed.
+            let known = match session_find(s, session) {
+                Some(i) => s.sessions[i].have_stream && s.sessions[i].stream == stream,
+                None => false,
+            };
+            if !known {
+                s.dropped += 1;
+                dev_log(sys, 2, b"[mqtt_quic] rx unknown".as_ptr(), 22);
+                continue;
+            }
+            // session_id (provider connection index) → mqtt conn_id.
+            let cid = s.rx_buf[base];
             let data_off = base + STREAM_DATA_PREFIX;
             let data_len = pl - STREAM_DATA_PREFIX;
             if data_len == 0 {
@@ -234,8 +384,35 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             );
             if w > 0 {
                 s.stream_frames_in += 1;
+                // Return the flow-control credit for what we consumed.
+                //
+                // The transport advances MAX_STREAM_DATA and MAX_DATA from
+                // these acknowledgements and from nothing else — it cannot
+                // know this adapter has drained its buffer. A consumer that
+                // never acknowledges runs until the initial window is
+                // exhausted and then stalls with no error on either side,
+                // which on a long-lived MQTT session means "it worked in
+                // testing and stopped in production".
+                let mut ack = [0u8; STREAM_DATA_PREFIX + 4];
+                ack[0..4].copy_from_slice(&session.to_le_bytes());
+                ack[4..8].copy_from_slice(&stream.to_le_bytes());
+                ack[8..12].copy_from_slice(&(data_len as u32).to_le_bytes());
+                let _ = net_write_frame(
+                    sys,
+                    s.quic_out,
+                    CMD_MUX_STREAM_ACK,
+                    ack.as_ptr(),
+                    ack.len(),
+                    s.tx_buf.as_mut_ptr(),
+                    s.tx_buf.len(),
+                );
             } else {
+                // The codec would not take it. Logged rather than only
+                // counted: a silently dropped inbound packet looks like a
+                // transport fault from both ends, and this is the one
+                // place that knows it was neither.
                 s.dropped += 1;
+                dev_log(sys, 2, b"[mqtt_quic] rx wr fail".as_ptr(), 22);
             }
         }
 
@@ -269,11 +446,25 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.dropped += 1;
                     continue;
                 }
+                // The codec names the connection; the adapter turns that
+                // into the session and the stream the transport actually
+                // gave us. Without the lookup this addressed handle 0,
+                // which is never a live stream — the write is refused and
+                // the client waits for a reply that was never sent.
+                let session = cid as u32;
+                let stream = match session_find(s, session) {
+                    Some(i) if s.sessions[i].have_stream => s.sessions[i].stream,
+                    _ => {
+                        s.dropped += 1;
+                        dev_log(sys, 2, b"[mqtt_quic] no stream".as_ptr(), 21);
+                        continue;
+                    }
+                };
                 // payload built at tx_buf[NET_FRAME_HDR..]; net_write_frame
                 // prepends the [msg_type][len] header in place via scratch.
                 let mut payload = [0u8; STREAM_DATA_PREFIX + MAX_PACKET];
-                payload[0..4].copy_from_slice(&(cid as u32).to_le_bytes());
-                // stream_id 0 (payload[4..8] already zero).
+                payload[0..4].copy_from_slice(&session.to_le_bytes());
+                payload[4..8].copy_from_slice(&stream.to_le_bytes());
                 if data_len > 0 {
                     core::ptr::copy_nonoverlapping(
                         s.frame_buf.as_ptr().add(1),
@@ -294,6 +485,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.stream_frames_out += 1;
                 } else {
                     s.dropped += 1;
+                    dev_log(sys, 2, b"[mqtt_quic] tx DROP".as_ptr(), 19);
                 }
             }
         }

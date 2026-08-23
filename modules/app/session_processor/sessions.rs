@@ -21,6 +21,12 @@ pub struct Inflight {
     packet_id: u16,
     qos: u8,
     phase: u8,
+    /// Session epoch the flow opened under. The dedupe key that names
+    /// this flow's durable record is keyed by it, and a reconnect bumps
+    /// the session's epoch, so a QoS 2 transaction that spans one must
+    /// carry the epoch it started with rather than read the session's
+    /// current value. 0 for slots opened before any publish named one.
+    session_epoch: SessionEpoch,
     wal_index: u64,
     /// Raft correlation_id for the proposal that owns this slot (QoS 1+
     /// only; 0 for QoS 0 and subscriber-side slots). Used to look up the
@@ -37,6 +43,7 @@ impl Inflight {
             packet_id: 0,
             qos: 0,
             phase: 0,
+            session_epoch: 0,
             wal_index: 0,
             correlation_id: 0,
             direction: 0,
@@ -53,6 +60,13 @@ pub struct Session {
     session_epoch: SessionEpoch,
     protocol: u8,
     conn_id: u8,
+    /// 1 once the durable session record exists on this node, set by
+    /// every node when `QOP_CONNECT` applies. `active` is narrower: it
+    /// means a client socket is attached HERE, which a follower never
+    /// has. Keeping them apart is what lets a follower hold the same
+    /// durable record as the leader and still be found by
+    /// `find_by_stream`.
+    present: u8,
     active: u8,
     /// 1 if this slot still owns subscription / inflight / prefetch state
     /// after a disconnect (clean_start=false). Distinct from `active` so
@@ -126,6 +140,7 @@ impl Session {
             session_epoch: 0,
             protocol: PROTO_UNKNOWN,
             conn_id: 0,
+            present: 0,
             active: 0,
             persisted: 0,
             clean_start: 0,
@@ -156,6 +171,7 @@ impl Session {
                     packet_id,
                     qos,
                     phase: if qos == 2 { QOS2_PUBLISH } else { 0 },
+                    session_epoch: 0,
                     wal_index: 0,
                     correlation_id: 0,
                     direction,
@@ -276,9 +292,7 @@ pub fn find_by_conn(s: &Sessions, conn_id: u8) -> Option<usize> {
 pub fn find_by_stream(s: &Sessions, tenant: TenantId, stream_hash: StreamHash) -> Option<usize> {
     (0..MAX_SESSIONS).find(|&i| {
         let x = &s.slots[i];
-        (x.active == 1 || x.persisted == 1 || x.transient == 1)
-            && x.tenant == tenant
-            && x.stream_hash == stream_hash
+        (x.present == 1 || x.transient == 1) && x.tenant == tenant && x.stream_hash == stream_hash
     })
 }
 
@@ -286,7 +300,7 @@ pub fn find_by_stream(s: &Sessions, tenant: TenantId, stream_hash: StreamHash) -
 pub fn allocate(s: &Sessions) -> Option<usize> {
     (0..MAX_SESSIONS).find(|&i| {
         let x = &s.slots[i];
-        x.active == 0 && x.persisted == 0 && x.transient == 0
+        x.present == 0 && x.transient == 0
     })
 }
 
@@ -523,6 +537,7 @@ pub fn commit_connect(s: &mut Sessions, si: usize, p: ConnectParams) {
     x.protocol = p.protocol;
     x.clean_start = u8::from(p.clean_start);
     x.keep_alive_ms = p.keep_alive_ms;
+    x.present = 1;
     x.persisted = 0;
 }
 
@@ -590,7 +605,10 @@ pub fn close(s: &mut Sessions, si: usize, persisted: bool, now: u64) {
         x.persisted = 1;
         x.disconnected_at_ms = now;
     } else {
+        // Clean disconnect: the durable record ends here, so the slot
+        // stops being findable and returns to the free pool.
         x.persisted = 0;
+        x.present = 0;
     }
 }
 
@@ -751,6 +769,7 @@ pub fn will_delay_ms(s: &Sessions, si: usize) -> u32 {
 pub struct InflightView {
     pub qos: u8,
     pub phase: u8,
+    pub session_epoch: SessionEpoch,
     pub correlation_id: u64,
     pub wal_index: u64,
 }
@@ -766,6 +785,7 @@ pub fn inflight_view(s: &Sessions, si: usize, ii: usize) -> Option<InflightView>
     Some(InflightView {
         qos: e.qos,
         phase: e.phase,
+        session_epoch: e.session_epoch,
         correlation_id: e.correlation_id,
         wal_index: e.wal_index,
     })
@@ -795,6 +815,14 @@ pub fn inflight_release(s: &mut Sessions, si: usize, ii: usize) {
 pub fn inflight_set_phase(s: &mut Sessions, si: usize, ii: usize, phase: u8) {
     if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
         s.slots[si].inflight[ii].phase = phase;
+    }
+}
+
+/// Stamp the session epoch the flow opened under. Set once, when the
+/// publish that opened the flow applies.
+pub fn inflight_set_epoch(s: &mut Sessions, si: usize, ii: usize, epoch: SessionEpoch) {
+    if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
+        s.slots[si].inflight[ii].session_epoch = epoch;
     }
 }
 

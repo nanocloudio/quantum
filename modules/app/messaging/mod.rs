@@ -100,6 +100,9 @@ const METRIC_ID_RETAINED: u8 = 0x03;
 /// each component contributes exactly one sample per rollup window.
 const METRICS_INTERVAL_MS: u64 = 10_000;
 
+/// Metric payload capacity every component in this module writes into.
+const METRIC_BYTES: usize = 36;
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
@@ -198,7 +201,7 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
     if chan < 0 {
         return;
     }
-    let mut env = [0u8; 9 + 24];
+    let mut env = [0u8; 9 + METRIC_BYTES];
     env[0] = 1; // dimensional
                 // tenant/protocol/prg are unset here: these are node-scoped component
                 // counters, not per-tenant series.
@@ -245,6 +248,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if s.in_op >= 0 {
             for _ in 0..OP_BUDGET {
+                // Every budget decision precedes consumption. A record's
+                // type is not known until it is read, so once ANY
+                // per-type budget is spent this step, the drain stops
+                // rather than take a record it might not be able to
+                // handle. Losing a MSG_DEDUP_CHECK this way would leave a
+                // committed publish's stash unresolved indefinitely.
+                if checks >= dedup::CHECK_BUDGET
+                    || enqueues >= offline::ENQUEUE_BUDGET
+                    || reconnects >= offline::RECONNECT_BUDGET
+                    || writes >= retained::WRITE_BUDGET
+                    || reads >= retained::READ_BUDGET
+                {
+                    break;
+                }
                 let poll = (sys.channel_poll)(s.in_op, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -263,37 +280,25 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         retained::on_reset(&mut s.retained);
                     }
                     wire::MSG_DEDUP_CHECK => {
-                        if checks >= dedup::CHECK_BUDGET {
-                            break;
-                        }
                         checks += 1;
                         dedup::on_check(&mut s.dedup, sys, &s.buf[..plen], now);
                     }
+                    wire::MSG_DEDUP_PHASE => {
+                        dedup::on_phase(&mut s.dedup, &s.buf[..plen]);
+                    }
                     wire::MSG_OFFLINE_ENQUEUE => {
-                        if enqueues >= offline::ENQUEUE_BUDGET {
-                            break;
-                        }
                         enqueues += 1;
                         offline::on_enqueue(&mut s.offline, &s.buf[..plen], now);
                     }
                     wire::MSG_OFFLINE_RECONNECT => {
-                        if reconnects >= offline::RECONNECT_BUDGET {
-                            break;
-                        }
                         reconnects += 1;
                         offline::on_reconnect(&mut s.offline, sys, &s.buf[..plen]);
                     }
                     wire::MSG_RETAINED_WRITE => {
-                        if writes >= retained::WRITE_BUDGET {
-                            break;
-                        }
                         writes += 1;
                         retained::on_write(&mut s.retained, &s.buf[..plen], now);
                     }
                     wire::MSG_RETAINED_READ => {
-                        if reads >= retained::READ_BUDGET {
-                            break;
-                        }
                         reads += 1;
                         retained::on_read(&mut s.retained, sys, &s.buf[..plen]);
                     }
@@ -310,7 +315,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── 9: component-tagged telemetry, one frame per component ───
         if now.wrapping_sub(s.last_metrics_ms) >= METRICS_INTERVAL_MS {
             s.last_metrics_ms = now;
-            let mut m = [0u8; 24];
+            let mut m = [0u8; METRIC_BYTES];
             let n = dedup::metrics(&s.dedup, &mut m);
             emit_metrics(sys, s.out_metrics, METRIC_ID_DEDUP, &m[..n]);
             let n = offline::metrics(&s.offline, &mut m);

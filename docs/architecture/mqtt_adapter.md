@@ -43,11 +43,21 @@ design.
 | **QoS 1** | PUBLISH → PUBACK | PUBACK after WAL entries reach quorum durability via `flow`'s ack component. |
 | **QoS 2** | PUBLISH → PUBREC → PUBREL → PUBCOMP | Four-phase handshake; each phase transition persists in WAL and requires quorum durability before progressing. |
 
-QoS 2's four-phase state is owned by `session_processor` and tracked
-in the dedupe entry (`DedupeState.phase`). Replay reconstructs the
-exact phase a session was in at crash time, so PUBREC / PUBREL /
-PUBCOMP emit only once per message regardless of node failure between
-phases.
+QoS 2's four-phase state is owned by `session_processor` and lives in
+two records the apply path writes on every node: the publisher's
+in-flight slot, which the state machine reads to decide the next
+response, and the dedupe entry (`DedupeState.phase`), which is keyed
+by message identity and outlives that slot. Both are rebuilt by
+replaying the committed PUBLISH and PUBREL entries, so a node that
+restarts, or a follower that is promoted mid-transaction, resumes the
+phase the log proves rather than one the failed leader held in
+memory. Transitions only advance, so a repeated PUBREL — from a
+client whose PUBCOMP was lost, or from replay — is answered again
+without republishing the message.
+
+Exactly-once is scoped to that contract: the broker accepts each
+message once and completes each transaction once. It says nothing
+about side effects a subscriber performs on delivery.
 
 Cross-PRG publishes carry a `forward_seq` idempotence key (see
 [partitioning.md](partitioning.md)) so replay after failover fences

@@ -64,8 +64,33 @@ pub const MSG_SESSION_CONNECT: u8 = 0x9A;
 pub const MSG_SESSION_DISCONNECT: u8 = 0x9B;
 
 // Dedupe
+//
+// MSG_DEDUP_CHECK   `[dedup_key(20)]` or `[dedup_key(20)][phase:u8]`
+// MSG_DEDUP_RESULT  `[dedup_key(20)][duplicate:u8][phase:u8]`
+//
+// The phase byte carries the QoS 2 protocol state the durable entry
+// holds (`DEDUP_PHASE_NONE` for flows that have none, otherwise a
+// `QOS2_*` value). It is a trailing field: a check written without it
+// is read as `DEDUP_PHASE_NONE` and leaves the stored phase untouched,
+// so entries recorded by either shape stay readable.
+// MSG_DEDUP_PHASE   `[dedup_key(20)][phase:u8]`
+//
+// Record-only: it advances the phase of an entry the apply path has
+// already checked in, and emits no result. Recording is separate from
+// MSG_DEDUP_CHECK because a check is also the duplicate verdict that
+// gates fan-out; a phase transition must never be able to answer one.
 pub const MSG_DEDUP_CHECK: u8 = 0xA0;
 pub const MSG_DEDUP_RESULT: u8 = 0xA1;
+pub const MSG_DEDUP_PHASE: u8 = 0xA2;
+
+/// Length of the bare dedupe key, and the offset of the trailing phase
+/// byte in a check payload that carries one.
+pub const DEDUP_KEY_LEN: usize = 20;
+
+/// "This flow has no QoS 2 phase" — the value a check without a phase
+/// byte decodes to, and the value a result reports for an entry whose
+/// phase was never recorded. Distinct from every `QOS2_*` state.
+pub const DEDUP_PHASE_NONE: u8 = 0xFF;
 
 // Topic routing
 pub const MSG_TOPIC_PUBLISH: u8 = 0xA8;
@@ -118,6 +143,21 @@ pub const MSG_BP_SIGNAL: u8 = 0xC3;
 pub const MSG_PREFETCH_CREDIT: u8 = 0xC4;
 pub const MSG_DELIVERY_LAG: u8 = 0xC5;
 
+/// MSG_ACK_REGISTER body:
+/// `[session_slot:u32 LE][message_id:u32 LE][partition_id:u16 LE]
+///  [wal_index:u64 LE][session_epoch:u32 LE]`.
+///
+/// The epoch names the session generation the publish was accepted
+/// under. It travels back on MSG_ACK_EMIT so a completion arriving
+/// after the slot has been reused for a different client is discarded
+/// rather than matched on `(session_slot, message_id)` alone — MQTT
+/// packet ids are client-chosen and collide freely across sessions.
+pub const ACK_REGISTER_LEN: usize = 22;
+
+/// MSG_ACK_EMIT body:
+/// `[session_slot:u32 LE][message_id:u32 LE][session_epoch:u32 LE]`.
+pub const ACK_EMIT_LEN: usize = 12;
+
 // Control plane (Quantum-specific)
 pub const MSG_TENANT_RECORD: u8 = 0xD0;
 pub const MSG_TENANT_QUOTA: u8 = 0xD1;
@@ -135,6 +175,20 @@ pub const MSG_DR_SNAPSHOT_REQ: u8 = 0xE1;
 pub const MSG_DR_SNAPSHOT_RESP: u8 = 0xE2;
 pub const MSG_DR_PROMOTE: u8 = 0xE3;
 pub const MSG_METRICS_ROLLUP: u8 = 0xE8;
+
+/// HTTP request parsed off the shared client port for the admin
+/// surface (clustor `operations`' `request` port; values shared with
+/// clustor's wire vocabulary). Payload:
+///   `[conn_id:u8][method:u8 (G=0x47, P=0x50, ...)][path_len:u8][path bytes][body...]`
+/// The method byte is the verb's first character so the consumer
+/// dispatches without re-parsing.
+pub const MSG_HTTP_REQUEST: u8 = 0x74;
+
+/// HTTP response from the admin surface back to the module that owns
+/// the client port, which frames the wire-level HTTP/1.1 response
+/// itself. Payload:
+///   `[conn_id:u8][status:u16 LE][body_len:u16 LE][body bytes]`
+pub const MSG_HTTP_RESPONSE: u8 = 0x75;
 
 /// Client-facing frame on the `codec → protocol → peer_router.client_resp`
 /// chain. Payload is `[conn_id:u8][protocol bytes]`. Carries an
@@ -328,6 +382,17 @@ pub fn decode_dedup_key(buf: &[u8]) -> (u32, u64, u32, u32) {
     let epoch = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
     let msg_id = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
     (tenant, stream_hash, epoch, msg_id)
+}
+
+/// Read the trailing QoS 2 phase byte of a MSG_DEDUP_CHECK payload.
+/// Payloads written without the field report `DEDUP_PHASE_NONE`.
+#[inline]
+pub fn decode_dedup_phase(buf: &[u8]) -> u8 {
+    if buf.len() > DEDUP_KEY_LEN {
+        buf[DEDUP_KEY_LEN]
+    } else {
+        DEDUP_PHASE_NONE
+    }
 }
 
 /// TopicKey: (tenant_id: u32, topic_hash: u64) = 12 bytes.

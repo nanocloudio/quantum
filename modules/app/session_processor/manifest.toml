@@ -145,4 +145,7 @@ metrics = [
     "disconnects",
     "publishes_applied",
     "sessions_active",
+    "apply_output_stalls",
+    "acks_stale_epoch",
+    "correlations_overdue",
 ]

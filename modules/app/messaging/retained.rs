@@ -282,7 +282,7 @@ pub unsafe fn on_read(r: &mut Retained, sys: &SyscallTable, payload: &[u8]) {
 }
 
 /// Fill the component's metric payload. Returns the byte count.
-pub fn metrics(r: &Retained, m: &mut [u8; 24]) -> usize {
+pub fn metrics(r: &Retained, m: &mut [u8; super::METRIC_BYTES]) -> usize {
     m[0..4].copy_from_slice(&r.writes.to_le_bytes());
     m[4..8].copy_from_slice(&r.reads.to_le_bytes());
     m[8..12].copy_from_slice(&r.hits.to_le_bytes());

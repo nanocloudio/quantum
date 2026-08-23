@@ -130,7 +130,7 @@ pub unsafe fn on_lag(p: &mut Prefetch, sys: &SyscallTable, payload: &[u8]) {
 }
 
 /// Fill the component's metric payload. Returns the byte count.
-pub fn metrics(p: &Prefetch, m: &mut [u8; 24]) -> usize {
+pub fn metrics(p: &Prefetch, m: &mut [u8; 28]) -> usize {
     m[0..4].copy_from_slice(&p.credit_updates.to_le_bytes());
     let mut active = 0u32;
     for i in 0..MAX_CONSUMERS {

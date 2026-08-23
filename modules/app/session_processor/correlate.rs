@@ -21,6 +21,7 @@
 //! blocking. The stash drains are driven by the dispatch table at its
 //! own per-step budget.
 
+use super::wire;
 use super::{
     MAX_PENDING_CORRELATIONS, MAX_PENDING_DLV, MAX_STASH_ENV, PENDING_ACK_SLOTS, PENDING_DLV_SLOTS,
     STASH_DEDUP_PENDING, STASH_SLOTS,
@@ -65,19 +66,29 @@ pub struct Correlate {
     pending: [PendingCorrelation; MAX_PENDING_CORRELATIONS],
     next_correlation_id: u64,
     dropped: u32,
+    /// Live correlations, and ack registrations parked because the
+    /// edge to the ack component was full. Their sum is what
+    /// `allocate` reserves against: a correlation that exists is a
+    /// promise that its ack registration will have somewhere to go.
+    pending_active: u32,
+    ack_parked: u32,
 
     dlv_active: [u8; PENDING_DLV_SLOTS],
     dlv_len: [u16; PENDING_DLV_SLOTS],
     dlv_env: [[u8; MAX_PENDING_DLV]; PENDING_DLV_SLOTS],
 
     ack_active: [u8; PENDING_ACK_SLOTS],
-    ack_buf: [[u8; 18]; PENDING_ACK_SLOTS],
+    ack_buf: [[u8; wire::ACK_REGISTER_LEN]; PENDING_ACK_SLOTS],
 
     /// Commit-gating stash: a publish is released only once BOTH its
     /// dedup verdict and its durability have landed, which arrive
     /// independently and in either order. The envelope must survive
     /// until then, so a full stash means the publish is dropped rather
     /// than released early.
+    /// Slot occupancy, held separately from `stash_correlation` so a
+    /// stash can carry correlation id 0. Apply-side stashes on a
+    /// follower have no client correlation to name.
+    stash_active: [u8; STASH_SLOTS],
     stash_correlation: [u64; STASH_SLOTS],
     stash_dedup_key: [[u8; 20]; STASH_SLOTS],
     stash_dedup_state: [u8; STASH_SLOTS],
@@ -91,7 +102,8 @@ pub struct Correlate {
 /// Reserve a stash slot for a publish awaiting dedup + durability.
 pub fn stash_alloc(s: &mut Correlate, correlation_id: u64, dedup_key: &[u8]) -> Option<usize> {
     for i in 0..STASH_SLOTS {
-        if s.stash_correlation[i] == 0 {
+        if s.stash_active[i] == 0 {
+            s.stash_active[i] = 1;
             s.stash_correlation[i] = correlation_id;
             let k = dedup_key.len().min(20);
             s.stash_dedup_key[i][..k].copy_from_slice(&dedup_key[..k]);
@@ -108,20 +120,21 @@ pub fn stash_alloc(s: &mut Correlate, correlation_id: u64, dedup_key: &[u8]) -> 
 }
 
 pub fn stash_by_correlation(s: &Correlate, cid: u64) -> Option<usize> {
-    (0..STASH_SLOTS).find(|&i| s.stash_correlation[i] == cid)
+    (0..STASH_SLOTS).find(|&i| s.stash_active[i] == 1 && s.stash_correlation[i] == cid)
 }
 
 pub fn stash_by_dedup_key(s: &Correlate, key: &[u8]) -> Option<usize> {
     if key.len() < 20 {
         return None;
     }
-    (0..STASH_SLOTS).find(|&i| s.stash_correlation[i] != 0 && s.stash_dedup_key[i][..] == key[..20])
+    (0..STASH_SLOTS).find(|&i| s.stash_active[i] == 1 && s.stash_dedup_key[i][..] == key[..20])
 }
 
 pub fn stash_release(s: &mut Correlate, slot: usize) {
     if slot >= STASH_SLOTS {
         return;
     }
+    s.stash_active[slot] = 0;
     s.stash_correlation[slot] = 0;
     s.stash_dedup_state[slot] = STASH_DEDUP_PENDING;
     s.stash_durable[slot] = 0;
@@ -129,7 +142,7 @@ pub fn stash_release(s: &mut Correlate, slot: usize) {
 }
 
 pub fn stash_occupied(s: &Correlate, slot: usize) -> bool {
-    slot < STASH_SLOTS && s.stash_correlation[slot] != 0
+    slot < STASH_SLOTS && s.stash_active[slot] == 1
 }
 
 pub fn stash_dedup_state(s: &Correlate, slot: usize) -> u8 {
@@ -190,6 +203,8 @@ pub fn init(s: &mut Correlate) {
     }
     s.next_correlation_id = 0;
     s.dropped = 0;
+    s.pending_active = 0;
+    s.ack_parked = 0;
     for i in 0..PENDING_DLV_SLOTS {
         s.dlv_active[i] = 0;
         s.dlv_len[i] = 0;
@@ -198,6 +213,7 @@ pub fn init(s: &mut Correlate) {
         s.ack_active[i] = 0;
     }
     for i in 0..STASH_SLOTS {
+        s.stash_active[i] = 0;
         s.stash_correlation[i] = 0;
         s.stash_dedup_key[i] = [0u8; 20];
         s.stash_dedup_state[i] = STASH_DEDUP_PENDING;
@@ -215,9 +231,16 @@ pub fn reset(s: &mut Correlate) {
 
 // ── Correlations ────────────────────────────────────────────────────
 
-/// Bind a new correlation and return its id, or None when the table is
-/// full (the caller must then refuse the operation rather than propose
-/// something it can never match back).
+/// Bind a new correlation and return its id, or None when there is no
+/// capacity (the caller must then refuse the operation rather than
+/// propose something it can never match back).
+///
+/// Capacity is the correlation table AND a parking slot for the ack
+/// registration this correlation will produce. Both are reserved here,
+/// before the work is accepted, so the registration can never be
+/// discarded later for want of room: the operation is refused while it
+/// is still the client's to retry, never after the protocol has
+/// acknowledged it.
 pub fn allocate(
     s: &mut Correlate,
     session_slot: u32,
@@ -225,6 +248,9 @@ pub fn allocate(
     op: u8,
     now: u64,
 ) -> Option<u64> {
+    if s.pending_active + s.ack_parked >= PENDING_ACK_SLOTS as u32 {
+        return None;
+    }
     for i in 0..MAX_PENDING_CORRELATIONS {
         if s.pending[i].active == 0 {
             s.next_correlation_id = s.next_correlation_id.wrapping_add(1);
@@ -240,6 +266,7 @@ pub fn allocate(
                 active: 1,
                 ts_ms: now,
             };
+            s.pending_active = s.pending_active.saturating_add(1);
             return Some(cid);
         }
     }
@@ -257,22 +284,30 @@ pub fn take(s: &mut Correlate, cid: u64) -> Option<(u32, u16, u8)> {
                 s.pending[i].op,
             );
             s.pending[i] = PendingCorrelation::zero();
+            s.pending_active = s.pending_active.saturating_sub(1);
             return Some(r);
         }
     }
     None
 }
 
-/// Reclaim correlations older than `timeout_ms`. Without this a reply
-/// that never arrives leaks its slot forever and a slow leak eventually
-/// exhausts the table, stalling acks across every protocol. Returns how
-/// many were reclaimed.
-pub fn expire(s: &mut Correlate, now: u64, timeout_ms: u64) -> u32 {
+/// Count correlations older than `timeout_ms` without touching them.
+///
+/// A live correlation names a proposal the substrate accepted, and the
+/// substrate emits `proposal_assigned` exactly once for every accepted
+/// tagged proposal. The assignment is therefore always still in flight,
+/// however late it is, and reclaiming the slot would consume it with
+/// nowhere to bind it — the publish would be accepted and then never
+/// acknowledged. Capacity is bounded at the other end instead:
+/// `allocate` refuses while the publish is still the client's to retry.
+///
+/// The count is a leak detector. A non-zero value means an assignment
+/// went missing, which is a substrate contract violation, not something
+/// this table can correct.
+pub fn count_overdue(s: &Correlate, now: u64, timeout_ms: u64) -> u32 {
     let mut n = 0;
     for i in 0..MAX_PENDING_CORRELATIONS {
         if s.pending[i].active == 1 && now.wrapping_sub(s.pending[i].ts_ms) > timeout_ms {
-            s.pending[i] = PendingCorrelation::zero();
-            s.dropped = s.dropped.wrapping_add(1);
             n += 1;
         }
     }
@@ -360,23 +395,34 @@ pub fn dlv_free(s: &mut Correlate, slot: usize) {
 
 // ── Ack stash ───────────────────────────────────────────────────────
 
-/// Stash an 18-byte ack registration. False when the stash is full.
-pub fn ack_stash(s: &mut Correlate, reg: [u8; 18]) -> bool {
+/// Park an 18-byte ack registration whose emission was backpressured.
+/// The slot was reserved when the correlation was allocated, so this
+/// succeeds for every registration the broker owes; false means the
+/// reservation invariant was violated and the caller must say so
+/// rather than account the work dropped.
+pub fn ack_stash(s: &mut Correlate, reg: [u8; wire::ACK_REGISTER_LEN]) -> bool {
     for i in 0..PENDING_ACK_SLOTS {
         if s.ack_active[i] == 0 {
             s.ack_buf[i] = reg;
             s.ack_active[i] = 1;
+            s.ack_parked = s.ack_parked.saturating_add(1);
             return true;
         }
     }
     false
 }
 
+/// How many registrations are parked. Zero lets the drain skip its
+/// sweep entirely, which is the ordinary case.
+pub fn ack_parked(s: &Correlate) -> u32 {
+    s.ack_parked
+}
+
 pub fn ack_is_active(s: &Correlate, slot: usize) -> bool {
     slot < PENDING_ACK_SLOTS && s.ack_active[slot] == 1
 }
 
-pub fn ack_get(s: &Correlate, slot: usize) -> Option<[u8; 18]> {
+pub fn ack_get(s: &Correlate, slot: usize) -> Option<[u8; wire::ACK_REGISTER_LEN]> {
     if ack_is_active(s, slot) {
         Some(s.ack_buf[slot])
     } else {
@@ -385,7 +431,8 @@ pub fn ack_get(s: &Correlate, slot: usize) -> Option<[u8; 18]> {
 }
 
 pub fn ack_free(s: &mut Correlate, slot: usize) {
-    if slot < PENDING_ACK_SLOTS {
+    if slot < PENDING_ACK_SLOTS && s.ack_active[slot] == 1 {
         s.ack_active[slot] = 0;
+        s.ack_parked = s.ack_parked.saturating_sub(1);
     }
 }

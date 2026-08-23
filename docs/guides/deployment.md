@@ -80,6 +80,8 @@ Environment=FLUXOR_BIN=/opt/quantum/bin/fluxor
 Environment=FLUXOR_LINUX_BIN=/opt/quantum/bin/fluxor-linux
 Environment=QUANTUM_CONFIG=/etc/quantum/pi5.yaml
 Environment=RUST_LOG=info
+Environment=FLUXOR_PROJECT_ROOT=/opt/quantum
+WorkingDirectory=/var/lib/quantum
 ExecStart=/opt/quantum/bin/fluxor run ${QUANTUM_CONFIG}
 Restart=on-failure
 RestartSec=5s
@@ -102,12 +104,17 @@ Then `sudo systemctl restart quantum`.
 
 ## Runtime state
 
-In a development run the runtime writes WAL segments (`wal/`) and
-snapshot state (`data/`) under its working directory. The shipped
-unit hardens the filesystem and grants write access to
-`/var/lib/quantum` and `/var/log/quantum`; mount `/var/lib/quantum`
-on a durable volume backed by NVMe — the WAL relies on fsync
-correctness.
+The runtime writes WAL segments (`wal/`), Raft metadata (`raft/`)
+and snapshot state (`data/`) under its working directory, and
+`fluxor run` regenerates the derived `config.bin`/`modules.bin`
+there too (`target/linux/<config>/`). The shipped unit therefore
+runs with `/var/lib/quantum` as its working directory, so everything
+written at runtime lands there; mount it on a durable volume backed
+by NVMe — the WAL relies on fsync correctness. The rest of the
+filesystem, `/opt/quantum` included, stays read-only to the service;
+the CLI resolves the install tree through
+`FLUXOR_PROJECT_ROOT=/opt/quantum` rather than the working
+directory.
 
 ## Upgrades
 

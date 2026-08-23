@@ -79,6 +79,33 @@ inflight accounting. When apply-to-delivery lag exceeds the
 threshold, credits per session reduce until the lag normalises, then
 ramp back to the configured maximum.
 
+## Ack registration (`flow`'s ack component)
+
+A durability-gated publish is only acknowledged once `flow`'s ack
+component holds a registration for it, so that registration is
+reserved before the publish is accepted, not attempted afterwards.
+`session_processor` reserves a parking slot for it when it binds the
+proposal's correlation; a publish that cannot get one is refused
+while it is still the client's to retry, and counted as throttled.
+
+The ack component stops reading its input while its inflight table is
+full rather than accepting a registration it cannot hold, and it makes
+every per-step budget decision before taking a record off the channel —
+a record's type is not known until it is read, so a drain that could
+exceed a budget stops instead of consuming and discarding. The
+registration waits in the channel, `session_processor` parks it in the
+slot it reserved, and both sides retry on later ticks. Saturation
+therefore shows up as bounded backpressure and rising latency, never
+as a publish that was acknowledged and then forgotten.
+
+A completion is released only once its MSG_ACK_EMIT has been written in
+full; a short or refused write leaves the entry active for a later step.
+Registrations carry the session generation the publish was accepted
+under, and a completion whose generation no longer occupies the slot is
+dropped — MQTT packet ids are client-chosen, so slot and packet id alone
+would match a delayed completion against whichever client now holds the
+slot.
+
 ## Backpressure translation (`flow`'s backpressure component)
 
 The operational observability surface for flow control. Tracks queue

@@ -3,22 +3,26 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# MQTT-over-QUIC adapter. Bridges fluxor's `quic` foundation module
-# (ALPN `mqtt`, raw bidi-stream surface) to quantum's `protocol` module
-# without modifying either side.
+# MQTT-over-QUIC adapter. Bridges fluxor's `quic` foundation module to
+# quantum's `protocol` module without modifying either side.
 #
 # Inbound:
-#   quic.app_out  → quic_in   — raw envelopes (MSG_QUIC_STREAM_DATA = 0x13,
-#                              MSG_QUIC_STREAM_OPEN = 0x12, MSG_PEER_IDENTITY
-#                              = 0x5A, MSG_QUIC_DATAGRAM_RX = 0x10)
+#   quic.app_out  → quic_in   — mux-contract frames (session lifecycle,
+#                               MSG_MUX_STREAM_ACCEPTED / _RX / _CLOSED,
+#                               peer identity, datagrams)
 #   quic_in       → mqtt_out  — `[conn_id][mqtt bytes]`, the same shape
-#                              `protocol.raw_in` consumes on the TCP path
+#                               `protocol.raw_in` consumes on the TCP path
 #
 # Outbound (response path):
 #   protocol.frames_out → frames_in — envelope-framed MSG_CLIENT_FRAME
 #                                     (0xEA) carrying `[conn_id][mqtt bytes]`
-#   frames_in           → quic_out  — raw MSG_QUIC_STREAM_WRITE envelope
-#                                     (0x14) `[0x14][cid][sid=0][fin=0][data…]`
+#   frames_in           → quic_out  — CMD_MUX_STREAM_SEND on the session's
+#                                     MQTT control stream
+#
+# Both outputs must be wired: `quic_out` carries the response path and
+# `mqtt_out` every inbound packet. Leaving `mqtt_out` unwired makes each
+# write fail, which presents as a completed QUIC handshake followed by
+# silence.
 #
 # Conn-id namespace: this adapter does NOT remap conn_ids. It is meant
 # for QUIC-only graphs (no concurrent peer_router TCP path into the same
