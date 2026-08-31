@@ -5,7 +5,7 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # kafka_sink — Kafka PRODUCER exposing the generic
-# `stream.sink.ordered_ack` surface: ordered publishes in, durable acks
+# `stream.ordered_ack` surface: ordered publishes in, durable acks
 # + link-state signals out. Sibling of mqtt_sink/amqp_sink; any
 # producer graph composes it by deployment pin. Wire fragment for the
 # surface is currently owned by lattice `modules/common/cdc_wire.rs`
@@ -36,7 +36,26 @@ hardware_targets = ["bcm2712"]
 # Payload ceiling: this broker caps a partition's records blob at 1900
 # bytes; larger payloads get the typed OVERSIZE refusal.
 
-capabilities = ["stream.sink.ordered_ack"]
+# `stream.ordered_ack` is the CDC session protocol (replay on LINK_DOWN,
+# contiguous acknowledged prefix); `stream.publish` is the substitutable
+# fire-and-collect surface a consumer binds by pin. This module offers both.
+capabilities = ["stream.ordered_ack.sink"]
+
+# The terms this module offers `stream.publish` on. `max_payload` is the
+# protocol ceiling, which is NOT the same as `publish_in`'s max_record: the
+# port sizes the channel ring, this sizes what the broker will actually
+# accept. A producer declaring a larger max_record now fails the build
+# instead of collecting typed OVERSIZE refusals at runtime.
+#
+# Kafka acks=-1: the ProduceResponse follows quorum durability. The message
+# key selects the partition, so same-key records are ordered; a broadcast is
+# ONE Produce naming every partition. This broker caps a partition's records
+# blob at 1900 bytes.
+[capability_facts."stream.ordered_ack.sink"]
+ack        = "durable"
+ordering   = "per_key"
+broadcast  = "fanout"
+max_payload = 8192
 
 # in[0]/out[0]: net_proto to the IP module (TCP client to the broker).
 [[ports]]
@@ -60,7 +79,7 @@ index = 1
 direction = "input"
 content_type = "OctetStream"
 buffer_size = 32768
-max_record = 8192
+max_record = 8717
 
 # out[1]: MSG_CDC_ACK `SinkAck` frames (replies + link-state).
 [[ports]]

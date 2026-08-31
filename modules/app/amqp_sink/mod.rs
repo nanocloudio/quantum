@@ -1,5 +1,5 @@
 // amqp_sink — AMQP 0-9-1 publisher exposing the generic
-// `stream.sink.ordered_ack` surface. See manifest.toml for the
+// `stream.ordered_ack` surface. See manifest.toml for the
 // contract mapping; the surface frames are inlined byte-for-byte from
 // their owner (lattice `modules/common/cdc_wire.rs`).
 //
@@ -13,7 +13,7 @@
 //        -> WaitOpenOk -> WaitChanOk -> WaitConfirmOk -> Running
 //        -> Reconnect -> Connecting ...
 //
-// Running: drain MSG_CDC_PUBLISH while the confirm window has room
+// Running: drain MSG_PUBLISH while the confirm window has room
 // (the broker allows at most 8 pending publishes per connection),
 // three frames per publish (method + content header + body), delivery
 // tags sequential from 1 mapped to publish corrs in an ordered ring.
@@ -39,6 +39,18 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+// The ordered-ack exchange surface. Mounted from the staged SDK tree so the
+// frame layout and the status vocabulary have ONE definition: these constants
+// were previously hand-copied here, which is a wire contract maintained by
+// comment across three repositories.
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
+mod exchange;
+use exchange::{
+    Ack, Publish, ACK_WIRE_LEN, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX, PUBLISH_FRAME_MAX,
+    PUBLISH_OVERHEAD, REFUSE_OVERSIZE, REFUSE_UNROUTABLE, STATUS_LINK_DOWN, STATUS_LINK_UP,
+    STATUS_OK,
+};
+
 #[path = "../../common/cores/amqp_core.rs"]
 mod amqp_core;
 
@@ -60,15 +72,6 @@ const NET_CMD_CONNECT: u8 = 0x13;
 
 // ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
 
-const MSG_CDC_PUBLISH: u8 = 0xED;
-const MSG_CDC_ACK: u8 = 0xEE;
-const SINK_STATUS_OK: u8 = 0;
-const SINK_REFUSE_OVERSIZE: u8 = 1;
-const SINK_REFUSE_UNROUTABLE: u8 = 2;
-const SINK_STATUS_LINK_DOWN: u8 = 16;
-const SINK_STATUS_LINK_UP: u8 = 17;
-const SINK_PUBLISH_OVERHEAD: usize = 13;
-
 // ── AMQP method ids the core does not name ───────────────────────────
 
 const CLASS_BASIC: u16 = 60;
@@ -83,13 +86,16 @@ const CONFIRM_SELECT_OK: u16 = 11;
 
 /// This broker's per-publish body ceiling; larger payloads are refused
 /// with the typed OVERSIZE status before anything hits the wire.
-const MAX_PUBLISH_BODY: usize = 1800;
+// The broker's publish-body cap, at the suite ceiling. AMQP frame-max must
+// be negotiated at or above this; the `max_payload` fact carries the number a
+// producer checks against.
+const MAX_PUBLISH_BODY: usize = PAYLOAD_MAX;
 /// Confirm window — the broker allows at most 8 pending per conn.
 const INFLIGHT_CAP: usize = 8;
 
-const TX_BUF_SIZE: usize = 4096;
+const TX_BUF_SIZE: usize = PUBLISH_FRAME_MAX + 4096;
 const RX_BUF_SIZE: usize = 2048;
-const CHAN_BUF_SIZE: usize = 8192;
+const CHAN_BUF_SIZE: usize = PUBLISH_FRAME_MAX;
 const NET_BUF_SIZE: usize = 1600;
 const MAX_TOPIC_LEN: usize = 63;
 
@@ -315,7 +321,7 @@ unsafe fn send_ack(s: &mut SinkState, corr: u64, status: u8) -> bool {
     }
     let sys = &*s.syscalls;
     let mut buf = [0u8; 3 + 9];
-    buf[0] = MSG_CDC_ACK;
+    buf[0] = MSG_ACK;
     buf[1] = 9;
     buf[2] = 0;
     buf[3..11].copy_from_slice(&corr.to_le_bytes());
@@ -331,7 +337,7 @@ unsafe fn emit_link_down(s: &mut SinkState) {
         i += 1;
     }
     s.inflight_used = 0;
-    let _ = send_ack(s, 0, SINK_STATUS_LINK_DOWN);
+    let _ = send_ack(s, 0, STATUS_LINK_DOWN);
 }
 
 // ── TX ───────────────────────────────────────────────────────────────
@@ -414,35 +420,26 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
         {
             return;
         }
-        if hdr[0] != MSG_CDC_PUBLISH || len < SINK_PUBLISH_OVERHEAD {
+        if hdr[0] != MSG_PUBLISH || len < PUBLISH_OVERHEAD {
             continue;
         }
-        let cb = s.chan_buf.as_ptr();
-        let corr = u64::from_le_bytes([
-            *cb,
-            *cb.add(1),
-            *cb.add(2),
-            *cb.add(3),
-            *cb.add(4),
-            *cb.add(5),
-            *cb.add(6),
-            *cb.add(7),
-        ]);
-        let klen = u16::from_le_bytes([*cb.add(9), *cb.add(10)]) as usize;
-        let plen = u16::from_le_bytes([*cb.add(11), *cb.add(12)]) as usize;
-        if corr == 0 || SINK_PUBLISH_OVERHEAD + klen + plen != len {
+        // One decoder, from the SDK contract: the frame layout is not
+        // this module's to know.
+        let Some(publish) = Publish::decode(&s.chan_buf[..len]) else {
             continue;
-        }
+        };
+        let corr = publish.corr;
+        let plen = publish.payload.len();
         if plen > MAX_PUBLISH_BODY {
             // Broker body ceiling: typed refusal, never truncation.
-            let _ = send_ack(s, corr, SINK_REFUSE_OVERSIZE);
+            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
             continue;
         }
-        let body = core::slice::from_raw_parts(cb.add(SINK_PUBLISH_OVERHEAD + klen), plen);
+        let body = publish.payload;
         let topic = &s.topic[..s.topic_len as usize];
         let mut frames = [0u8; TX_BUF_SIZE];
         let Some(flen) = publish_frames(CHANNEL, topic, body, &mut frames) else {
-            let _ = send_ack(s, corr, SINK_REFUSE_UNROUTABLE);
+            let _ = send_ack(s, corr, REFUSE_UNROUTABLE);
             continue;
         };
         // Record the confirm slot BEFORE the send: the broker's tag
@@ -485,11 +482,7 @@ unsafe fn fold_confirm(s: &mut SinkState, tag: u64, multiple: bool, nack: bool) 
             s.inflight_corr[i] = 0;
             s.inflight_tag[i] = 0;
             s.inflight_used = s.inflight_used.saturating_sub(1);
-            let status = if nack {
-                SINK_REFUSE_UNROUTABLE
-            } else {
-                SINK_STATUS_OK
-            };
+            let status = if nack { REFUSE_UNROUTABLE } else { STATUS_OK };
             let _ = send_ack(s, corr, status);
         }
         i += 1;
@@ -563,7 +556,7 @@ unsafe fn process_frames(s: &mut SinkState) {
                     s.next_tag = 1;
                     s.backoff_ms = BACKOFF_INIT_MS;
                     s.last_hb_ms = millis(s);
-                    let _ = send_ack(s, 0, SINK_STATUS_LINK_UP);
+                    let _ = send_ack(s, 0, STATUS_LINK_UP);
                 }
                 (CLASS_BASIC, BASIC_ACK) | (CLASS_BASIC, BASIC_NACK)
                     if payload_end - args_at >= 9 =>

@@ -1,5 +1,5 @@
 // kafka_sink — Kafka producer exposing the generic
-// `stream.sink.ordered_ack` surface. See manifest.toml for the
+// `stream.ordered_ack` surface. See manifest.toml for the
 // contract mapping; the surface frames are inlined byte-for-byte from
 // their owner (lattice `modules/common/cdc_wire.rs`).
 //
@@ -16,7 +16,7 @@
 //
 // Metadata registers the topic with the broker (auto-create by
 // mention) and reads back the real partition count, which the msg_key
-// hash then addresses. Running drains MSG_CDC_PUBLISH while the
+// hash then addresses. Running drains MSG_PUBLISH while the
 // produce window has room; Kafka correlation ids map to publish corrs
 // in a fixed ring. Entering Running emits LINK_UP; any connection
 // loss emits LINK_DOWN and clears the ring — those corrs are exactly
@@ -39,6 +39,18 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+// The ordered-ack exchange surface. Mounted from the staged SDK tree so the
+// frame layout and the status vocabulary have ONE definition: these constants
+// were previously hand-copied here, which is a wire contract maintained by
+// comment across three repositories.
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
+mod exchange;
+use exchange::{
+    Ack, Publish, ACK_WIRE_LEN, FLAG_BROADCAST, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX,
+    PUBLISH_FRAME_MAX, PUBLISH_OVERHEAD, REFUSE_OVERSIZE, REFUSE_UNROUTABLE, STATUS_LINK_DOWN,
+    STATUS_LINK_UP, STATUS_OK,
+};
+
 #[path = "../../common/cores/kafka_core.rs"]
 mod kafka_core;
 
@@ -56,16 +68,6 @@ const NET_CMD_CONNECT: u8 = 0x13;
 
 // ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
 
-const MSG_CDC_PUBLISH: u8 = 0xED;
-const MSG_CDC_ACK: u8 = 0xEE;
-const SINK_STATUS_OK: u8 = 0;
-const SINK_REFUSE_OVERSIZE: u8 = 1;
-const SINK_REFUSE_UNROUTABLE: u8 = 2;
-const SINK_STATUS_LINK_DOWN: u8 = 16;
-const SINK_STATUS_LINK_UP: u8 = 17;
-const SINK_PUBLISH_OVERHEAD: usize = 13;
-const SINK_FLAG_BROADCAST: u8 = 0x01;
-
 // ── Kafka constants ──────────────────────────────────────────────────
 
 const API_PRODUCE: i16 = 0;
@@ -80,7 +82,10 @@ const ERR_MESSAGE_TOO_LARGE: i16 = 10;
 /// The broker's per-partition records-blob ceiling. The RecordBatch
 /// overhead is ~70 bytes, so payloads above this are refused with the
 /// typed OVERSIZE status before anything hits the wire.
-const MAX_RECORDS_BYTES: usize = 1900;
+// The broker's records-blob cap. Raised to the suite ceiling plus record
+// framing; the broker must be configured to match (`message.max.bytes`), and
+// the `max_payload` capability fact is what tells a producer the real number.
+const MAX_RECORDS_BYTES: usize = PAYLOAD_MAX + RECORD_OVERHEAD;
 const RECORD_OVERHEAD: usize = 96;
 const MAX_PAYLOAD: usize = MAX_RECORDS_BYTES - RECORD_OVERHEAD;
 /// Produce window: requests sent, response not yet seen.
@@ -88,9 +93,9 @@ const INFLIGHT_CAP: usize = 8;
 /// Partition ceiling (the broker clamps its `partitions` param 1..=16).
 const MAX_PARTS: usize = 16;
 
-const TX_BUF_SIZE: usize = 8192;
-const RX_BUF_SIZE: usize = 4096;
-const CHAN_BUF_SIZE: usize = 8192;
+const TX_BUF_SIZE: usize = PUBLISH_FRAME_MAX + 4096;
+const RX_BUF_SIZE: usize = 8192;
+const CHAN_BUF_SIZE: usize = PUBLISH_FRAME_MAX;
 const NET_BUF_SIZE: usize = 1600;
 const MAX_TOPIC_LEN: usize = 64;
 const MAX_KEY_LEN: usize = 260;
@@ -346,7 +351,7 @@ unsafe fn send_ack(s: &mut SinkState, corr: u64, status: u8) -> bool {
     }
     let sys = &*s.syscalls;
     let mut buf = [0u8; 3 + 9];
-    buf[0] = MSG_CDC_ACK;
+    buf[0] = MSG_ACK;
     buf[1] = 9;
     buf[2] = 0;
     buf[3..11].copy_from_slice(&corr.to_le_bytes());
@@ -363,7 +368,7 @@ unsafe fn emit_link_down(s: &mut SinkState) {
         i += 1;
     }
     s.inflight_used = 0;
-    let _ = send_ack(s, 0, SINK_STATUS_LINK_DOWN);
+    let _ = send_ack(s, 0, STATUS_LINK_DOWN);
 }
 
 // ── TX ───────────────────────────────────────────────────────────────
@@ -446,41 +451,36 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
         {
             return;
         }
-        if hdr[0] != MSG_CDC_PUBLISH || len < SINK_PUBLISH_OVERHEAD {
+        if hdr[0] != MSG_PUBLISH || len < PUBLISH_OVERHEAD {
             continue;
         }
-        let cb = s.chan_buf.as_ptr();
-        let corr = u64::from_le_bytes([
-            *cb,
-            *cb.add(1),
-            *cb.add(2),
-            *cb.add(3),
-            *cb.add(4),
-            *cb.add(5),
-            *cb.add(6),
-            *cb.add(7),
-        ]);
-        let flags = *cb.add(8);
-        let klen = u16::from_le_bytes([*cb.add(9), *cb.add(10)]) as usize;
-        let plen = u16::from_le_bytes([*cb.add(11), *cb.add(12)]) as usize;
-        if corr == 0 || SINK_PUBLISH_OVERHEAD + klen + plen != len || klen > MAX_KEY_LEN {
+        // One decoder, from the SDK contract: the frame layout is not
+        // this module's to know.
+        let Some(publish) = Publish::decode(&s.chan_buf[..len]) else {
+            continue;
+        };
+        let corr = publish.corr;
+        let flags = publish.flags;
+        let klen = publish.msg_key.len();
+        let plen = publish.payload.len();
+        if klen > MAX_KEY_LEN {
             continue;
         }
         if plen > MAX_PAYLOAD {
             // Broker records-blob ceiling: typed refusal, never
             // truncation.
-            let _ = send_ack(s, corr, SINK_REFUSE_OVERSIZE);
+            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
             continue;
         }
-        let msg_key = core::slice::from_raw_parts(cb.add(SINK_PUBLISH_OVERHEAD), klen);
-        let payload = core::slice::from_raw_parts(cb.add(SINK_PUBLISH_OVERHEAD + klen), plen);
+        let msg_key = publish.msg_key;
+        let payload = publish.payload;
 
         // Partition addressing (term 2/5): key hash normally; EVERY
         // partition in one request for broadcast — the broker acks
         // that request only after the slowest partition is durable.
         let nparts = s.partitions.max(1).min(MAX_PARTS as u32);
         let mut parts = [0u32; MAX_PARTS];
-        let parts_used: usize = if flags & SINK_FLAG_BROADCAST != 0 {
+        let parts_used: usize = if flags & FLAG_BROADCAST != 0 {
             let mut i = 0usize;
             while i < nparts as usize {
                 parts[i] = i as u32;
@@ -502,7 +502,7 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
             now,
             &mut body,
         ) else {
-            let _ = send_ack(s, corr, SINK_REFUSE_OVERSIZE);
+            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
             continue;
         };
         s.kcorr = s.kcorr.wrapping_add(1);
@@ -518,7 +518,7 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
             &body[..blen],
             &mut req,
         ) else {
-            let _ = send_ack(s, corr, SINK_REFUSE_OVERSIZE);
+            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
             continue;
         };
         // Record in-flight BEFORE the send.
@@ -607,7 +607,7 @@ unsafe fn process_responses(s: &mut SinkState) {
                 s.phase = Phase::Running;
                 s.backoff_ms = BACKOFF_INIT_MS;
                 log_msg(s, b"[kafkasink] metadata ok");
-                let _ = send_ack(s, 0, SINK_STATUS_LINK_UP);
+                let _ = send_ack(s, 0, STATUS_LINK_UP);
             } else {
                 log_err(s, b"[kafkasink] metadata unparseable");
                 enter_reconnect(s);
@@ -627,13 +627,13 @@ unsafe fn process_responses(s: &mut SinkState) {
                 s.inflight_used = s.inflight_used.saturating_sub(1);
                 match produce_errors(body) {
                     Some(0) => {
-                        let _ = send_ack(s, pub_corr, SINK_STATUS_OK);
+                        let _ = send_ack(s, pub_corr, STATUS_OK);
                     }
                     Some(ERR_MESSAGE_TOO_LARGE) => {
-                        let _ = send_ack(s, pub_corr, SINK_REFUSE_OVERSIZE);
+                        let _ = send_ack(s, pub_corr, REFUSE_OVERSIZE);
                     }
                     _ => {
-                        let _ = send_ack(s, pub_corr, SINK_REFUSE_UNROUTABLE);
+                        let _ = send_ack(s, pub_corr, REFUSE_UNROUTABLE);
                     }
                 }
                 break;

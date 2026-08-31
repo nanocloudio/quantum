@@ -1,5 +1,5 @@
 // mqtt_sink — MQTT 3.1.1 QoS 1 producer exposing the generic
-// `stream.sink.ordered_ack` surface. See manifest.toml for the
+// `stream.ordered_ack` surface. See manifest.toml for the
 // contract mapping; the frame layouts below are the surface's wire
 // (currently owned by lattice `modules/common/cdc_wire.rs`) and
 // inlined byte-for-byte — that owner's conformance vectors are the
@@ -11,7 +11,7 @@
 //   Init -> Connecting -> WaitConnect -> MqttConnect -> WaitConnack
 //        -> Running -> Reconnect -> Connecting ...
 //
-// Running: drain MSG_CDC_PUBLISH frames while the in-flight window
+// Running: drain MSG_PUBLISH frames while the in-flight window
 // has room, one serialized MQTT PUBLISH each (packet-id mapped to the
 // publish corr in a fixed ring); PUBACK answers status 0 on ack_out.
 // Entering Running emits LINK_UP; any connection loss emits LINK_DOWN
@@ -35,6 +35,17 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+// The ordered-ack exchange surface. Mounted from the staged SDK tree so the
+// frame layout and the status vocabulary have ONE definition: these constants
+// were previously hand-copied here, which is a wire contract maintained by
+// comment across three repositories.
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
+mod exchange;
+use exchange::{
+    Ack, Publish, ACK_WIRE_LEN, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX, PUBLISH_FRAME_MAX,
+    PUBLISH_OVERHEAD, REFUSE_OVERSIZE, STATUS_LINK_DOWN, STATUS_LINK_UP, STATUS_OK,
+};
+
 // ── Net protocol (same vocabulary as mqtt_client) ────────────────────
 
 const NET_MSG_DATA: u8 = 0x02;
@@ -47,24 +58,13 @@ const NET_CMD_CONNECT: u8 = 0x13;
 
 // ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
 
-/// Channel envelope types on the pump pair.
-const MSG_CDC_PUBLISH: u8 = 0xED;
-const MSG_CDC_ACK: u8 = 0xEE;
-/// Ack statuses.
-const SINK_STATUS_OK: u8 = 0;
-const SINK_REFUSE_OVERSIZE: u8 = 1;
-const SINK_STATUS_LINK_DOWN: u8 = 16;
-const SINK_STATUS_LINK_UP: u8 = 17;
-/// SinkPublish fixed head: [corr:u64][flags:u8][klen:u16][plen:u16].
-const SINK_PUBLISH_OVERHEAD: usize = 13;
-
 // ── Sizing ───────────────────────────────────────────────────────────
 
 /// One worst-case CDC envelope (lattice CDC_ENVELOPE_MAX = 4478) plus
 /// MQTT topic + headers — the C-1 frame budget.
-const TX_BUF_SIZE: usize = 8192;
+const TX_BUF_SIZE: usize = PUBLISH_FRAME_MAX + 4096;
 const RX_BUF_SIZE: usize = 2048;
-const CHAN_BUF_SIZE: usize = 8192;
+const CHAN_BUF_SIZE: usize = PUBLISH_FRAME_MAX;
 const NET_BUF_SIZE: usize = 1600;
 const MAX_CLIENT_ID_LEN: usize = 32;
 const MAX_TOPIC_LEN: usize = 96;
@@ -255,14 +255,14 @@ unsafe fn write_mqtt_string(buf: *mut u8, s: *const u8, len: usize) -> usize {
 
 // ── ack_out emission ─────────────────────────────────────────────────
 
-/// Write one `[MSG_CDC_ACK][len][corr:u64][status]` envelope.
+/// Write one `[MSG_ACK][len][corr:u64][status]` envelope.
 unsafe fn send_ack(s: &mut SinkState, corr: u64, status: u8) -> bool {
     if s.ack_out_chan < 0 {
         return false;
     }
     let sys = &*s.syscalls;
     let mut buf = [0u8; 3 + 9];
-    buf[0] = MSG_CDC_ACK;
+    buf[0] = MSG_ACK;
     buf[1] = 9;
     buf[2] = 0;
     buf[3..11].copy_from_slice(&corr.to_le_bytes());
@@ -280,7 +280,7 @@ unsafe fn emit_link_down(s: &mut SinkState) {
         i += 1;
     }
     s.inflight_used = 0;
-    let _ = send_ack(s, 0, SINK_STATUS_LINK_DOWN);
+    let _ = send_ack(s, 0, STATUS_LINK_DOWN);
 }
 
 // ── MQTT builders ────────────────────────────────────────────────────
@@ -434,27 +434,17 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
         {
             return;
         }
-        if hdr[0] != MSG_CDC_PUBLISH || len < SINK_PUBLISH_OVERHEAD {
+        if hdr[0] != MSG_PUBLISH || len < PUBLISH_OVERHEAD {
             continue;
         }
-        // SinkPublish: [corr:u64][flags:u8][klen:u16][plen:u16][key][payload]
-        let cb = s.chan_buf.as_ptr();
-        let corr = u64::from_le_bytes([
-            *cb,
-            *cb.add(1),
-            *cb.add(2),
-            *cb.add(3),
-            *cb.add(4),
-            *cb.add(5),
-            *cb.add(6),
-            *cb.add(7),
-        ]);
-        let klen = u16::from_le_bytes([*cb.add(9), *cb.add(10)]) as usize;
-        let plen = u16::from_le_bytes([*cb.add(11), *cb.add(12)]) as usize;
-        if corr == 0 || SINK_PUBLISH_OVERHEAD + klen + plen != len {
+        // One decoder, from the SDK contract: the frame layout is not
+        // this module's to know.
+        let Some(publish) = Publish::decode(&s.chan_buf[..len]) else {
             continue; // malformed; nothing addressable to refuse
-        }
-        let payload_ptr = cb.add(SINK_PUBLISH_OVERHEAD + klen);
+        };
+        let corr = publish.corr;
+        let plen = publish.payload.len();
+        let payload_ptr = publish.payload.as_ptr();
 
         // Fresh packet id (1..=65535, never 0).
         s.packet_id = s.packet_id.wrapping_add(1);
@@ -472,7 +462,7 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
         );
         if pkt_len == 0 {
             // Frame budget exceeded: typed refusal, never truncation.
-            let _ = send_ack(s, corr, SINK_REFUSE_OVERSIZE);
+            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
             continue;
         }
         // Record in-flight BEFORE the send so a PUBACK can never race
@@ -530,7 +520,7 @@ unsafe fn process_rx_packet(s: &mut SinkState) -> usize {
                         s.backoff_ms = BACKOFF_INIT_MS;
                         // (Re)connected and writable: the §11 signal
                         // the pump gates publishing on.
-                        let _ = send_ack(s, 0, SINK_STATUS_LINK_UP);
+                        let _ = send_ack(s, 0, STATUS_LINK_UP);
                     }
                 } else {
                     log_err(s, b"[mqttsink] connack rejected");
@@ -549,7 +539,7 @@ unsafe fn process_rx_packet(s: &mut SinkState) -> usize {
                         s.inflight_corr[i] = 0;
                         s.inflight_pkt[i] = 0;
                         s.inflight_used = s.inflight_used.saturating_sub(1);
-                        let _ = send_ack(s, corr, SINK_STATUS_OK);
+                        let _ = send_ack(s, corr, STATUS_OK);
                         break;
                     }
                     i += 1;

@@ -5,7 +5,7 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # mqtt_sink — MQTT 3.1.1 QoS 1 PRODUCER exposing the generic
-# `stream.sink.ordered_ack` surface: ordered publishes in, durable acks
+# `stream.ordered_ack` surface: ordered publishes in, durable acks
 # + link-state signals out. Any producer graph that speaks the surface
 # can compose it by deployment pin — quantum knows nothing about who
 # publishes (lattice CDC is the first consumer; the wire fragment is
@@ -29,7 +29,25 @@ hardware_targets = ["bcm2712"]
 # Frame budget: TX sized for a worst-case 4 KiB payload + framing —
 # the requirement the QoS-0 mqtt_client could not meet.
 
-capabilities = ["stream.sink.ordered_ack"]
+# `stream.ordered_ack` is the CDC session protocol (replay on LINK_DOWN,
+# contiguous acknowledged prefix); `stream.publish` is the substitutable
+# fire-and-collect surface a consumer binds by pin. This module offers both.
+capabilities = ["stream.ordered_ack.sink"]
+
+# The terms this module offers `stream.publish` on. `max_payload` is the
+# protocol ceiling, which is NOT the same as `publish_in`'s max_record: the
+# port sizes the channel ring, this sizes what the broker will actually
+# accept. A producer declaring a larger max_record now fails the build
+# instead of collecting typed OVERSIZE refusals at runtime.
+#
+# MQTT 3.1.1 QoS 1: PUBACK is the durable accept. One topic is ONE ordering
+# unit, so broadcast degenerates to a plain publish. TX is sized for a
+# worst-case 4 KiB payload + framing.
+[capability_facts."stream.ordered_ack.sink"]
+ack        = "durable"
+ordering   = "single"
+broadcast  = "degenerate"
+max_payload = 8192
 
 # in[0]/out[0]: net_proto to the IP module (TCP client to the broker).
 [[ports]]
@@ -53,7 +71,7 @@ index = 1
 direction = "input"
 content_type = "OctetStream"
 buffer_size = 32768
-max_record = 8192
+max_record = 8717
 
 # out[1]: MSG_CDC_ACK `SinkAck` frames (replies + link-state).
 [[ports]]
