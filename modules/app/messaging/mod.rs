@@ -73,6 +73,18 @@ mod dedup;
 mod offline;
 mod retained;
 
+/// Placement: shared with `session_processor` and `topic_engine` so all
+/// three resolve a shard to the same owner.
+#[allow(
+    dead_code,
+    reason = "the core is compiled verbatim into every module that shares it; \
+              this module uses the placement half, topic_engine the routing \
+              half. Trimming it per consumer would fork the one definition \
+              the core exists to provide"
+)]
+#[path = "../../common/cores/edge_routing_core.rs"]
+mod edge;
+
 /// Kernel step ABI: 0=Continue, 1=Done, 2=Burst, 3=Ready. Returning
 /// Burst re-runs the domain's exec rotation within the same tick, so a
 /// reply reaches the session state machine in this tick rather than the
@@ -113,6 +125,13 @@ struct ModuleState {
     dedup: dedup::Dedup,
     offline: offline::Offline,
     retained: retained::Retained,
+
+    /// Placement, learned over the op bus from `session_processor`.
+    view: edge::EdgeMap,
+    /// Retained entries dropped because their shard was reassigned.
+    retained_released: u32,
+    /// Queued deliveries dropped with a released session slot.
+    offline_released: u32,
 
     /// Module-owned read buffer. Each record is read once here and
     /// dispatched as a borrowed payload; components own only their own
@@ -177,6 +196,12 @@ pub unsafe extern "C" fn module_new(
         dedup::init(&mut s.dedup);
         offline::init(&mut s.offline);
         retained::init(&mut s.retained);
+        // Single PRG, epoch 0, until placement arrives: a module that
+        // has heard none owns everything, which is the single-node
+        // behaviour and releases nothing.
+        s.view = edge::EdgeMap::new(0, 0);
+        s.retained_released = 0;
+        s.offline_released = 0;
 
         // All three components reply on out[0]; the consumer demuxes by
         // frame type exactly as it did across the three separate edges.
@@ -301,6 +326,34 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     wire::MSG_RETAINED_READ => {
                         reads += 1;
                         retained::on_read(&mut s.retained, sys, &s.buf[..plen]);
+                    }
+                    // Placement, forwarded verbatim by `session_processor`
+                    // over this same op bus because this module has no
+                    // control-plane port of its own. Parsed with the
+                    // shared core, so there is one wire format and one
+                    // shard->owner derivation across every module that
+                    // reads placement.
+                    wire::MSG_PLACEMENT_UPDATE => {
+                        if edge::apply_placement_update(&mut s.view.view, &s.buf[..plen])
+                            == edge::PlacementUpdate::Applied
+                        {
+                            let view = &s.view;
+                            // `is_local`, not `owns_shard`: a fenced
+                            // shard is still ours and must keep its
+                            // state, because an aborted migration lifts
+                            // the fence and leaves ownership unmoved.
+                            s.retained_released = s.retained_released.wrapping_add(
+                                retained::release_foreign(&mut s.retained, |sh| view.is_local(sh)),
+                            );
+                        }
+                    }
+                    wire::MSG_OFFLINE_RELEASE => {
+                        if plen >= 4 {
+                            let slot = u32::from_le_bytes([s.buf[0], s.buf[1], s.buf[2], s.buf[3]]);
+                            s.offline_released = s
+                                .offline_released
+                                .wrapping_add(offline::release_slot(&mut s.offline, slot));
+                        }
                     }
                     // Shared bus: traffic addressed to other consumers.
                     _ => {}

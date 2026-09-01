@@ -12,15 +12,29 @@
 
 use super::wire;
 
-const MAX_CONNS: usize = 64;
-/// Sized to carry the largest client record peer_router can emit
-/// (`peer_router BUF_SIZE = 4096` net bytes + 1 conn_id byte, rounded
-/// up). Undersizing this is not a soft cap: `channel_read_msg` DISCARDS
-/// oversize envelopes wholesale, so a 1 KiB buffer silently dropped any
-/// TCP segment over 1023 bytes — e.g. every pipelined or batched Kafka
-/// produce burst. The composite owns the buffer; this is the bound it
-/// must satisfy.
-pub const READ_BUF: usize = 4608;
+/// Connection-classification slots. Must stay at or above
+/// `peer_router`'s `MAX_CONNS` and the per-protocol connection tables
+/// this router feeds, or it becomes the silent ceiling on concurrent
+/// clients. `ConnState` holds only a 16-byte sniff buffer, so the
+/// table is cheap.
+const MAX_CONNS: usize = 512;
+/// Sized to the wire-channel per-message cap
+/// (`fluxor-abi::CHANNEL_BUFFER_SIZE`), because this ONE buffer serves
+/// both directions and the two have different largest messages.
+///
+/// Undersizing it is not a soft cap: `channel_read_msg` DISCARDS
+/// oversize envelopes wholesale, and the loss is silent at both ends —
+/// inbound, a TCP segment larger than the buffer takes a whole
+/// pipelined produce burst with it; outbound, the same buffer drains
+/// `responses_in`, where `session_processor` builds Fetch responses up
+/// to its `budget_end` of 7600 bytes, and a discarded response leaves
+/// the consumer to time out with nothing to show for it.
+///
+/// Sizing it to either direction's traffic is therefore a guess that
+/// silently costs data when it is wrong. Sizing it to the channel's own
+/// ceiling is not a guess: a message that can arrive cannot be too
+/// large to read.
+pub const READ_BUF: usize = 8192;
 
 pub const PROTO_UNKNOWN: u8 = 0;
 pub const PROTO_MQTT: u8 = 1;

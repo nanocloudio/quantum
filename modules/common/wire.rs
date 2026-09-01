@@ -18,6 +18,13 @@ pub const MSG_CLIENT_RESPONSE: u8 = 0x11;
 pub const MSG_ADMIN_COMMAND: u8 = 0x12;
 pub const MSG_ADMIN_RESPONSE: u8 = 0x13;
 pub const MSG_PROPOSAL_ASSIGNED: u8 = 0x14;
+/// Client proposal carrying a proposer-chosen virtual-shard id, for
+/// `partition_router`'s keyed placement path. Payload is
+/// `[shard_id:u32 LE]` followed by exactly what an untagged or tagged
+/// `MSG_CLIENT_PROPOSAL` would carry; the router strips the prefix and
+/// forwards the remainder under [`MSG_CLIENT_PROPOSAL`], so `consensus`
+/// never sees this type. Mirrors clustor's value.
+pub const MSG_CLIENT_PROPOSAL_KEYED: u8 = 0x1C;
 
 pub const MSG_WAL_ENTRY: u8 = 0x20;
 pub const MSG_DURABILITY_PROOF: u8 = 0x22;
@@ -27,6 +34,26 @@ pub const MSG_COMMITTED_BATCH: u8 = 0x23;
 /// session_processor consumes this on `entries_in` to drive the
 /// apply-side state machine (P0 of `docs/partitioning.md`).
 pub const MSG_COMMITTED_ENTRY: u8 = 0x24;
+
+/// Control-plane shard map: `[epoch:u64][count:u16]` then `count`
+/// entries of `[shard:u32][prg:u16]`. Mirrors clustor's value; it names
+/// the PRG that SERVES a shard, NOT a raft partition — PRG count comes
+/// from the node count, partition count is a graph parameter, and the
+/// two are separate namespaces.
+pub const MSG_SHARD_MAP_UPDATE: u8 = 0x81;
+
+/// Prefix on a `MSG_COMMITTED_ENTRY` body, as clustor's `consensus`
+/// writes it: `[partition_id:u16 LE][term:u64 LE][index:u64 LE]`, then
+/// the entry body.
+///
+/// The partition id is load-bearing. One engine hosts K raft groups
+/// whose logs each number from 1 and all feed this one stream, so a
+/// consumer keeping a single apply cursor sees partition 1's index 1
+/// after partition 0's and drops it as a duplicate — or reads a
+/// partition running ahead as a GAP and wipes its apply-derived state.
+/// Measured at K=4 as only ~1/4 of topics delivering, the same ones
+/// every run. Key any apply cursor on `(partition_id, index)`.
+pub const COMMITTED_ENTRY_HDR: usize = 18;
 
 /// Apply-pipeline reset notice (mirrors Clustor's value). Emitted by
 /// the substrate when the apply index has rewound — snapshot install,
@@ -48,6 +75,142 @@ pub const MSG_THROTTLE_ENVELOPE: u8 = 0x41;
 pub const MSG_LAG_SIGNAL: u8 = 0x42;
 
 pub const MSG_METRICS: u8 = 0x70;
+/// Raft leader hint from `consensus.leader_state`. Body:
+/// `[leader_id:u8][term:u64 LE]`; `0xFF` means unknown. Mirrors
+/// clustor's `MSG_LEADER_HINT` — the same id, because it is the same
+/// frame crossing the graph.
+/// WAL entry read-back, mirrored from clustor's `wire.rs` — the two
+/// sides must agree byte for byte or a cold read decodes the wrong
+/// entry. Request: `[request_id:u32][wal_index:u64]`. Reply:
+/// `[request_id:u32][term:u64][index:u64][prev_term:u64][body...]`,
+/// with an empty body meaning NOT FOUND.
+/// Partitioned envelope: `[partition_id:u16 LE][msg_type:u8][len:u16 LE]`.
+/// clustor's substrate writes replies on partitioned channels; this is
+/// the matching read, mirrored from its `wire_channels.rs`. Reading a
+/// partitioned frame with the plain 3-byte `channel_read_msg` silently
+/// takes the low byte of `partition_id` as the message type — the frame
+/// is not corrupt, it is simply never recognised, which presents as a
+/// reply that never arrives.
+pub const PARTITIONED_HDR: usize = 5;
+
+/// `MSG_COMPACTION_FLOOR`: `[kpg_id:u16][floor_revision:u64]` on a
+/// PARTITIONED channel. Tells `durability` the highest raft index it is
+/// safe to snapshot — and therefore compact — at.
+///
+/// MUST equal clustor's `wire::MSG_COMPACTION_FLOOR`. It is restated
+/// here because the repos share no crate, and a mismatch is SILENT:
+/// `drain_retention_floors` compares the type and drops anything else,
+/// so the frame arrives, is discarded, and compaction proceeds as if no
+/// consumer had asked for retention. Verified against clustor's value
+/// rather than chosen — an invented 0x2E cost a debugging round here.
+pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
+
+/// Write one partitioned envelope: `[partition_id:u16][msg_type:u8]
+/// [len:u16]` then the payload, in ONE write so the frame cannot tear.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+pub unsafe fn channel_write_partitioned(
+    sys: &crate::abi::SyscallTable,
+    chan: i32,
+    partition_id: u16,
+    msg_type: u8,
+    payload: &[u8],
+) -> i32 {
+    // One buffer, one write. Writing the header and payload separately
+    // would let a full channel accept the header and refuse the body,
+    // desyncing the reader for every frame after it.
+    let mut frame = [0u8; PARTITIONED_HDR + 64];
+    let total = PARTITIONED_HDR + payload.len();
+    if total > frame.len() {
+        return -1;
+    }
+    frame[0..2].copy_from_slice(&partition_id.to_le_bytes());
+    frame[2] = msg_type;
+    frame[3..5].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    frame[PARTITIONED_HDR..total].copy_from_slice(payload);
+    (sys.channel_write)(chan, frame.as_ptr(), total)
+}
+
+/// Read one partitioned envelope. Returns `(partition_id, msg_type,
+/// payload_len)`; the payload is placed at `buf[0..payload_len]`.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+pub unsafe fn channel_read_partitioned(
+    sys: &crate::abi::SyscallTable,
+    chan: i32,
+    buf: &mut [u8],
+) -> (u16, u8, u16) {
+    let mut hdr = [0u8; PARTITIONED_HDR];
+    let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), PARTITIONED_HDR);
+    if n < PARTITIONED_HDR as i32 {
+        return (0, 0, 0);
+    }
+    let partition_id = u16::from_le_bytes([hdr[0], hdr[1]]);
+    let msg_type = hdr[2];
+    let payload_len = u16::from_le_bytes([hdr[3], hdr[4]]);
+    let plen = payload_len as usize;
+    if plen == 0 {
+        return (partition_id, msg_type, 0);
+    }
+    if plen > buf.len() {
+        // Drain and discard, exactly as `channel_read_msg` does: a
+        // partial read would desynchronise every later frame.
+        let mut discard = [0u8; 256];
+        let mut remaining = plen;
+        while remaining > 0 {
+            let chunk = remaining.min(256);
+            let r = (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
+            if r <= 0 {
+                break;
+            }
+            remaining -= r as usize;
+        }
+        return (0, 0, 0);
+    }
+    let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
+    if (n2 as usize) < plen {
+        return (0, 0, 0);
+    }
+    (partition_id, msg_type, payload_len)
+}
+
+pub const MSG_WAL_ENTRY_REQUEST: u8 = 0x29;
+pub const MSG_WAL_ENTRY_REPLY: u8 = 0x2A;
+pub const WAL_ENTRY_REQUEST_LEN: usize = 12;
+pub const WAL_ENTRY_REPLY_HDR: usize = 28;
+
+#[inline]
+pub fn encode_wal_entry_request(
+    buf: &mut [u8; WAL_ENTRY_REQUEST_LEN],
+    request_id: u32,
+    wal_index: u64,
+) {
+    buf[0..4].copy_from_slice(&request_id.to_le_bytes());
+    buf[4..12].copy_from_slice(&wal_index.to_le_bytes());
+}
+
+/// Returns `(request_id, term, index, prev_term)`, or `None` when the
+/// buffer is too short to be a reply header.
+#[inline]
+pub fn decode_wal_entry_reply(buf: &[u8]) -> Option<(u32, u64, u64, u64)> {
+    if buf.len() < WAL_ENTRY_REPLY_HDR {
+        return None;
+    }
+    let request_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let mut u = [0u8; 8];
+    u.copy_from_slice(&buf[4..12]);
+    let term = u64::from_le_bytes(u);
+    u.copy_from_slice(&buf[12..20]);
+    let index = u64::from_le_bytes(u);
+    u.copy_from_slice(&buf[20..28]);
+    let prev_term = u64::from_le_bytes(u);
+    Some((request_id, term, index, prev_term))
+}
+
+pub const MSG_LEADER_HINT: u8 = 0x09;
+
 pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;
 
 // ── Quantum-specific message types ──────────────────────────────────────────
@@ -117,6 +280,23 @@ pub const MSG_RETAINED_READ: u8 = 0xB3;
 /// online. Routed on the same messaging bus as the other infrastructure
 /// ops; the offline component filters by msg_type.
 pub const MSG_OFFLINE_RECONNECT: u8 = 0xB4;
+/// `[session_slot:u32 LE]` — drop every queued delivery for that slot.
+/// Sent when the session owning it is released because its shard moved
+/// to another PRG. Slots are recycled, so leaving the queue behind
+/// would drain it to whichever session is allocated the slot next.
+pub const MSG_OFFLINE_RELEASE: u8 = 0xB6;
+
+/// Version-agnostic CONNACK refusals meaning "this session is not
+/// served here". `session_processor` decides placement; the MQTT codec
+/// owns how that is spelled on the wire, because the same condition has
+/// a different reason code in each version — and `0x03`, the only
+/// refusal 3.1.1 can express, means "Malformed Packet" in v5, so a
+/// single literal code would be actively wrong for one of them.
+///
+/// Neither value is a valid MQTT reason code in either version, so
+/// these cannot collide with a real one travelling the same field.
+pub const MQTT_REASON_MOVED: u8 = 0xFF;
+pub const MQTT_REASON_TRY_ELSEWHERE: u8 = 0xFE;
 
 /// Apply-pipeline reset fan-out from `session_processor` to every
 /// apply-derived module. Body: `[reset_index:u64 LE]`. Fires when the
@@ -166,7 +346,6 @@ pub const MSG_CAPABILITIES: u8 = 0xD3;
 pub const MSG_EPOCH_EVENT: u8 = 0xD4;
 
 // Forward coordination
-pub const MSG_FORWARD_REQUEST: u8 = 0xD8;
 pub const MSG_FORWARD_ACK: u8 = 0xD9;
 
 // Operations
@@ -199,6 +378,12 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 /// group members) deterministically instead of leaking until a timeout —
 /// and closes the conn_id-reuse cross-delivery hazard.
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
+
+/// Ask `peer_router` to CLOSE a client connection. Payload `[conn_id:u8]`.
+/// The inverse of [`MSG_CONN_CLOSED`], which is a notice; this is a
+/// command. MQTT 3.1.1 has no server-initiated DISCONNECT, so closing the
+/// socket is the only way to tell a 3.1.1 client its session moved.
+pub const MSG_CONN_CLOSE_REQUEST: u8 = 0xEC;
 
 // ── Envelope primitives ─────────────────────────────────────────────────────
 
@@ -412,6 +597,174 @@ pub fn fnv1a_64(data: &[u8]) -> u64 {
     h
 }
 
+// ── Virtual-shard routing keys ──────────────────────────────────────────────
+//
+// `partition_router` places a proposal by the shard id the proposer
+// supplies, not by hashing the body. Placement is therefore stable per
+// routing key: every publish to one topic reaches one partition
+// whatever its payload. Quantum owns the keys because only Quantum
+// knows what a key means; the substrate only maps shard -> partition.
+//
+// Keys are domain-separated so an MQTT topic and a Kafka topic of the
+// same name cannot collide, and tenant-separated so two tenants'
+// identically-named objects stay independent.
+
+/// Size of the virtual-shard space. Mirrors clustor's `VIRTUAL_SHARDS`;
+/// both sides must agree or a shard id means different things at each
+/// end. Fixed for the life of a cluster.
+pub const VIRTUAL_SHARDS: u32 = 1 << 18;
+
+/// Routing-key domains. The tag is hashed into the key, never sent on
+/// the wire — it exists so the domains occupy disjoint key spaces.
+pub const RKEY_MQTT_SESSION: u8 = 1;
+pub const RKEY_MQTT_TOPIC: u8 = 2;
+pub const RKEY_KAFKA: u8 = 3;
+pub const RKEY_KAFKA_GROUP: u8 = 4;
+pub const RKEY_AMQP_QUEUE: u8 = 5;
+
+/// Reduce a routing-key hash to a virtual-shard id. Mirrors clustor's
+/// `shard_for_key`.
+#[inline]
+pub fn shard_for_key(key_hash: u64) -> u32 {
+    (key_hash % VIRTUAL_SHARDS as u64) as u32
+}
+
+/// Hash `(domain, tenant, key)` to a virtual shard.
+///
+/// Hashed incrementally rather than through a staging buffer, so a
+/// 256-byte topic costs no copy and there is no length ceiling to
+/// overflow.
+#[inline]
+pub fn shard_for(domain: u8, tenant: u32, key: &[u8]) -> u32 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    h ^= domain as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    for &b in &tenant.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &b in key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    shard_for_key(h)
+}
+
+/// Hash `(domain, tenant, key, ordinal)` to a virtual shard — the
+/// four-part form, for keys that carry a numeric tail such as a Kafka
+/// partition index.
+#[inline]
+pub fn shard_for_ordinal(domain: u8, tenant: u32, key: &[u8], ordinal: u32) -> u32 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    h ^= domain as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    for &b in &tenant.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &b in key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &b in &ordinal.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    shard_for_key(h)
+}
+
+/// Shard owning an MQTT session's state: `(tenant, client_id)`.
+#[inline]
+pub fn shard_mqtt_session(tenant: u32, client_id: &[u8]) -> u32 {
+    shard_for(RKEY_MQTT_SESSION, tenant, client_id)
+}
+
+/// Shard owning an MQTT session's state, keyed by the stream hash the
+/// codec already stamps on every session-scoped op.
+///
+/// `stream_hash` *is* the session identity: `session_processor` indexes
+/// every session by `(tenant, stream_hash)` and the codec carries it on
+/// CONNECT, DISCONNECT, SUBSCRIBE, UNSUBSCRIBE and the QoS ack path.
+/// Deriving the shard from it rather than re-hashing `client_id` — which
+/// is only in scope at CONNECT — keeps every op for one session on one
+/// shard without threading the client id through the module.
+#[inline]
+pub fn shard_mqtt_stream(tenant: u32, stream_hash: u64) -> u32 {
+    shard_for(RKEY_MQTT_SESSION, tenant, &stream_hash.to_le_bytes())
+}
+
+/// Shard owning an MQTT topic's subscriptions and retained message:
+/// `(tenant, normalized_topic)`.
+#[inline]
+pub fn shard_mqtt_topic(tenant: u32, topic: &[u8]) -> u32 {
+    shard_for(RKEY_MQTT_TOPIC, tenant, topic)
+}
+
+/// Shard owning a Kafka partition's log: `(tenant, topic, partition)`.
+/// The Kafka partition is the unit of placement — never re-derived from
+/// record contents, so a producer's partitioner alone decides it.
+#[inline]
+pub fn shard_kafka(tenant: u32, topic: &[u8], partition: u32) -> u32 {
+    shard_for_ordinal(RKEY_KAFKA, tenant, topic, partition)
+}
+
+/// Shard owning a Kafka consumer group's coordinator state:
+/// `(tenant, group_id)`.
+#[inline]
+pub fn shard_kafka_group(tenant: u32, group_id: &[u8]) -> u32 {
+    shard_for(RKEY_KAFKA_GROUP, tenant, group_id)
+}
+
+/// Shard owning an AMQP queue: `(tenant, queue_name)`.
+#[inline]
+pub fn shard_amqp_queue(tenant: u32, queue: &[u8]) -> u32 {
+    shard_for(RKEY_AMQP_QUEUE, tenant, queue)
+}
+
+/// Size of the keyed-proposal prefix. Mirrors clustor's
+/// `KEYED_PROPOSAL_HDR`.
+pub const KEYED_PROPOSAL_HDR: usize = 4;
+
+/// Write a keyed proposal: envelope + `[shard_id:u32 LE]` + `payload`,
+/// staged into one buffer and issued as a single atomic channel write —
+/// the same discipline as [`channel_write_msg`], which this mirrors.
+///
+/// `payload` is what the router forwards after stripping the prefix: a
+/// bare body on the untagged port, or `[correlation_id:u64 LE][body]`
+/// on the tagged one. Returns total bytes written, or -1.
+///
+/// # Safety
+/// `sys` must point to a valid SyscallTable.
+#[inline]
+pub unsafe fn channel_write_keyed_proposal(
+    sys: &crate::abi::SyscallTable,
+    chan: i32,
+    shard_id: u32,
+    payload: &[u8],
+) -> i32 {
+    const MAX_MSG: usize = crate::abi::CHANNEL_BUFFER_SIZE;
+    let plen = KEYED_PROPOSAL_HDR + payload.len();
+    let total = ENVELOPE_HDR + plen;
+    if total > MAX_MSG {
+        return -1;
+    }
+    let mut buf = [0u8; MAX_MSG];
+    encode_header(
+        &mut buf[..ENVELOPE_HDR],
+        MSG_CLIENT_PROPOSAL_KEYED,
+        plen as u16,
+    );
+    buf[ENVELOPE_HDR..ENVELOPE_HDR + KEYED_PROPOSAL_HDR].copy_from_slice(&shard_id.to_le_bytes());
+    if !payload.is_empty() {
+        buf[ENVELOPE_HDR + KEYED_PROPOSAL_HDR..total].copy_from_slice(payload);
+    }
+    let w = (sys.channel_write)(chan, buf.as_ptr(), total);
+    if w < total as i32 {
+        return -1;
+    }
+    total as i32
+}
+
 /// MQTT topic match: supports `+` (single-level) and `#` (multi-level) wildcards.
 /// Returns true if `pattern` matches `topic`.
 pub fn mqtt_topic_match(pattern: &[u8], topic: &[u8]) -> bool {
@@ -612,17 +965,33 @@ pub const QOP_PUBREL: u8 = 0x06;
 pub const QOP_RETAINED_CLEAR: u8 = 0x07;
 
 /// KAFKA_PRODUCE: one Kafka record batch appended to a topic-partition.
-/// The `base_offset` returned to the producer is the WAL index assigned
-/// to this entry (offsets are WAL indexes interpreted through the
-/// topic's view of the WAL — see docs/architecture/kafka_adapter.md
-/// §Retention). Tagged when `acks != 0` so the ProduceResponse is
-/// gated on quorum durability; untagged (fire-and-forget) for
-/// `acks == 0`.
+/// Tagged when `acks != 0` so the ProduceResponse is gated on quorum
+/// durability; untagged (fire-and-forget) for `acks == 0`.
 ///
-/// Op-body: `[partition:u16 LE][topic_len:u16 LE][topic]
+/// Op-body: `[origin:u8][partition:u16 LE][topic_len:u16 LE][topic]
 ///           [records: remaining bytes — the verbatim Kafka record
 ///            batch (magic v2) from the ProduceRequest]`.
+///
+/// `origin` is the replica id of the node that ACCEPTED the produce, or
+/// [`PRODUCE_ORIGIN_NONE`] when no client is waiting (`acks == 0`).
+///
+/// Why it is on the wire: the batch's logical offset and its
+/// idempotence verdict are both decided at APPLY, which runs on every
+/// replica, but the client waiting for them is parked in an inflight
+/// slot that exists only on the accepting node. Clustor strips the
+/// tagged correlation before storing the entry, and the replicated slot
+/// index alone cannot be matched safely — a follower may hold a live
+/// slot at the same index and generation, and would stamp an offset
+/// onto an unrelated client's produce. Carrying the origin makes the
+/// match structural: a replica that did not originate the proposal
+/// skips it outright. The body stays opaque to Clustor, which never
+/// inspects it.
 pub const QOP_KAFKA_PRODUCE: u8 = 0x08;
+
+/// `origin` value meaning "no client is waiting for this batch"
+/// (`acks == 0`). Chosen outside the valid replica-id range so it can
+/// never collide with a real node.
+pub const PRODUCE_ORIGIN_NONE: u8 = 0xFF;
 
 /// AMQP_PUBLISH: one AMQP 0-9-1 Basic.Publish body appended to the
 /// routing key's message log (shared apply-side store with Kafka —
@@ -644,6 +1013,41 @@ pub const QOP_AMQP_PUBLISH: u8 = 0x09;
 /// Op-body: `[group_len:u16 LE][group][topic_len:u16 LE][topic]
 ///           [partition:u16 LE][offset:i64 LE]`.
 pub const QOP_KAFKA_OFFSET: u8 = 0x0A;
+
+/// KAFKA GROUP GENERATION: the highest generation a consumer group has
+/// reached. Op-body: `[group_len:u16 LE][group][generation:i32 LE]`.
+///
+/// Group membership is rebuilt by clients after a coordinator change,
+/// which is fine — but the GENERATION must not be rebuilt with it. A
+/// new coordinator starting a group again from 1 REUSES generations the
+/// old one already issued, and a zombie consumer still holding one of
+/// them is then accepted as current and commits offsets under it. That
+/// is the failure this record prevents.
+///
+/// Applied as a maximum, never an assignment: replay, re-delivery and
+/// out-of-order arrival all converge on the same value, and a
+/// generation can only ever move forward.
+pub const QOP_KAFKA_GROUP_GEN: u8 = 0x0B;
+
+/// KAFKA GROUP MEMBER: one member's identity and its current partition
+/// assignment. Op-body:
+/// `[group_len:u16 LE][group][member_len:u8][member_id]`
+/// `[assign_len:u16 LE][assignment]`.
+///
+/// Emitted only at SyncGroup, when the group has REACHED a stable
+/// assignment — a group mid-rebalance is not worth preserving, and
+/// replicating every intermediate state would be chatter.
+///
+/// What this buys: `member_join` returns an already-known member
+/// without bumping the generation, so a consumer that reconnects to a
+/// NEW coordinator with the same `member.id` keeps its generation and
+/// its partitions instead of triggering a group-wide rebalance. Without
+/// it every coordinator change costs a stop-the-world rebalance of
+/// every group it hosted.
+///
+/// Restored members come back UNBOUND (`conn_id` is meaningless across
+/// a restart); the rejoining client rebinds them.
+pub const QOP_KAFKA_GROUP_MEMBER: u8 = 0x0C;
 
 // ── Disconnect reasons (QOP_DISCONNECT body) ────────────────────────────────
 

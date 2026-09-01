@@ -15,7 +15,17 @@
 use super::abi::SyscallTable;
 use super::wire;
 
-const MAX_RETAINED: usize = 64;
+/// Retained messages held per node.
+///
+/// MQTT retention is per TOPIC, and a real deployment has thousands of
+/// topics each carrying a retained last-known-value, so the table has
+/// to be sized for topics rather than for a demo. At ~1.3 KiB per entry
+/// (topic + payload) 4096 costs ~5.3 MiB against a 100 MiB state arena.
+///
+/// A static array rather than the per-module heap: a retained value
+/// lives as long as its topic, so the arena would be reserved for the
+/// worst case anyway and dynamic allocation would buy nothing.
+const MAX_RETAINED: usize = 4096;
 const MAX_RETAINED_TOPIC: usize = 256;
 const MAX_RETAINED_PAYLOAD: usize = 1024;
 
@@ -83,6 +93,40 @@ pub fn on_reset(r: &mut Retained) {
     for i in 0..MAX_RETAINED {
         r.entries[i] = RetainedEntry::zero();
     }
+}
+
+/// Release every retained entry whose shard is no longer this node's,
+/// and report how many went.
+///
+/// A retained entry is keyed by `(tenant, topic)`, which is exactly the
+/// routing key, so its shard is derivable from what the entry already
+/// stores — no re-indexing of the table by shard is needed, and none is
+/// done. `is_local` is supplied by the caller so this component keeps no
+/// placement view of its own.
+///
+/// Retention is the case where keeping foreign state is most visibly
+/// wrong: a retained message is what a NEW subscriber is handed on
+/// SUBSCRIBE, so a node still holding one for a shard it lost would
+/// answer fresh subscribers with a last-known-value the real owner has
+/// already superseded.
+pub fn release_foreign(r: &mut Retained, is_local: impl Fn(u32) -> bool) -> u32 {
+    let mut released = 0u32;
+    for i in 0..MAX_RETAINED {
+        if r.entries[i].active == 0 {
+            continue;
+        }
+        let tl = r.entries[i].topic_len as usize;
+        if tl > MAX_RETAINED_TOPIC {
+            continue;
+        }
+        let shard = super::wire::shard_mqtt_topic(r.entries[i].tenant, &r.entries[i].topic[..tl]);
+        if is_local(shard) {
+            continue;
+        }
+        r.entries[i] = RetainedEntry::zero();
+        released = released.wrapping_add(1);
+    }
+    released
 }
 
 /// MSG_RETAINED_WRITE: `[tenant:u32 LE][topic_hash:u64 LE]`

@@ -39,7 +39,14 @@ const MAX_PACKET: usize = 8192;
 /// MQTT frame (`[type][varint up to 4 B][body]`) for the largest body
 /// without truncating during encode.
 const RESP_BUF: usize = MAX_PACKET + 16;
-const MAX_CONNS: usize = 32;
+/// Concurrent MQTT connections per node.
+///
+/// Each `ConnCtx` reserves an 8 KiB reassembly buffer plus its alias
+/// tables for the connection's whole life, so this is roughly
+/// `MAX_CONNS * 8.5 KiB` resident (256 -> ~2.2 MiB). See `kafka.rs`'s
+/// `KCONNS` for why these stay static arrays rather than moving to the
+/// per-module heap.
+const MAX_CONNS: usize = 256;
 const MAX_TOPIC_ALIASES_PER_CONN: usize = 16;
 const ALIAS_TOPIC_MAX: usize = 128;
 
@@ -123,6 +130,17 @@ pub struct Mqtt {
     qos2_packets: u32,
     mqtt5_publishes: u32,
     topic_alias_hits: u32,
+    /// `1 + index` of the connection whose front packet the proposal
+    /// edge refused; 0 = none. While set, `flush_held` must land it
+    /// before any further raw bytes are taken, or a later packet
+    /// overtakes it and the session sees this connection out of order.
+    held_ci: u16,
+    /// Decoded packets the proposal edge refused and this codec held
+    /// (retried, never dropped). Steady state 0.
+    proposals_held: u32,
+    /// Frames `out_frames` refused where nothing retries them
+    /// (PINGRESP, a close request, a server DISCONNECT). Steady state 0.
+    frames_refused: u32,
 
     conns: [ConnCtx; MAX_CONNS],
     in_buf: [u8; MAX_PACKET],
@@ -915,7 +933,7 @@ fn strip_user_props_for_v311(out: &mut [u8], flags: u8, body: &[u8]) -> usize {
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u8]) {
+pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u8]) -> bool {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
         // the router component frames each client record as a MSG_CLIENT_FRAME
@@ -926,11 +944,11 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
         // channel read did: `in_buf` holds `[conn_id][tcp chunk]`.
         let n = payload.len() as i32;
         if n as usize > s.in_buf.len() {
-            return;
+            return false;
         }
         s.in_buf[..payload.len()].copy_from_slice(payload);
         if n < 1 {
-            return;
+            return false;
         }
 
         let conn_id = s.in_buf[0];
@@ -946,15 +964,15 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
                     break;
                 }
             }
-            return;
+            return false;
         }
         if n < 2 {
-            return;
+            return false;
         }
 
         let chunk_len = (n as usize) - 1;
         if chunk_len == 0 {
-            return;
+            return false;
         }
         let ci = s.find_or_create_conn(conn_id);
 
@@ -965,7 +983,7 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
         if cur + chunk_len > MAX_PACKET {
             s.parse_errors += 1;
             s.conns[ci].reass_len = 0;
-            return;
+            return false;
         }
         core::ptr::copy_nonoverlapping(
             s.in_buf.as_ptr().add(1),
@@ -978,6 +996,42 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
         // packet bytes are staged into `in_buf` so the existing
         // decode body can address them through `pkt_start` /
         // `pkt_bytes` unchanged.
+        drain_conn(s, sys, ci, conn_id)
+    }
+}
+
+/// Retry the packet a refused proposal write left at the front of its
+/// connection's reassembly buffer. `true` when nothing is held (the
+/// caller may take new raw bytes); `false` while the edge still
+/// refuses it.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+pub unsafe fn flush_held(s: &mut Mqtt, sys: &SyscallTable) -> bool {
+    if s.held_ci == 0 {
+        return true;
+    }
+    let ci = (s.held_ci - 1) as usize;
+    s.held_ci = 0;
+    if ci >= MAX_CONNS || s.conns[ci].active == 0 {
+        return true;
+    }
+    let conn_id = s.conns[ci].conn_id;
+    !drain_conn(s, sys, ci, conn_id)
+}
+
+/// Decode and emit every complete packet at the front of connection
+/// `ci`'s reassembly buffer. Returns `true` when a packet is HELD: the
+/// proposal edge refused it, it is back at the front of the buffer
+/// unchanged, and the caller must stop taking raw bytes until
+/// `flush_held` lands it.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -> bool {
+    unsafe {
         loop {
             let avail = s.conns[ci].reass_len as usize;
             if avail < 2 {
@@ -1355,7 +1409,9 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
                 PKT_PINGREQ => {
                     // Synthesize PINGRESP immediately — no session processor involvement
                     let ping = [(PKT_PINGRESP << 4), 0u8];
-                    write_conn_frame(sys, s.out_frames, conn_id, &ping);
+                    if !write_conn_frame(sys, s.out_frames, conn_id, &ping) {
+                        s.frames_refused = s.frames_refused.wrapping_add(1);
+                    }
                     s.packets_encoded += 1;
                     continue;
                 }
@@ -1371,36 +1427,63 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
                 }
             }
 
-            write_conn_frame_with_mtype(
+            if !write_conn_frame_with_mtype(
                 sys,
                 s.out_proposals,
                 conn_id,
                 session_msg_type,
                 &s.envelope[..pos],
-            );
+            ) {
+                // Refused. A dropped PUBLISH is one the client never
+                // hears back about, so the packet goes back to the
+                // front of the reassembly buffer — `in_buf` still holds
+                // it verbatim — and the connection is marked held.
+                let rem = s.conns[ci].reass_len as usize;
+                core::ptr::copy(
+                    s.conns[ci].reass_buf.as_ptr(),
+                    s.conns[ci].reass_buf.as_mut_ptr().add(pkt_size),
+                    rem,
+                );
+                core::ptr::copy_nonoverlapping(
+                    s.in_buf.as_ptr().add(1),
+                    s.conns[ci].reass_buf.as_mut_ptr(),
+                    pkt_size,
+                );
+                s.conns[ci].reass_len = (rem + pkt_size) as u16;
+                s.held_ci = (ci + 1) as u16;
+                s.proposals_held = s.proposals_held.wrapping_add(1);
+                if s.proposals_held & 0x1F == 1 {
+                    dev_log(sys, 2, b"[mqtt] proposal held".as_ptr(), 20);
+                }
+                return true;
+            }
             s.packets_decoded += 1;
         } // end inner reassembly-drain loop
+        false
     }
 }
 
 /// Encode one session response into MQTT frames on `out_frames`.
 /// Payload (post-envelope-strip) is `[conn_id][proto][pkt_type][flags][body]`.
+/// Returns `false` when the frame edge refused the encoded packet and
+/// the response must be offered again; `true` when it was written or
+/// there is nothing to write.
 ///
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
+pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> bool {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
         // Stage the record exactly as the channel read did.
         let plen = payload.len();
         if plen > s.resp_buf.len() {
-            return;
+            return true;
         }
         s.resp_buf[..plen].copy_from_slice(payload);
         dev_log(sys, 3, b"[mqtt] resp rx".as_ptr(), 14);
         if plen < 4 {
-            return;
+            return true;
         }
         let n = plen;
         let conn_id = s.resp_buf[0];
@@ -1421,6 +1504,77 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
         // encoder unchanged.
         let ci_resp = s.find_or_create_conn(conn_id);
         let proto_v = s.conns[ci_resp].protocol_version;
+
+        // Translate the placement refusals into this connection's
+        // version. `session_processor` knows the session is served
+        // elsewhere; only the codec knows how to say so, because the
+        // same condition is `0x9D`/`0x9C` in v5 and `0x03` in 3.1.1 —
+        // and `0x03` in v5 means "Malformed Packet", so passing one
+        // literal through would misinform half the clients.
+        // A server-initiated DISCONNECT exists ONLY in v5. It is how a
+        // node tells a client its session has moved: the client
+        // reconnects, meets the CONNECT redirect, and lands on the new
+        // owner with `session_present = 1` — session state is
+        // REPLICATED, so nothing is lost by reconnecting. 3.1.1 has no
+        // such packet; its remedy is closing the socket, which needs a
+        // primitive that does not exist yet, so the frame is DROPPED
+        // rather than encoded as bytes the client would read as a
+        // malformed packet.
+        if pkt_type == PKT_DISCONNECT {
+            if body.is_empty() {
+                return true;
+            }
+            if proto_v < 5 {
+                // 3.1.1 has no server DISCONNECT, so the only way to
+                // tell this client its session moved is to close the
+                // socket — it then reconnects and meets the CONNECT
+                // redirect. Encoding a v5 DISCONNECT here instead would
+                // put bytes on the wire a 3.1.1 client reads as a
+                // malformed packet.
+                if !write_conn_frame_with_mtype(
+                    sys,
+                    s.out_frames,
+                    conn_id,
+                    wire::MSG_CONN_CLOSE_REQUEST,
+                    &[],
+                ) {
+                    s.frames_refused = s.frames_refused.wrapping_add(1);
+                }
+                return true;
+            }
+            let reason = match body[0] {
+                wire::MQTT_REASON_MOVED => 0x9Du8,         // Server moved
+                wire::MQTT_REASON_TRY_ELSEWHERE => 0x9Cu8, // Use another server
+                other => other,
+            };
+            let n = encode_mqtt_frame(&mut s.frame, PKT_DISCONNECT, 0, &[reason]);
+            if n > 0 && !write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..n]) {
+                s.frames_refused = s.frames_refused.wrapping_add(1);
+            }
+            return true;
+        }
+
+        let mut retarget = [0u8; 2];
+        let body = if pkt_type == PKT_CONNACK
+            && body.len() >= 2
+            && matches!(
+                body[1],
+                wire::MQTT_REASON_MOVED | wire::MQTT_REASON_TRY_ELSEWHERE
+            ) {
+            retarget[0] = body[0];
+            retarget[1] = if proto_v >= 5 {
+                if body[1] == wire::MQTT_REASON_MOVED {
+                    0x9D // Server moved
+                } else {
+                    0x9C // Use another server
+                }
+            } else {
+                0x03 // Server unavailable — 3.1.1's only refusal
+            };
+            &retarget[..]
+        } else {
+            body
+        };
         let needs_v5_props_splice =
             proto_v >= 5 && matches!(pkt_type, PKT_CONNACK | PKT_SUBACK | PKT_UNSUBACK,);
         let frame_len = if pkt_type == PKT_PUBLISH && proto_v >= 5 {
@@ -1453,14 +1607,18 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) {
             encode_mqtt_frame(&mut s.frame, pkt_type, flags, body)
         };
         if frame_len == 0 {
-            return;
+            return true;
         }
 
-        let ok = write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..frame_len]);
-        if ok {
-            dev_log(sys, 3, b"[mqtt] resp -> peer".as_ptr(), 19);
+        // A refused frame is NOT consumed: the caller keeps the response
+        // and offers it again next step, so a PUBACK the client is
+        // waiting on is never lost to a full edge.
+        if !write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..frame_len]) {
+            return false;
         }
+        dev_log(sys, 3, b"[mqtt] resp -> peer".as_ptr(), 19);
         s.packets_encoded += 1;
+        true
     }
 }
 
@@ -1497,6 +1655,19 @@ unsafe fn write_conn_frame_with_mtype(
     out[1..total].copy_from_slice(bytes);
     let w = wire::channel_write_msg(sys, chan, msg_type, &out[..total]);
     w > 0
+}
+
+/// Counters for the module's per-second accounting line: packets
+/// decoded and written to the session, packets held on a refused
+/// proposal edge, frames encoded to clients, frames refused where
+/// nothing retries them.
+pub fn hb_counters(s: &Mqtt) -> (u32, u32, u32, u32) {
+    (
+        s.packets_decoded,
+        s.proposals_held,
+        s.packets_encoded,
+        s.frames_refused,
+    )
 }
 
 /// Fill the component's metric payload. Returns the byte count.

@@ -71,7 +71,16 @@ content_type = "OctetStream"
 [[ports]]
 name = "frames_out"
 direction = "output"
-content_type = "OctetStream"
+# NetProto, not OctetStream: this port carries wire envelopes
+# `[msg_type:u8][len:u16 LE][payload]` and is fanned (a kernel tee or
+# merge sits on it). A fan typed OctetStream moves bytes, so under
+# pressure one producer's frame is split and another's interleaved —
+# a consumer then reads a header off the middle of a payload. NetProto
+# has that framing, and a NetProto fan moves whole frames only.
+content_type = "NetProto"
+# Transaction-class edges: one record per committed entry or
+# response, never a media stream, whatever NetProto defaults to.
+rate_class_default = "transaction"
 
 # Component-tagged samples under the dimensional metric envelope
 # `[dim_flag=1][tenant:u32][protocol:u8][prg:u16][metric_id][payload]`,
@@ -91,3 +100,12 @@ metrics = [
     "unclassified",
     "packets_decoded", "packets_encoded", "parse_errors",
 ]
+
+# Raft leader hints (MSG_LEADER_HINT). Metadata names the current leader
+# as the leader of every partition — exactly true while one Raft group
+# serves them all. Optional: unwired, Metadata answers self, which is
+# the honest answer from the node serving the request.
+[[ports]]
+name = "leader_state"
+direction = "input"
+content_type = "OctetStream"

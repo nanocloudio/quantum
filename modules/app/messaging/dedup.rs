@@ -183,13 +183,26 @@ pub unsafe fn on_check(d: &mut Dedup, sys: &SyscallTable, payload: &[u8], now: u
     // it can throttle the publish while it is still the client's to
     // retry.
     if hit.is_none() && free_slot.is_none() {
-        d.refused = d.refused.wrapping_add(1);
-        let mut r = [0u8; 22];
-        r[..wire::DEDUP_KEY_LEN].copy_from_slice(&payload[..wire::DEDUP_KEY_LEN]);
-        r[20] = DEDUP_VERDICT_REFUSED;
-        r[21] = wire::DEDUP_PHASE_NONE;
-        emit_result(d, sys, &r);
-        return;
+        // Full shard: the entry closest to expiry gives way. A refusal
+        // here is not an admission decision — the caller files
+        // COMMITTED publishes — and with a three-day TTL a refusing
+        // shard answers REFUSED to every message after its first
+        // hundred and twenty-eight, which downstream read as a publish
+        // to drop from fan-out. The dedup window for the evicted key
+        // shortens to however long the shard held it; a retry older
+        // than that lands as a fresh message, which is the
+        // bounded-window trade every dedup table makes.
+        let mut victim = 0usize;
+        let mut earliest = u64::MAX;
+        for (i, e) in d.shards[shard].iter().enumerate() {
+            if e.expiry_ms < earliest {
+                earliest = e.expiry_ms;
+                victim = i;
+            }
+        }
+        d.shards[shard][victim].active = 0;
+        d.evicted = d.evicted.wrapping_add(1);
+        free_slot = Some(victim);
     }
 
     let mut stored_phase = wire::DEDUP_PHASE_NONE;

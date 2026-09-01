@@ -21,7 +21,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench")
+CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench" "tools/core_tests")
 
 # Each crate is formatted BY NAME rather than with `cargo fmt --all`: a
 # future path dependency into `modules/**` would otherwise reformat the PIC
@@ -31,6 +31,11 @@ declare -A PKG=(
   ["tools/telemetry_guard"]="telemetry_guard"
   ["tools/wire_lint"]="wire_lint"
   ["tools/quantum-bench"]="quantum-bench"
+  # Host test bed for `modules/common/cores/*`. The cores are written to
+  # be `include!`d by a host crate as well as by the PIC modules; this is
+  # that crate, and the only place their invariants are exercised —
+  # `fluxor ci` fmt/clippies `modules/**` but runs no test over it.
+  ["tools/core_tests"]="core_tests"
 )
 
 fail=0

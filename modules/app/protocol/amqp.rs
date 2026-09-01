@@ -37,7 +37,8 @@ const RASM: usize = 8192;
 /// Largest accepted frame payload `size`: whole frame (7 + size + 1)
 /// must fit RASM (bound kept one byte conservative).
 const MAX_FSIZE: usize = RASM - 9;
-const ACONNS: usize = 16;
+/// Concurrent AMQP connections per node. See `kafka.rs`'s `KCONNS`.
+const ACONNS: usize = 128;
 /// Frame/scratch buffer size (responses, outbound envelopes).
 const OUT_BUF: usize = 8192;
 /// Per-tick drain quotas. Ingress must outrun the router component's 64

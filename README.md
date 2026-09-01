@@ -6,15 +6,15 @@ AMQP 0-9-1) built as a graph of cooperative modules on the
 Raft substrate. There is no monolithic broker binary: the runtime is
 `fluxor-linux` (or the bare-metal kernel on a Raspberry Pi 5), and
 every operational concern — codecs, session state, dedupe, retained
-store, forwarding, flow control, governance — is a
+store, topic routing, flow control, governance — is a
 position-independent `.fmod` module loaded into that runtime.
 
-A deployed broker graph is 14 modules across six execution domains:
+A deployed broker graph is 13 modules across six execution domains:
 the clustor substrate (`peer_router`, `consensus`, `durability`,
 `gateway`, `admission`, `control_plane`, `operations`) plus quantum's
 application modules (`protocol`, `session_processor`, `topic_engine`,
-`messaging`, `flow`, `forward_coordinator`, `governance`). Graphs
-that want the HTTP diagnostic/admin surface add wave's `http` module
+`messaging`, `flow`, `governance`). Graphs that want the HTTP
+diagnostic/admin surface add wave's `http` module
 (`app` variant) on its own listener; bare-metal deployments add the
 fluxor `tls` foundation module. The full structural reference —
 layers, execution domains, module reference, message graph — is

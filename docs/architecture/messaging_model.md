@@ -23,7 +23,6 @@ sits on top.
 | **stream_id** | Protocol-defined logical stream identifier (MQTT `client_id`, Kafka producer ID, AMQP container ID). |
 | **dedupe entry** | `(tenant_id, stream_id, session_epoch, message_id)` map rejecting duplicates until the dedupe TTL expires. Owned by `messaging`'s dedup component. |
 | **offline queue** | Persistent FIFO storing durable deliveries for disconnected or throttled sessions. Owned by `messaging`'s offline component. |
-| **forward_seq** | Idempotence key for cross-PRG forwarding; monotonically increasing per `(ingress PRG, egress PRG, routing_epoch)` and persisted so replay fences duplicates. Owned by `forward_coordinator`. |
 | **dirty_epoch** | Routing-epoch mismatch condition; adapters map it to protocol-specific outcomes (reject, disconnect, retry). |
 
 ## Default timers
@@ -61,15 +60,12 @@ Persisted by `session_processor` through WAL frames committed via
 ```
 routing_record {
     subject                 // topic / queue / partition
-    subscribers[]
-    forward_seq             // per (ingress, egress, epoch)
+    subscribers[]           // each carrying the owning session's stream_hash
     last_emit_index         // last WAL index emitted by this PRG for this subject
 }
 ```
 
-Owned by `topic_engine` and `forward_coordinator`. `last_emit_index`
-is the floor below which WAL compaction must not truncate forwards
-that haven't been acknowledged by the destination PRG.
+Owned by `topic_engine`.
 
 ### Retained record
 

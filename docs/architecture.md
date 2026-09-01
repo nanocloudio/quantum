@@ -7,11 +7,10 @@ Raft replication substrate. A single process serves MQTT
 acknowledgements, deterministic backpressure, and a uniform on-disk
 format across all three protocols.
 
-A deployed broker graph is **14 modules across six execution
-domains**: the 7-module clustor substrate plus 7 quantum modules —
+A deployed broker graph is **13 modules across six execution
+domains**: the 7-module clustor substrate plus 6 quantum modules —
 protocol codecs and routing, a unified session state machine, topic
-and messaging infrastructure, flow control, cross-PRG forwarding,
-governance. Graphs that want the HTTP diagnostic/admin surface add
+and messaging infrastructure, flow control, governance. Graphs that want the HTTP diagnostic/admin surface add
 wave's `http` module (`app` variant) on its own listener; bare-metal
 deployments add the fluxor `tls` foundation module.
 
@@ -31,7 +30,7 @@ Three layers compose into one process:
 |-------|-------------|----------------|
 | Foundation | fluxor | TCP/UDP transport (`linux_net` / `ip`), TLS 1.3 (`tls`), QUIC (`quic`), the module SDK/ABI, and the cooperative scheduler |
 | Substrate | clustor | Raft consensus and replication, the WAL, durability proofs and snapshotting, admission control, the control-plane bridge, the admin surface — 7 modules |
-| Application | quantum | Protocol codecs, session state, topic routing, messaging infrastructure, flow control, forwarding, governance — 7 modules |
+| Application | quantum | Protocol codecs, session state, topic routing, messaging infrastructure, flow control, governance — 6 modules |
 
 Every module exposes a `step()` function the scheduler calls on a
 fixed tick (or in poll-mode). Modules never share memory or call each
@@ -62,7 +61,7 @@ genuine domain boundaries.
 |--------|-------------|---------|---------|
 | `network` | poll-mode | `linux_net` / `ip`, `tls`, `peer_router` | Transport I/O, TLS termination, peer and client demux |
 | `consensus` | poll-mode | `consensus`, `durability` | Raft FSM, replication, commit and apply ordering, persistence; `durability` fsyncs inline |
-| `apply` | 250µs | `gateway`, `admission`, `session_processor`, `flow`, `forward_coordinator` | Request admission, response framing, the session state machine |
+| `apply` | 250µs | `gateway`, `admission`, `session_processor`, `flow` | Request admission, response framing, the session state machine |
 | `ingest` | 500µs | `protocol` (router, mqtt, kafka, amqp), `topic_engine` | Protocol parsing/framing and subscription matching |
 | `messaging` | 250µs | `messaging` | Store-and-forward state |
 | `ops` | 1ms | `control_plane`, `operations`, `governance` | Control plane, governance, admin, observability |
@@ -120,8 +119,8 @@ across partitions.
 
 These modules implement the broker. They plug into the substrate via
 `consensus` and extend the graph with protocol routing, codecs,
-session management, messaging infrastructure, flow control,
-forwarding, and governance.
+session management, messaging infrastructure, flow control, and
+governance.
 
 #### Protocol routing and codecs
 
@@ -174,19 +173,13 @@ leader. That seam is specified in
 
 | Module | Domain | Description |
 |--------|--------|-------------|
-| `topic_engine` | ingest | Subscription matching and publish-time fan-out. MQTT wildcards (`+`, `#`), shared-subscription distribution by stable hash modulo group size, cross-PRG forward emission with a `forward_seq` idempotence key. |
+| `topic_engine` | ingest | Subscription matching and publish-time fan-out. MQTT wildcards (`+`, `#`), shared-subscription distribution by stable hash modulo group size, and delivery filtered on session locality so exactly the node holding a subscriber's session writes to it. |
 
 #### Messaging infrastructure
 
 | Module | Domain | Description |
 |--------|--------|-------------|
 | `messaging` | messaging | Composite of three components sharing one request bus (`op_in`) and one reply bus (`result_out`), demuxed by frame type. **dedup** — session-scoped deduplication (16-shard map, 72h TTL, periodic GC); QoS 2 four-phase state for MQTT. **offline** — persistent FIFO for disconnected sessions, drain-on-reconnect in sequence order. **retained** — retained-message storage, topic-indexed and wildcard-matched for new-subscription delivery; payloads are stored inline. Each component emits telemetry under its own metric identity. |
-
-#### Cross-PRG forwarding
-
-| Module | Domain | Description |
-|--------|--------|-------------|
-| `forward_coordinator` | apply | Cross-PRG forwarding with `forward_seq` idempotence, tracking `(ingress_prg, egress_prg, routing_epoch) → monotone_seq` persisted in PRG state for the WAL replay fence. Same-node forwards use intra-domain channels; cross-node forwards emit routed envelopes to `peer_router`. |
 
 #### Governance
 
@@ -228,7 +221,7 @@ ip ↔ tls → peer_router ──→ protocol { router → mqtt | kafka | amqp }
      ↓
    session_processor (apply loop)
      ↓
-   topic_engine → forward_coordinator → peer_router (cross-node)
+   topic_engine (match + deliver where the session lives)
      ↓
    messaging (dedup / offline / retained)
 ```
@@ -262,7 +255,6 @@ graph TB
         flow["flow<br/><i>ack · backpressure · prefetch</i>"]
         admission["admission<br/><i>proof cache,<br/>PID credits</i>"]
         gateway["gateway<br/><i>credit-gated admission</i>"]
-        forward_coordinator["forward_coordinator<br/><i>cross-PRG forward</i>"]
     end
 
     subgraph core0_msg["Core 0 — Ops + Messaging (1ms / 250µs)"]
@@ -294,11 +286,8 @@ graph TB
     session_processor ==>|"dedup / offline / retained"| messaging
     messaging ==>|"result / drain / read"| session_processor
 
-    %% Topic engine → forwarding
+    %% Topic engine → delivery
     topic_engine -->|deliver| session_processor
-    topic_engine -->|forward| forward_coordinator
-    forward_coordinator ==>|local| consensus
-    forward_coordinator ==>|remote| peer_router
 
     %% Persistence
     consensus -->|"log append"| durability

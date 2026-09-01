@@ -33,7 +33,17 @@ use super::{
 pub struct Store {
     pub parts: [KPart; KSTORE_PARTS],
     pub inflight: [KafkaInflight; KAFKA_INFLIGHT],
+    /// Response bodies parked until a slot's proposals are durable.
+    ///
+    /// Kept beside the inflight table rather than inside it: only the
+    /// deferred-response protocols use one, and widening every entry by
+    /// `KIN_RESP_MAX` would cost the produce path memory it never
+    /// touches.
+    resp: [[u8; KIN_RESP_MAX]; KAFKA_INFLIGHT],
+    resp_len: [u16; KAFKA_INFLIGHT],
     pub evictions: u32,
+    /// Records dropped by key compaction.
+    pub compacted: u32,
     pub full: u32,
     pub batches_applied: u32,
 }
@@ -79,6 +89,7 @@ pub fn inflight_open(s: &mut Store, ki: usize, o: InflightOpen, topic: &[u8]) {
     e.topic_len = o.topic_len;
     e.n_parts = o.n_parts;
     e.n_done = o.n_done;
+    e.n_applied = 0;
     e.api_ver = o.api_ver;
     e.acks = o.acks;
     e.kafka_corr = o.kafka_corr;
@@ -120,6 +131,9 @@ pub fn inflight_valid(s: &Store, ki: usize, epoch: u32) -> bool {
 pub fn inflight_free(s: &mut Store, ki: usize) {
     if ki < KAFKA_INFLIGHT {
         s.inflight[ki].active = 0;
+        // Drop any parked response with the slot: a stale body left
+        // behind would be emitted by whichever request reuses the slot.
+        s.resp_len[ki] = 0;
     }
 }
 
@@ -131,12 +145,48 @@ pub fn inflight_proto(s: &Store, ki: usize) -> u8 {
     }
 }
 
-/// Record the assigned WAL index for one partition of a multi-partition
-/// produce.
+/// Record the assigned LOGICAL offset for one partition of a
+/// multi-partition produce — the offset a consumer will fetch this data
+/// at, decided on the apply side.
 pub fn inflight_set_part_offset(s: &mut Store, ki: usize, pidx: usize, offset: i64) {
     if ki < KAFKA_INFLIGHT && pidx < KIN_MAX_PARTS {
         s.inflight[ki].part_offs[pidx] = offset;
     }
+}
+
+/// Record a per-partition error decided on the apply side (an
+/// idempotence verdict), without disturbing the partition id seeded at
+/// propose time.
+pub fn inflight_set_part_err(s: &mut Store, ki: usize, pidx: usize, err: i16) {
+    if ki < KAFKA_INFLIGHT && pidx < KIN_MAX_PARTS {
+        s.inflight[ki].part_errs[pidx] = err;
+    }
+}
+
+/// Largest deferred response body a slot can hold.
+///
+/// An OffsetCommit response is small — per topic a name plus a count,
+/// per partition six bytes — so 512 covers the shapes real consumers
+/// send. A response that does not fit is answered immediately instead
+/// of being gated, and counted, rather than silently truncated.
+pub const KIN_RESP_MAX: usize = 512;
+
+/// Park a response body until the slot's proposals are durable.
+pub fn inflight_set_response(s: &mut Store, ki: usize, body: &[u8]) -> bool {
+    if ki >= KAFKA_INFLIGHT || body.len() > KIN_RESP_MAX {
+        return false;
+    }
+    s.resp[ki][..body.len()].copy_from_slice(body);
+    s.resp_len[ki] = body.len() as u16;
+    true
+}
+
+/// The parked response body, if any.
+pub fn inflight_response(s: &Store, ki: usize) -> &[u8] {
+    if ki >= KAFKA_INFLIGHT {
+        return &[];
+    }
+    &s.resp[ki][..s.resp_len[ki] as usize]
 }
 
 /// Count one partition as durable. Returns true once every partition in
@@ -149,6 +199,29 @@ pub fn inflight_complete_part(s: &mut Store, ki: usize) -> bool {
         s.inflight[ki].n_done += 1;
     }
     s.inflight[ki].n_done >= s.inflight[ki].n_parts
+}
+
+/// Mark one partition of a produce APPLIED — its logical offset (or its
+/// idempotence verdict) is now known.
+///
+/// Durability and apply are independent post-commit signals with no
+/// ordering between them, and the ack routinely arrives FIRST. A
+/// response released on durability alone therefore reports an offset
+/// apply had not yet assigned. Counting both is what lets the response
+/// carry the real one.
+pub fn inflight_apply_part(s: &mut Store, ki: usize) {
+    if ki < KAFKA_INFLIGHT && s.inflight[ki].n_applied < s.inflight[ki].n_parts {
+        s.inflight[ki].n_applied += 1;
+    }
+}
+
+/// True when every partition of this produce is BOTH quorum-durable and
+/// applied — the point at which the response is both safe and complete.
+pub fn inflight_ready(s: &Store, ki: usize) -> bool {
+    ki < KAFKA_INFLIGHT
+        && s.inflight[ki].active == 1
+        && s.inflight[ki].n_done >= s.inflight[ki].n_parts
+        && s.inflight[ki].n_applied >= s.inflight[ki].n_parts
 }
 
 /// True when slot `i` is live and older than `timeout_ms`. The caller
@@ -260,6 +333,67 @@ pub fn next_offset(s: &Store, pi: usize) -> u64 {
     }
 }
 
+/// Oldest offset that still logically exists — the floor a cold read
+/// must not go below. Distinct from `log_start`, which is only the
+/// ring's tail.
+#[cfg(feature = "kafka")]
+pub fn retention_floor(s: &Store, pi: usize) -> u64 {
+    if pi >= KSTORE_PARTS || s.parts[pi].active == 0 {
+        return 0;
+    }
+    s.parts[pi].retention_floor
+}
+
+/// The lowest index of raft partition `partition` this store still
+/// needs, or `None` when it needs nothing from that log (no active
+/// Kafka partition, or none of them holds an anchor there).
+///
+/// A record below `retention_floor` has been deleted by POLICY and will
+/// never be served again, so the entry that carried it is expendable.
+/// One below the oldest still-needed index is therefore the highest
+/// index it is safe to compact that log at.
+///
+/// Per raft partition, because raft indexes are per-log: a floor that
+/// mixed two logs' indexes would retire live segments in one of them.
+#[cfg(feature = "kafka")]
+pub fn oldest_needed_raft_index(s: &Store, partition: u16) -> Option<u64> {
+    let mut lowest: Option<u64> = None;
+    for pi in 0..KSTORE_PARTS {
+        if s.parts[pi].active == 0 {
+            continue;
+        }
+        // Seek the FLOOR, not the log start: `log_start` also advances
+        // on capacity eviction, and a record evicted from the RAM ring
+        // is still served from the WAL by a cold read. Compacting to
+        // the ring's tail would delete exactly what the cold-read path
+        // exists to fetch.
+        let needed = s.parts[pi]
+            .offset_index
+            .needed_from(s.parts[pi].retention_floor, partition);
+        let idx = match needed {
+            // No anchor covers it — cannot prove anything is expendable,
+            // so claim everything. Fail closed: a floor guessed too high
+            // deletes entries a consumer can still ask for.
+            Err(()) => return Some(0),
+            Ok(None) => continue,
+            Ok(Some(idx)) => idx,
+        };
+        lowest = Some(match lowest {
+            Some(cur) if cur <= idx => cur,
+            _ => idx,
+        });
+    }
+    lowest
+}
+
+/// Every raft partition the store's anchors name, as a bitmap.
+#[cfg(feature = "kafka")]
+pub fn raft_partitions_seen(s: &Store) -> u64 {
+    (0..KSTORE_PARTS)
+        .filter(|&pi| s.parts[pi].active != 0)
+        .fold(0u64, |m, pi| m | s.parts[pi].offset_index.partitions_seen())
+}
+
 pub fn log_start(s: &Store, pi: usize) -> u64 {
     if pi < KSTORE_PARTS {
         s.parts[pi].log_start
@@ -294,6 +428,7 @@ pub fn init(s: &mut Store) {
         *e = KafkaInflight::zero();
     }
     s.evictions = 0;
+    s.compacted = 0;
     s.full = 0;
     s.batches_applied = 0;
 }
@@ -354,6 +489,9 @@ pub struct KafkaInflight {
     pub part_ids: [i32; KIN_MAX_PARTS],
     pub part_offs: [i64; KIN_MAX_PARTS],
     pub part_errs: [i16; KIN_MAX_PARTS],
+    /// Partitions whose apply has landed. Paired with `n_done`
+    /// (durability) — see `inflight_ready`.
+    pub n_applied: u8,
     pub topic: [u8; KAFKA_MAX_TOPIC],
 }
 
@@ -376,6 +514,7 @@ impl KafkaInflight {
             part_ids: [0; KIN_MAX_PARTS],
             part_offs: [-1; KIN_MAX_PARTS],
             part_errs: [0; KIN_MAX_PARTS],
+            n_applied: 0,
             topic: [0; KAFKA_MAX_TOPIC],
         }
     }
@@ -388,8 +527,22 @@ pub struct KPart {
     pub partition: u16,
     /// High watermark: next logical offset to assign.
     pub next_offset: u64,
-    /// Oldest offset still resident in the ring.
+    /// Oldest offset still resident in the ring. Advances on EVERY
+    /// eviction, including the capacity eviction `push` does when the
+    /// ring fills.
     pub log_start: u64,
+    /// Oldest offset that still logically EXISTS. Advances only when a
+    /// POLICY deletes records — time retention or key compaction —
+    /// never on capacity eviction.
+    ///
+    /// The distinction is what keeps retention honest now that cold
+    /// reads exist. Both cases put an offset below `log_start`, but they
+    /// mean opposite things: a record evicted for capacity is still on
+    /// disk and may be served from the WAL, while a record deleted by
+    /// policy must NOT be — a broker that promises deletion and then
+    /// serves the data has not deleted it. Cold reads are therefore
+    /// bounded below by this, not by `log_start`.
+    pub retention_floor: u64,
     /// AMQP Basic.Get consumption cursor (queue semantics over the log;
     /// single-consumer v1 — each Get pops the next raw entry).
     pub get_cursor: u64,
@@ -400,6 +553,11 @@ pub struct KPart {
     /// Bytes currently used (0 == empty; disambiguates head == tail).
     pub used: u32,
     topic: [u8; KAFKA_MAX_TOPIC],
+    /// Sparse Kafka-offset -> raft-index anchors, so a Fetch for an
+    /// offset that has aged out of the ring can still be located in the
+    /// WAL. The ring is a cache of the raft log, not the log itself.
+    #[cfg(feature = "kafka")]
+    pub offset_index: super::kafka_log::OffsetIndex,
     pub ring: [u8; KSTORE_BYTES],
 }
 
@@ -409,8 +567,11 @@ impl KPart {
             active: 0,
             topic_len: 0,
             partition: 0,
+            #[cfg(feature = "kafka")]
+            offset_index: super::kafka_log::OffsetIndex::new(),
             next_offset: 0,
             log_start: 0,
+            retention_floor: 0,
             get_cursor: 0,
             head: 0,
             tail: 0,
@@ -447,7 +608,12 @@ pub fn find_or_create(s: &mut Store, topic: &[u8], partition: u16) -> Option<usi
             p.topic[..topic.len()].copy_from_slice(topic);
             p.next_offset = 0;
             p.log_start = 0;
+            p.retention_floor = 0;
             p.get_cursor = 0;
+            #[cfg(feature = "kafka")]
+            {
+                p.offset_index = super::kafka_log::OffsetIndex::new();
+            }
             p.head = 0;
             p.tail = 0;
             p.used = 0;
@@ -490,10 +656,286 @@ pub fn entry_at(p: &KPart, mut pos: u32) -> (u32, u16, u8, u64, u32) {
     (pos + KENTRY_HDR as u32, len, flags, offset, nrec)
 }
 
+/// The broker-clock append time of the entry at `pos`.
+pub fn entry_appended_ms(p: &KPart, pos: u32) -> u64 {
+    let (data_pos, _, _, _, _) = entry_at(p, pos);
+    let h = data_pos as usize - KENTRY_HDR + 15;
+    u64::from_le_bytes([
+        p.ring[h],
+        p.ring[h + 1],
+        p.ring[h + 2],
+        p.ring[h + 3],
+        p.ring[h + 4],
+        p.ring[h + 5],
+        p.ring[h + 6],
+        p.ring[h + 7],
+    ])
+}
+
 /// Position immediately after the entry starting at `pos` (post-wrap-resolve).
 pub fn entry_end(p: &KPart, pos: u32) -> u32 {
     let (data_pos, len, _, _, _) = entry_at(p, pos);
     data_pos + len as u32
+}
+
+/// Drop entries from the tail that have aged past `retention_ms`, up to
+/// `budget` per call. Returns how many went.
+///
+/// Time retention, as distinct from the capacity eviction `push`
+/// already does when the ring fills. Without it the only retention
+/// policy is "until RAM runs out", so a low-rate topic keeps records
+/// for ever and a high-rate one silently keeps minutes — the retention
+/// a deployment gets depends on its traffic rather than on what it
+/// asked for.
+///
+/// Walks from the TAIL and stops at the first entry still inside the
+/// window: the log is offset-ordered, so an entry newer than the window
+/// means every entry after it is too. That also keeps this O(evicted)
+/// rather than O(ring) on the common tick where nothing expires.
+///
+/// The timestamp is read from the stored RecordBatch itself
+/// (`batch_first_timestamp`), so the ring's own entry header is
+/// unchanged — a format change here would invalidate every WAL that
+/// already exists.
+///
+/// `budget` bounds the work per call: expiring a whole partition in one
+/// tick would be an unbounded memmove inside a step that everything
+/// else is waiting on.
+/// How many offsets apart the WAL anchors are. 64 anchors at this
+/// spacing span 32k offsets per partition — comfortably more than the
+/// ring holds, which is the point: the index has to outlive the cache
+/// it backstops.
+#[cfg(feature = "kafka")]
+pub const OFFSET_ANCHOR_INTERVAL: u64 = 512;
+
+/// Record that `offset` in partition `pi` was carried by raft entry
+/// `raft_index` of raft partition `raft_partition`. Cheap and
+/// unconditional — the index anchors sparsely and ignores the rest.
+#[cfg(feature = "kafka")]
+pub fn note_offset_anchor(
+    s: &mut Store,
+    pi: usize,
+    offset: u64,
+    raft_index: u64,
+    raft_partition: u16,
+) {
+    if pi >= KSTORE_PARTS || s.parts[pi].active == 0 || raft_index == 0 {
+        return;
+    }
+    s.parts[pi].offset_index.note_append(
+        offset,
+        raft_index,
+        raft_partition,
+        OFFSET_ANCHOR_INTERVAL,
+    );
+}
+
+/// The raft `(partition, index)` to start reading from to reach
+/// `offset` in partition `pi`, or `None` when this index cannot locate
+/// it.
+#[cfg(feature = "kafka")]
+pub fn seek_offset(s: &Store, pi: usize, offset: u64) -> Option<(u16, u64)> {
+    if pi >= KSTORE_PARTS || s.parts[pi].active == 0 {
+        return None;
+    }
+    s.parts[pi].offset_index.seek(offset)
+}
+
+/// Apply time retention to one partition slot. No-op for an inactive
+/// slot, so the caller can sweep the whole table without first asking
+/// which slots are live.
+#[cfg(feature = "kafka")]
+pub fn expire_partition(
+    s: &mut Store,
+    pi: usize,
+    now_ms: u64,
+    retention_ms: u64,
+    budget: u32,
+) -> u32 {
+    if pi >= KSTORE_PARTS || s.parts[pi].active == 0 {
+        return 0;
+    }
+    let n = expire_tail(&mut s.parts[pi], now_ms, retention_ms, budget);
+    s.evictions = s.evictions.wrapping_add(n);
+    n
+}
+
+#[cfg(feature = "kafka")]
+fn expire_tail(p: &mut KPart, now_ms: u64, retention_ms: u64, budget: u32) -> u32 {
+    if retention_ms == 0 {
+        return 0;
+    }
+    let mut dropped = 0u32;
+    while dropped < budget && p.used > 0 {
+        let age = super::kafka_log::entry_age_ms(entry_appended_ms(p, p.tail), now_ms);
+        if !super::kafka_log::retention_expired(age, retention_ms) {
+            break;
+        }
+        evict_tail(p);
+        p.retention_floor = p.log_start;
+        dropped += 1;
+    }
+    dropped
+}
+
+/// Batches examined by one compaction sweep. Bounds both the walk and
+/// the key-descriptor table below.
+#[cfg(feature = "kafka")]
+const COMPACT_SCAN: usize = 32;
+
+/// Drop tail batches whose single keyed record has been superseded by a
+/// later record with the same key. Returns how many went.
+///
+/// ## What this does and does not do
+///
+/// Kafka compacts by REWRITING segments, dropping individual superseded
+/// records from inside a batch. That needs a batch rewriter — new CRC,
+/// re-encoded record set — and this store is a byte RING that can only
+/// evict from the tail. Rewriting a batch in place is not something the
+/// structure supports, and building a rewriter here would reinvent
+/// segment compaction one layer up from a data structure that cannot
+/// hold the result.
+///
+/// So this compacts at BATCH granularity, and only for batches carrying
+/// exactly ONE keyed record:
+///
+/// - a multi-record batch is never dropped (its records may not all be
+///   superseded, and dropping the batch would take live records with
+///   it);
+/// - a record with a NULL key is never superseded — a keyless record
+///   has no identity for a later one to replace;
+/// - only a CONTIGUOUS run at the tail can go, because that is the only
+///   thing a ring can evict.
+///
+/// That last constraint sounds severe and mostly is not: when the same
+/// keys are rewritten over time, the OLDEST records are exactly the ones
+/// that have been superseded, so the droppable run tends to sit at the
+/// tail where the ring can reach it.
+///
+/// Supersession is decided by EXACT key comparison, never by hash. A
+/// hash collision here would drop a live record — silent data loss —
+/// and no collision probability is small enough to trade for that when
+/// the exact comparison is a byte-range compare the ring can already do.
+#[cfg(feature = "kafka")]
+pub fn compact_partition(s: &mut Store, pi: usize, budget: u32) -> u32 {
+    if pi >= KSTORE_PARTS || s.parts[pi].active == 0 || s.parts[pi].used == 0 {
+        return 0;
+    }
+    // (key ring position, key length) per scanned batch; `None` when the
+    // batch is not a single-keyed-record batch and so is never
+    // droppable.
+    let mut keys: [Option<(u32, u16)>; COMPACT_SCAN] = [None; COMPACT_SCAN];
+    let mut n = 0usize;
+
+    {
+        let p = &s.parts[pi];
+        let mut pos = p.tail;
+        // Bounded by COMPACT_SCAN and terminated by reaching the head.
+        // Deliberately NOT bounded by a running byte count: `entry_at`
+        // resolves a `KWRAP` sentinel by restarting at 0, so `end - pos`
+        // goes negative across a wrap and a saturating byte counter
+        // silently stops advancing. The entry count is the honest bound.
+        while n < COMPACT_SCAN {
+            let (data_pos, len, flags, _, _) = entry_at(p, pos);
+            let end = data_pos as usize + len as usize;
+            if end > p.ring.len() {
+                break;
+            }
+            if flags & KFLAG_BATCH != 0 {
+                keys[n] = single_record_key(p, data_pos, len);
+            }
+            n += 1;
+            let next = entry_end(p, pos);
+            pos = if next >= KSTORE_BYTES as u32 { 0 } else { next };
+            if pos == p.head {
+                break;
+            }
+        }
+    }
+
+    // The decision — which batches are superseded, and how many of them
+    // the tail can actually reach — lives in the shared core, where it
+    // is host-tested. It is the half of compaction that can destroy
+    // live data, so it does not live inside this ring walk.
+    let mut droppable = [false; COMPACT_SCAN];
+    {
+        let part = &s.parts[pi];
+        super::kafka_log::mark_droppable(
+            n,
+            |i| keys[i].is_some(),
+            |i, j| match (keys[i], keys[j]) {
+                (Some((ap, al)), Some((bp, bl))) => al == bl && keys_equal(part, ap, bp, al),
+                _ => false,
+            },
+            &mut droppable,
+        );
+    }
+    let take = super::kafka_log::droppable_prefix(&droppable, n, budget);
+    for _ in 0..take {
+        evict_tail(&mut s.parts[pi]);
+        // Compaction is a policy deletion too: the superseded record is
+        // gone for good, not merely out of the ring.
+        s.parts[pi].retention_floor = s.parts[pi].log_start;
+        s.compacted = s.compacted.wrapping_add(1);
+    }
+    take
+}
+
+/// The key of a batch carrying exactly one keyed record, as a
+/// `(ring position, length)` into the ring. `None` for anything else —
+/// a multi-record batch, a null key, a tombstone, or a malformed batch.
+///
+/// Tombstones are excluded deliberately: a delete marker must outlive
+/// the records it deletes, so dropping one because a later record
+/// shares its key would resurrect the deleted value.
+#[cfg(feature = "kafka")]
+fn single_record_key(p: &KPart, data_pos: u32, len: u16) -> Option<(u32, u16)> {
+    let d = data_pos as usize;
+    let end = d + len as usize;
+    if end > p.ring.len() {
+        return None;
+    }
+    let body = &p.ring[d..end];
+    if super::kafka_log::batch_record_count(body) != Some(1) {
+        return None;
+    }
+    let mut found: Option<(u32, u16)> = None;
+    let mut ok_single = true;
+    let walked = super::kafka_log::for_each_record_key(body, |k, tomb| match k {
+        Some(k) if !tomb => {
+            // Offset of `k` within `body`, translated to a ring position.
+            let off = (k.as_ptr() as usize) - (body.as_ptr() as usize);
+            found = Some((data_pos + off as u32, k.len() as u16));
+        }
+        _ => ok_single = false,
+    });
+    if !walked || !ok_single {
+        return None;
+    }
+    found
+}
+
+/// Exact byte comparison of two keys held in the ring.
+///
+/// Byte by byte through the modulo rather than by slicing. `push`
+/// RELOCATES an entry that will not fit contiguously — it writes a
+/// `KWRAP` sentinel over the dead tail and restarts at 0 — so an entry
+/// never straddles the end and a slice would in fact be correct today.
+/// The modulo is cheap insurance against that invariant being relaxed
+/// later, not a fix for a wrap that currently happens: if `push` ever
+/// learns to split an entry, a slicing comparison here would silently
+/// compare the wrong bytes and compaction would drop live records.
+#[cfg(feature = "kafka")]
+fn keys_equal(p: &KPart, a: u32, b: u32, len: u16) -> bool {
+    let cap = KSTORE_BYTES as u32;
+    for i in 0..len as u32 {
+        let ai = ((a + i) % cap) as usize;
+        let bi = ((b + i) % cap) as usize;
+        if p.ring[ai] != p.ring[bi] {
+            return false;
+        }
+    }
+    true
 }
 
 /// Evict the oldest entry; updates tail/used/log_start.
@@ -539,6 +981,7 @@ pub fn push(
     flags: u8,
     nrec: u32,
     data: &[u8],
+    appended_ms: u64,
 ) -> Option<(u64, usize)> {
     let need = (KENTRY_HDR + data.len()) as u32;
     let cap = KSTORE_BYTES as u32;
@@ -577,6 +1020,7 @@ pub fn push(
     p.ring[b + 2] = flags;
     p.ring[b + 3..b + 11].copy_from_slice(&offset.to_le_bytes());
     p.ring[b + 11..b + 15].copy_from_slice(&nrec.to_le_bytes());
+    p.ring[b + 15..b + 23].copy_from_slice(&appended_ms.to_le_bytes());
     p.ring[b + KENTRY_HDR..b + KENTRY_HDR + data.len()].copy_from_slice(data);
     if p.used == 0 {
         p.tail = p.head;

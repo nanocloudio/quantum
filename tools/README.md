@@ -28,6 +28,6 @@ root workspace, so each inlines the shared lint baseline directly.
 
 | Crate | What it does |
 | --- | --- |
-| `quantum-bench` | Off-DUT drivers: `quantum-kafka-loadgen`, `quantum-mqtt-loadgen` (open-loop, driving the real codec path) and `quantum-scrape` (binary `/metrics` → JSON baseline record). Std-only, no dependencies, so it builds on an offline Pi |
+| `quantum-bench` | Off-DUT drivers: `quantum-kafka-loadgen`, `quantum-mqtt-loadgen` (driving the real codec path; closed loop per connection by default, `--inflight N` opens it so QoS 1 throughput is set by the offered rate rather than the ack round trip) and `quantum-scrape` (binary `/metrics` → JSON baseline record). Std-only, no dependencies, so it builds on an offline Pi |
 | `telemetry_guard` | Structure-checks telemetry catalog JSON (`--catalog <path>`): a top-level object with optional `metrics` / `traces` / `logs` arrays |
 | `wire_lint` | SHA-256 compares a wire catalog against the artefact it mirrors (`--expected` / `--candidate`), catching drift in shared frame definitions |

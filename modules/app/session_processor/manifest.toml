@@ -34,28 +34,37 @@ name = "amqp"
 features = ["mqtt", "amqp"]
 
 # Port reduction: session_processor uses message-type multiplexing to stay
-# within the 8-port-per-direction Fluxor limit. Related signals share channels
+# within the 16-port-per-direction Fluxor limit
+# (`fluxor/src/kernel/exec/scheduler/static_storage.rs::MAX_PORTS`, which
+# is per direction, not total). Related signals share channels
 # and are demuxed by MSG_* type bytes.
 #
-# Inputs (8):
+# The index is the ABI — a graph binds a port by position — so a port is
+# only ever appended, never inserted or reordered.
+#
+# Inputs (9):
 #   [0] codec_in         — MQTT/Kafka/AMQP proposals (demux by PROTO_* byte)
 #   [1] committed_in     — applied entries from consensus
 #   [2] flow_in          — PID credits + backpressure + prefetch (demux by msg_type)
 #   [3] ack_in           — ACK emit + redeliver from `flow::ack`
-#   [4] cp_in            — capabilities + epoch events + disconnect (demux)
+#   [4] cp_in            — capabilities + placement + epoch events + disconnect (demux)
 #   [5] messaging_in     — dedup result + offline drain + retained read + group assign + txn result
 #   [6] deliver_in       — topic deliveries from topic_engine
 #   [7] assigned_in      — MSG_PROPOSAL_ASSIGNED from consensus (correlation_id → wal_index)
+#   [8] wal_reply        — WAL records answering a cold Kafka Fetch
 #
-# Outputs (8):
+# Outputs (11):
 #   [0] proposals         — untagged proposals to consensus (CONNECT/DISCONNECT/etc)
 #   [1] codec_out         — responses to codecs (tag by PROTO_*)
 #   [2] topic_out         — publish + subscribe + unsubscribe to topic_engine
 #   [3] messaging_out     — dedup check + offline enqueue + retained write + group op + txn op
-#   [4] forward_out       — forward requests + inflight register
+#   [4] forward_out       — inflight register + lag signal to `flow`
 #   [5] audit_out         — audit events
 #   [6] metrics_out       — metrics
 #   [7] proposals_tagged  — tagged proposals (correlation_id-prefixed) for QoS 1+ PUBLISH
+#   [8] wal_request       — cold-read request for a Kafka Fetch
+#   [9] retention_floor   — lowest raft index this broker still needs
+#   [10] cp_out           — committed entries belonging to the control plane
 
 [[ports]]
 name = "codec_in"
@@ -65,7 +74,16 @@ content_type = "OctetStream"
 [[ports]]
 name = "committed_in"
 direction = "input"
-content_type = "OctetStream"
+# NetProto, not OctetStream: this port carries wire envelopes
+# `[msg_type:u8][len:u16 LE][payload]` and is fanned (a kernel tee or
+# merge sits on it). A fan typed OctetStream moves bytes, so under
+# pressure one producer's frame is split and another's interleaved —
+# a consumer then reads a header off the middle of a payload. NetProto
+# has that framing, and a NetProto fan moves whole frames only.
+content_type = "NetProto"
+# Transaction-class edges: one record per committed entry or
+# response, never a media stream, whatever NetProto defaults to.
+rate_class_default = "transaction"
 
 [[ports]]
 name = "flow_in"
@@ -149,3 +167,49 @@ metrics = [
     "acks_stale_epoch",
     "correlations_overdue",
 ]
+
+# Cold-read path for Kafka Fetch. A consumer whose offset has aged out
+# of the in-memory ring is served FROM THE WAL rather than refused: the
+# Kafka log IS the raft log, so the record is still durable — what was
+# missing was the way back from a Kafka offset to a raft index.
+[[ports]]
+name = "wal_request"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "wal_reply"
+direction = "input"
+content_type = "OctetStream"
+
+# `MSG_COMPACTION_FLOOR` to `durability.retention_floor`: the lowest raft
+# index this broker still needs, so the WAL is not compacted out from
+# under a Kafka consumer.
+#
+# Kafka retention and raft compaction are two lifetimes over ONE set of
+# bytes — the Kafka log IS the raft WAL — and compaction is driven by
+# snapshots, which know nothing about retention. Without this a snapshot
+# can retire segments a consumer inside its retention window can still
+# ask for, and the cold-read path then has nothing to read.
+#
+[[ports]]
+name = "retention_floor"
+direction = "output"
+content_type = "OctetStream"
+
+# Control-plane records. Every committed entry reaches this
+# module (it owns the apply cursor for the node), and the ones that are
+# not Quantum operations — epoch and migration records, admin and
+# config entries — are re-emitted here verbatim as MSG_COMMITTED_ENTRY
+# for `control_plane`. This is the ONLY way the control plane sees the
+# log: a kernel tee on `consensus.committed_entries` feeding both
+# consumers lost entries under a connect burst at K=64, and a missing
+# entry reads downstream as a snapshot install, which wipes every
+# session on the node. One consumer per stream, forwarded by the module
+# that reads it.
+[[ports]]
+name = "cp_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 2067

@@ -22,7 +22,22 @@ const RASM: usize = 8192;
 /// the session envelope (10 bytes) + conn_id + tagged-proposal (18
 /// bytes) + wire envelope (3 bytes) downstream of the 8 KiB channel cap.
 const MAX_KREQ: usize = 8100;
-const KCONNS: usize = 32;
+/// Concurrent Kafka connections per node.
+///
+/// Each slot carries an 8 KiB reassembly buffer for its whole life —
+/// a Kafka connection is long-lived and effectively always mid-stream —
+/// so this is `KCONNS * RASM` of resident state (256 -> 2 MiB), paid
+/// whether or not the connections exist.
+///
+/// That is why this stays a static array rather than moving to the
+/// per-module heap: `heap_alloc`'s arena is reserved from STATE_ARENA
+/// at instantiation, so a heap of the same worst-case size costs the
+/// same. The heap wins only where a buffer's lifetime is SHORTER than
+/// its slot's (wave's websocket fragments; clustor's pending-apply
+/// entries), which is not the case here.
+///
+/// Raising this further is a memory decision, not a code change.
+const KCONNS: usize = 256;
 /// Frame/scratch buffer size (responses, outbound envelopes).
 const OUT_BUF: usize = 8192;
 /// Per-tick drain quotas. Ingress must outrun the router component's 64
@@ -86,6 +101,23 @@ pub struct Kafka {
     unsupported_dropped: u32,
     /// InitProducerId issuance counter (monotonic; broker-local).
     next_producer_id: u64,
+    /// This node's id (param 4), forming the high bits of issued
+    /// producer ids so two nodes cannot hand out the same one.
+    pub node_id: u16,
+    /// Cluster size and per-node client ports, for Metadata.
+    pub peer_count: u8,
+    pub peer_ports: [u16; super::kafka_metadata::MAX_BROKERS],
+    /// Per-node advertised host. A peer with no host configured falls
+    /// back to this node's, which is right only when peers share an
+    /// address (co-located). Advertising a WRONG host is worse than
+    /// advertising one broker — a client would connect somewhere that
+    /// does not serve the partition — so each peer gets its own.
+    pub peer_hosts: [[u8; MAX_HOST_LEN]; super::kafka_metadata::MAX_BROKERS],
+    pub peer_host_lens: [u8; super::kafka_metadata::MAX_BROKERS],
+    /// in: `MSG_LEADER_HINT`. `-1` when unwired.
+    pub in_leader_state: i32,
+    /// Believed raft leader, `HINT_UNKNOWN` until the first hint.
+    pub leader_hint: u8,
 
     topics_seen: [[u8; MAX_TOPIC_LEN]; MAX_TOPICS_SEEN],
     topics_seen_len: [u8; MAX_TOPICS_SEEN],
@@ -104,6 +136,18 @@ pub struct Kafka {
 /// # Safety
 ///
 /// `d` must be valid for `len` reads (the param-macro contract).
+/// Record peer `i`'s advertised host.
+///
+/// # Safety
+/// `d` must point to `len` readable bytes, or be null.
+pub unsafe fn set_peer_host(s: &mut Kafka, i: usize, d: *const u8, len: usize) {
+    if i >= super::kafka_metadata::MAX_BROKERS || d.is_null() || len == 0 || len > MAX_HOST_LEN {
+        return;
+    }
+    core::ptr::copy_nonoverlapping(d, s.peer_hosts[i].as_mut_ptr(), len);
+    s.peer_host_lens[i] = len as u8;
+}
+
 pub unsafe fn set_advertised_host(s: &mut Kafka, d: *const u8, len: usize) {
     if d.is_null() || len == 0 || len > MAX_HOST_LEN {
         return;
@@ -124,6 +168,13 @@ pub fn init(s: &mut Kafka) {
     }
     s.topics_seen_count = 0;
     s.next_producer_id = 0;
+    s.node_id = 0;
+    s.peer_count = 1;
+    s.peer_ports = [0; super::kafka_metadata::MAX_BROKERS];
+    s.peer_hosts = [[0; MAX_HOST_LEN]; super::kafka_metadata::MAX_BROKERS];
+    s.peer_host_lens = [0; super::kafka_metadata::MAX_BROKERS];
+    s.in_leader_state = -1;
+    s.leader_hint = super::kafka_metadata::HINT_UNKNOWN;
     s.advertised_host_len = 0;
     s.advertised_port = 9090;
     s.partitions = 1;
@@ -265,12 +316,19 @@ fn build_api_versions(s: &mut Kafka, api_ver: i16) -> usize {
     p
 }
 
-/// Append one topic block (error 0, `partitions` partitions, leader 0)
-/// to the Metadata response being built in `s.scratch` at offset `p`.
+/// Append one topic block (error 0, `partitions` partitions, leader and
+/// replica set from `view`) to the Metadata response being built in
+/// `s.scratch` at offset `p`.
 /// Returns the new offset. Capacity is guaranteed by the caller: with
 /// `partitions` clamped to 16 and MAX_TOPICS_SEEN = 8, the worst-case
 /// response (8 × (77 + 16×34) = 4.9 KiB) fits OUT_BUF.
-fn put_metadata_topic(s: &mut Kafka, mut p: usize, name_idx: usize, v: i16) -> usize {
+fn put_metadata_topic(
+    s: &mut Kafka,
+    mut p: usize,
+    name_idx: usize,
+    v: i16,
+    view: &super::kafka_metadata::MetadataView,
+) -> usize {
     let nlen = s.topics_seen_len[name_idx] as usize;
     let parts = s.partitions.clamp(1, 16) as usize;
     s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
@@ -291,20 +349,28 @@ fn put_metadata_topic(s: &mut Kafka, mut p: usize, name_idx: usize, v: i16) -> u
         p += 2; // error
         s.scratch[p..p + 4].copy_from_slice(&(part as i32).to_be_bytes());
         p += 4;
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-        p += 4; // leader
+        // Leader: the raft leader, not always node 0. One Raft group
+        // serves every partition today, so its leader IS each
+        // partition's leader — true now, and the call site does not
+        // change when placement starts answering per shard.
+        s.scratch[p..p + 4].copy_from_slice(&view.leader_for(part as u32).to_be_bytes());
+        p += 4;
         if v >= 7 {
             s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
             p += 4; // leader_epoch
         }
-        s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
-        p += 4; // replicas: [0]
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-        p += 4;
-        s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
-        p += 4; // isr: [0]
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-        p += 4;
+        // Replicas and ISR span every node hosting the group, not [0]:
+        // a client told there is one replica believes the partition has
+        // no redundancy.
+        let nrep = view.replica_count();
+        for _ in 0..2 {
+            s.scratch[p..p + 4].copy_from_slice(&(nrep as i32).to_be_bytes());
+            p += 4;
+            for r in 0..nrep {
+                s.scratch[p..p + 4].copy_from_slice(&(r as i32).to_be_bytes());
+                p += 4;
+            }
+        }
         if v >= 5 {
             s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
             p += 4; // offline: []
@@ -315,6 +381,27 @@ fn put_metadata_topic(s: &mut Kafka, mut p: usize, name_idx: usize, v: i16) -> u
 
 /// Metadata response body (non-flexible v0-v7) into `s.scratch`.
 /// `req` is the request body after client_id. Returns body length.
+impl Kafka {
+    /// Snapshot the cluster shape for a Metadata answer.
+    ///
+    /// A peer with no configured port falls back to this node's, so a
+    /// single-node graph — which configures none — still advertises a
+    /// reachable broker rather than port 0.
+    pub fn metadata_view(&self) -> super::kafka_metadata::MetadataView {
+        let mut ports = self.peer_ports;
+        let me = (self.node_id as usize).min(super::kafka_metadata::MAX_BROKERS - 1);
+        if ports[me] == 0 {
+            ports[me] = self.advertised_port;
+        }
+        super::kafka_metadata::MetadataView {
+            self_id: self.node_id as u8,
+            peer_count: self.peer_count.max(1),
+            peer_ports: ports,
+            leader_hint: self.leader_hint,
+        }
+    }
+}
+
 fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
     // Parse requested topic names first (also refreshes topics_seen).
     // Request: [topics: i32 count][string...]  (count -1 = all, v1+)
@@ -367,35 +454,57 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
         s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
         p += 4; // throttle
     }
-    // brokers: [1 broker: node 0, advertised host:port, rack null (v1+)]
-    s.scratch[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    // Brokers: every node in the cluster, not just this one. A response
+    // naming one broker tells the client the cluster is a single
+    // machine, and no client can then distribute load however well the
+    // substrate partitions.
+    //
+    // Each broker is advertised on ITS OWN host when the graph supplies
+    // one (`peer{N}_host`), falling back to this node's address only for
+    // a peer that shares it. Advertising a wrong host is worse than
+    // advertising one broker: the client connects somewhere that does
+    // not serve the partition.
+    let view = s.metadata_view();
+    let nbrokers = view.broker_count();
+    s.scratch[p..p + 4].copy_from_slice(&(nbrokers as i32).to_be_bytes());
     p += 4;
-    s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-    p += 4; // node_id
-    let hlen = s.advertised_host_len as usize;
-    s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes());
-    p += 2;
-    let host = s.advertised_host;
-    s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]);
-    p += hlen;
-    s.scratch[p..p + 4].copy_from_slice(&(s.advertised_port as i32).to_be_bytes());
-    p += 4;
-    if v >= 1 {
-        s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
-        p += 2; // rack null
+    for bi in 0..nbrokers {
+        let Some(b) = view.broker(bi) else { break };
+        // Peer's own host when the graph gave one; this node's only as a
+        // fallback for a co-located peer.
+        let (host, hlen) = if s.peer_host_lens[bi] != 0 {
+            (s.peer_hosts[bi], s.peer_host_lens[bi] as usize)
+        } else {
+            (s.advertised_host, s.advertised_host_len as usize)
+        };
+        s.scratch[p..p + 4].copy_from_slice(&b.node_id.to_be_bytes());
+        p += 4;
+        s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes());
+        p += 2;
+        s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]);
+        p += hlen;
+        s.scratch[p..p + 4].copy_from_slice(&(b.port as i32).to_be_bytes());
+        p += 4;
+        if v >= 1 {
+            s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+            p += 2; // rack null
+        }
     }
     if v >= 2 {
         s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
         p += 2; // cluster_id null
     }
     if v >= 1 {
-        s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-        p += 4; // controller_id
+        // Controller: the raft leader, which is the node that can serve
+        // an admin request. Naming node 0 unconditionally sent every
+        // client's admin traffic at one node regardless of who led.
+        s.scratch[p..p + 4].copy_from_slice(&view.leader_for(0).to_be_bytes());
+        p += 4;
     }
     s.scratch[p..p + 4].copy_from_slice(&(want_n as i32).to_be_bytes());
     p += 4;
     for w in want.iter().take(want_n) {
-        p = put_metadata_topic(s, p, *w, v);
+        p = put_metadata_topic(s, p, *w, v, &view);
     }
     p
 }
@@ -492,12 +601,32 @@ unsafe fn handle_request(
             send_response(s, sys, conn_id, corr, p);
         }
         API_INIT_PRODUCER_ID => {
-            // Producer id issuance. Sequence-number dedup is NOT enforced
-            // yet — idempotent producers connect and function, with
-            // at-least-once (not exactly-once) semantics on retry.
+            // Producer id issuance. Sequence enforcement IS implemented:
+            // `session_processor` checks `(producer_id, epoch, sequence)`
+            // on the APPLY side, so a retried batch is recognised and not
+            // appended twice, and a gap answers
+            // OUT_OF_ORDER_SEQUENCE_NUMBER. See
+            // `modules/common/cores/kafka_idem_core.rs`.
+            //
+            // Ids are issued from a per-connection counter, NOT a
+            // cluster-wide one: two nodes will hand out the same id, so
+            // this is single-node-correct only. A cluster needs the id
+            // allocated through the control plane.
             // v0/v1: [throttle][err][producer_id i64][producer_epoch i16]
+            // `[node_id:16][counter:40]`, so ids from different nodes can
+            // never collide. 40 bits is ~1.1e12 producers per node, and
+            // the whole value stays well inside a positive i64 — which
+            // matters because a non-positive producer id means "not
+            // idempotent" to the apply-side check.
+            //
+            // KNOWN GAP: the counter restarts at 1 when a node restarts,
+            // so a node CAN reissue an id it previously handed out. A
+            // producer holding the old one would then share sequence
+            // state with the new holder. Closing that needs the id
+            // allocated through the control plane (or persisted), which
+            // is control-plane work this does not pretend to do.
             s.next_producer_id = s.next_producer_id.wrapping_add(1);
-            let pid = s.next_producer_id as i64;
+            let pid = (((s.node_id as u64) << 40) | (s.next_producer_id & 0x00FF_FFFF_FFFF)) as i64;
             let mut p = 0usize;
             s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
             p += 4;
@@ -546,11 +675,32 @@ unsafe fn handle_request(
     }
 }
 
-/// One step of this component.
+/// Drain raft leader hints so Metadata can name the real leader.
+///
+/// Monotone in nothing — the leader legitimately changes — so the
+/// latest hint simply wins. An unwired port leaves `leader_hint` at
+/// `HINT_UNKNOWN`, and Metadata answers self, which is the honest
+/// answer from a node that is serving the request.
 ///
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
+pub unsafe fn drain_leader_state(s: &mut Kafka, sys: &SyscallTable) {
+    if s.in_leader_state < 0 {
+        return;
+    }
+    let mut buf = [0u8; 16];
+    for _ in 0..4 {
+        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_leader_state, &mut buf);
+        if msg_type == 0 && plen == 0 {
+            break;
+        }
+        if msg_type == wire::MSG_LEADER_HINT && (plen as usize) >= 1 {
+            s.leader_hint = buf[0];
+        }
+    }
+}
+
 /// Handle one client record: `[conn_id][tcp chunk]` framed as
 /// MSG_CLIENT_FRAME, or MSG_CONN_CLOSED carrying just the conn id.
 /// Appends to the connection's reassembly buffer and drains every

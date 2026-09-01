@@ -23,9 +23,9 @@ restarted node rebuilds from the WAL.
 
 `session_processor` is the sole apply-side translator. Downstream
 consumers (`messaging`'s dedup / retained / offline components,
-`topic_engine`, `forward_coordinator`) do not subscribe to committed
-entries; they consume the apply-side emissions `session_processor`
-re-broadcasts on their existing input ports. Centralising the
+`topic_engine`) do not subscribe to committed entries; they consume the
+apply-side emissions `session_processor` re-broadcasts on their
+existing input ports. Centralising the
 committed-entry framing in one module keeps the framing knowledge in one
 place, preserves every other module's port budget, and narrows the
 apply-pipeline contract to a single consumer.
@@ -65,7 +65,7 @@ there are authoritative for body shape.
 | 0x05 | `QOP_UNSUBSCRIBE` | `[stream_hash:u64 LE][topic_len:u16 BE][topic]` |
 | 0x06 | `QOP_PUBREL` | `[packet_id:u16 BE][stream_hash:u64 LE][session_epoch:u32 LE]`. The epoch is a trailing field: entries logged without it replay against the session's current epoch, as they did when written |
 | 0x07 | `QOP_RETAINED_CLEAR` | `[topic_len:u16 BE][topic]` |
-| 0x08 | `QOP_KAFKA_PRODUCE` | `[partition:u16 LE][topic_len:u16 LE][topic][records — the verbatim Kafka record batch]`; tagged when `acks != 0`, untagged for `acks == 0` |
+| 0x08 | `QOP_KAFKA_PRODUCE` | `[origin:u8][partition:u16 LE][topic_len:u16 LE][topic][records — the verbatim Kafka record batch]`; tagged when `acks != 0`, untagged for `acks == 0`. `origin` is the replica id that accepted the produce, so only that node stamps the offset back onto a waiting client |
 | 0x09 | `QOP_AMQP_PUBLISH` | `[rk_len:u16 LE][routing_key][payload]`; tagged when the channel is in confirm mode |
 | 0x0A | `QOP_KAFKA_OFFSET` | `[group_len:u16 LE][group][topic_len:u16 LE][topic][partition:u16 LE][offset:i64 LE]` |
 
@@ -102,7 +102,7 @@ ops) the `correlation_id`, then dispatches on the canonical op:
 | `QOP_SUBSCRIBE` / `QOP_UNSUBSCRIBE` | Emit `MSG_TOPIC_SUBSCRIBE` / `MSG_TOPIC_UNSUBSCRIBE` keyed to the apply-side slot. |
 | `QOP_PUBREL` | Drive the QoS 2 phase transition on both the in-flight slot and the dedupe entry, opening the slot if the flow has none; on the leader the durability proof then fires PUBCOMP and releases it, on a follower the transition applies with no client-facing emit. Advancing is monotone, so a replayed or repeated PUBREL is a no-op on state and still answerable. |
 | `QOP_RETAINED_CLEAR` | Emit an explicit clear op on `out_messaging` keyed to `topic_hash`. |
-| `QOP_KAFKA_PRODUCE` | Append the record batch to the topic-partition's message log; the assigned WAL index becomes the batch's base offset. |
+| `QOP_KAFKA_PRODUCE` | Enforce the producer's `(producer_id, epoch, sequence)`, then append the record batch to the topic-partition's log and stamp the logical offset the append lands at as the batch's base offset. |
 | `QOP_AMQP_PUBLISH` | Append the body to the routing key's message log (shared store with Kafka; entries are flagged raw so Kafka Fetch skips them and Basic.Get returns them verbatim). |
 | `QOP_KAFKA_OFFSET` | Record the consumer-group offset commit. |
 
@@ -170,7 +170,6 @@ bump.
 | Offline queues | Per-session FIFO entries |
 | Retained messages | Topic-indexed payloads |
 | Consumer groups | Group metadata, member assignments, committed offsets |
-| Forward sequences | Per-PRG `forward_seq` counters |
 | Routing epoch | Current epoch for placement validation |
 
 Encoding is bare-metal-safe: fixed-size `#[repr(C)]` state, stack
@@ -188,10 +187,33 @@ this surface.
 | `proposals` (untagged) | `QOP_CONNECT`, `QOP_DISCONNECT`, `QOP_SUBSCRIBE`, `QOP_UNSUBSCRIBE`, `QOP_RETAINED_CLEAR`, QoS 0 `QOP_PUBLISH`, `acks=0` `QOP_KAFKA_PRODUCE`, non-confirm `QOP_AMQP_PUBLISH`, `QOP_KAFKA_OFFSET` | `session_processor` |
 | `proposals_tagged` | QoS 1+ `QOP_PUBLISH`, `QOP_PUBREL`, `acks!=0` `QOP_KAFKA_PRODUCE`, confirm-mode `QOP_AMQP_PUBLISH` | `session_processor` |
 | `proposal_assigned` (echo) | Binds `correlation_id → (session_slot, packet_id, op)`; emits `MSG_ACK_REGISTER` | `session_processor` → `flow`'s ack component |
-| `committed_entries` | Sole apply-side translation of session / dedup / retained / offline / topic state | `session_processor.committed_in` |
+| `committed_entries` | Sole apply-side translation of session / dedup / retained / offline / topic state | `session_processor.committed_in` — the stream's ONLY consumer |
+| `session_processor.cp_out` | Every committed entry that is not a Quantum op (epoch, migration, admin, config records), re-emitted verbatim as `MSG_COMMITTED_ENTRY` | `control_plane.committed_entries` |
 | `quorum_durable` (proof) | Drives `MSG_ACK_EMIT` → PUBACK / PUBREC / PUBCOMP | `flow`'s ack component |
 | `MSG_APPLY_PIPELINE_RESET` | Clears apply-derived arenas and fans out the reset | `session_processor` |
 | Snapshot install / export | Quantum-owned payload (design target, above) | `session_processor` + apply-state modules |
+
+**One consumer per committed stream.** `control_plane` does not read
+`consensus.committed_entries` alongside `session_processor`. A kernel
+fan-out on that edge can drop an entry under load, and downstream a
+missing entry is indistinguishable from a snapshot install — both
+appear as a jump in one partition's index, which clears every
+apply-derived arena on the node, sessions included. So the module that
+owns the apply cursor forwards the records the control plane needs on
+`cp_out`, and the entries that reach it are exactly the ones that
+reached apply.
+
+A jump that does occur is logged at warning level
+(`[sess] apply gap p= from= to=`) before the reset runs, naming the
+partition and both indices: a jump the substrate did not intend is
+otherwise indistinguishable from a quiet restart.
+
+The apply cursor is keyed on `(partition_id, index)`, never on the
+index alone. One engine hosts K raft groups whose logs each number from
+1 and all feed this one stream, so a single cursor sees partition 1's
+index 1 arrive after partition 0's and discards it as a duplicate — or
+reads a partition running ahead as a gap and wipes state that was
+never stale.
 
 ### Multi-PRG proof keying
 

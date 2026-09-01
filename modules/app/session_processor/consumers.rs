@@ -285,6 +285,44 @@ pub fn group_find_or_create(s: &mut Consumers, name: &[u8]) -> Option<usize> {
     group_find_or_create_idx(s, name)
 }
 
+/// Raise a group's generation to at least `generation`, creating the
+/// group if this node has never seen it.
+///
+/// The apply-side half of [`wire::QOP_KAFKA_GROUP_GEN`]. A MAXIMUM, not
+/// an assignment: a replayed or re-delivered record must not move a
+/// generation backwards, and a coordinator rebuilding a group after
+/// failover must resume ABOVE every generation the previous one issued
+/// rather than reissuing them.
+///
+/// Creating an empty group here is deliberate. A group with a high
+/// generation and no members is exactly the state that stops the next
+/// join from reusing a generation a zombie may still hold.
+///
+/// Returns false only when the group table is full.
+pub fn group_generation_raise(s: &mut Consumers, name: &[u8], generation: i32) -> bool {
+    let Some(gi) = group_find_or_create_idx(s, name) else {
+        return false;
+    };
+    if generation > s.groups[gi].generation {
+        s.groups[gi].generation = generation;
+    }
+    true
+}
+
+/// A group's `(name, generation)` if the slot is live, for the
+/// reconciliation sweep that replicates generations.
+pub fn group_snapshot(s: &Consumers, gi: usize, dst: &mut [u8]) -> Option<(usize, i32)> {
+    if gi >= KGROUPS || s.groups[gi].active == 0 {
+        return None;
+    }
+    let n = s.groups[gi].name_len as usize;
+    if n == 0 || n > dst.len() {
+        return None;
+    }
+    dst[..n].copy_from_slice(&s.groups[gi].name[..n]);
+    Some((n, s.groups[gi].generation))
+}
+
 pub fn group_generation(s: &Consumers, gi: usize) -> i32 {
     if gi < KGROUPS {
         s.groups[gi].generation
@@ -386,6 +424,12 @@ pub fn member_join(s: &mut Consumers, gi: usize, id: &[u8], conn_id: u8) -> Opti
         return None;
     }
     if let Some(mi) = member_idx(&s.groups[gi], id) {
+        // Rebind. A member restored from the log after a coordinator
+        // change carries the connection it joined on in the PREVIOUS
+        // run, which no longer exists — leaving it stale would route
+        // this member's deliveries at a dead connection. Rebinding also
+        // covers a client that reconnects without leaving first.
+        s.groups[gi].members[mi].conn_id = conn_id;
         return Some(mi);
     }
     let free = (0..KGROUP_MEMBERS).find(|&i| s.groups[gi].members[i].active == 0)?;
@@ -397,6 +441,48 @@ pub fn member_join(s: &mut Consumers, gi: usize, id: &[u8], conn_id: u8) -> Opti
     m.id[..id.len()].copy_from_slice(id);
     s.groups[gi].generation = s.groups[gi].generation.wrapping_add(1);
     Some(free)
+}
+
+/// Re-admit a member from the replicated log, with its assignment,
+/// WITHOUT bumping the generation.
+///
+/// The apply-side half of [`wire::QOP_KAFKA_GROUP_MEMBER`]. Not bumping
+/// is the whole point: the generation is what a rejoining consumer
+/// presents, and moving it would force the rebalance this record exists
+/// to avoid. `conn_id` is left unbound — the connection this member
+/// joined on belongs to the run that ended — and `member_join` rebinds
+/// it when the client returns.
+///
+/// Idempotent: replaying the same record refreshes the assignment in
+/// place rather than consuming a second member slot.
+pub fn member_restore(s: &mut Consumers, name: &[u8], id: &[u8], assign: &[u8]) -> bool {
+    if id.is_empty() || id.len() > KG_NAME {
+        return false;
+    }
+    let Some(gi) = group_find_or_create_idx(s, name) else {
+        return false;
+    };
+    let mi = match member_idx(&s.groups[gi], id) {
+        Some(mi) => mi,
+        None => {
+            let Some(free) = (0..KGROUP_MEMBERS).find(|&i| s.groups[gi].members[i].active == 0)
+            else {
+                return false;
+            };
+            let m = &mut s.groups[gi].members[free];
+            *m = KGroupMember::zero();
+            m.active = 1;
+            m.id_len = id.len() as u8;
+            m.conn_id = 0;
+            m.id[..id.len()].copy_from_slice(id);
+            free
+        }
+    };
+    let al = assign.len().min(KG_META);
+    let m = &mut s.groups[gi].members[mi];
+    m.assign[..al].copy_from_slice(&assign[..al]);
+    m.assign_len = al as u16;
+    true
 }
 
 /// Record the member's subscription metadata and the group's protocol

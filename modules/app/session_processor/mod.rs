@@ -1,7 +1,8 @@
 //! Session Processor — Unified session state machine for MQTT/Kafka/AMQP.
 //!
-//! The Raft apply callback for Quantum. Uses multiplexed channels to stay
-//! within the 8-port-per-direction Fluxor wire limit.
+//! The Raft apply callback for Quantum. Related signals share a channel
+//! and are demuxed by MSG_* type byte, so the module stays inside the
+//! 16-port-per-direction Fluxor wire limit.
 //!
 //! Ingress envelope (codec → session): `[conn_id:u8][mtype:u8][proto][pkt_type][flags][fields]`.
 //! Egress envelope (session → codec):  `[conn_id:u8][mtype:u8][proto][pkt_type][flags][body]`.
@@ -10,21 +11,29 @@
 //! client connection. Session → conn_id is set on CONNECT and cleared on
 //! DISCONNECT.
 //!
-//! Ports (7 in, 7 out):
-//!   in[0] codec_in      — protocol proposals
-//!   in[1] committed_in  — applied entries from consensus
-//!   in[2] flow_in       — PID credits + backpressure + prefetch
-//!   in[3] ack_in        — ACK emit + redeliver from `flow::ack`
-//!   in[4] cp_in         — capabilities + epoch + disconnect
-//!   in[5] messaging_in  — dedup/offline/retained/group/txn results
-//!   in[6] deliver_in    — topic deliveries
-//!   out[0] proposals    — to consensus (fluxor wire envelope)
-//!   out[1] codec_out    — [conn_id][mtype][envelope] responses to codecs
-//!   out[2] topic_out    — publish + subscribe + unsubscribe (wire envelope)
-//!   out[3] messaging_out — dedup/offline/retained/group/txn ops (wire envelope)
-//!   out[4] forward_out  — forward + inflight register (wire envelope)
-//!   out[5] audit_out    — audit events (wire envelope)
-//!   out[6] metrics_out  — metrics (wire envelope)
+//! Ports. The index is the ABI — a graph binds by position — so a port
+//! is only ever appended, never inserted or reordered.
+//!
+//!   in[0]  codec_in       — protocol proposals
+//!   in[1]  committed_in   — applied entries from consensus
+//!   in[2]  flow_in        — PID credits + backpressure + prefetch
+//!   in[3]  ack_in         — ACK emit + redeliver from `flow::ack`
+//!   in[4]  cp_in          — capabilities + placement + epoch + disconnect
+//!   in[5]  messaging_in   — dedup/offline/retained/group/txn results
+//!   in[6]  deliver_in     — topic deliveries
+//!   in[7]  assigned_in    — MSG_PROPOSAL_ASSIGNED (correlation → wal index)
+//!   in[8]  wal_reply      — WAL records for a cold Kafka Fetch
+//!   out[0] proposals      — to consensus (fluxor wire envelope)
+//!   out[1] codec_out      — [conn_id][mtype][envelope] responses to codecs
+//!   out[2] topic_out      — publish + subscribe + unsubscribe (wire envelope)
+//!   out[3] messaging_out  — dedup/offline/retained/group/txn ops (wire envelope)
+//!   out[4] forward_out    — inflight register + lag signal to `flow`
+//!   out[5] audit_out      — audit events (wire envelope)
+//!   out[6] metrics_out    — metrics (wire envelope)
+//!   out[7] proposals_tagged — correlation-prefixed proposals for QoS 1+
+//!   out[8] wal_request    — cold-read request for a Kafka Fetch
+//!   out[9] retention_floor — lowest raft index this broker still needs
+//!   out[10] cp_out        — committed entries the control plane owns
 
 #![no_std]
 #![allow(
@@ -50,6 +59,88 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/wire.rs"]
 mod wire;
 
+define_params! {
+    ModuleState;
+
+    // This node's replica id, stamped into every proposal this node
+    // ORIGINATES so the apply side — which runs on every replica — can
+    // tell its own requests from a peer's.
+    //
+    // Apply is where a produce's logical offset and its idempotence
+    // verdict become known, but the client waiting for them is parked
+    // in an inflight slot that exists only on the accepting node.
+    // Clustor strips the tagged correlation before storing the entry,
+    // and the replicated slot index alone is not safe to match on: a
+    // follower can hold a live slot at the same index and generation.
+    // The origin id makes the match structural instead of probabilistic
+    // — a replica that did not originate the proposal skips it outright.
+    1, self_id, u8, 0
+        => |s, d, len| { s.self_id = p_u8(d, len, 0, 0); };
+
+    // Kafka time retention, in milliseconds. 0 (the default) means
+    // "retain until the ring fills", which is the behaviour every
+    // existing graph has today — a broker must not start deleting data
+    // because a config was upgraded under it.
+    //
+    // Retention is what makes the log's footprint a function of the
+    // POLICY rather than of the traffic: without it a low-rate topic
+    // keeps records for ever while a high-rate one keeps minutes, and
+    // neither is what was asked for.
+    2, kafka_retention_ms, u32, 0
+        => |s, d, len| { s.kafka_retention_ms = p_u32(d, len, 0, 0); };
+
+    // Key compaction, off by default. Kafka models this as a per-topic
+    // `cleanup.policy`; there is no per-topic config surface here yet,
+    // so it is a broker-wide switch. Off is the safe default for the
+    // same reason retention's is: a config upgrade must not start
+    // deleting data.
+    //
+    // Compaction and time retention are INDEPENDENT here — Kafka treats
+    // them as alternative policies, but a compacted topic that also ages
+    // out is a coherent thing to want and neither sweep can drop a
+    // record the other would have kept.
+    3, kafka_compact, u8, 0
+        => |s, d, len| { s.kafka_compact = p_u8(d, len, 0, 0); };
+}
+
+/// Kafka idempotent-producer sequence bookkeeping. Enforced on the
+/// APPLY side (see `apply_kafka_produce`), because apply is the
+/// replicated state machine: every replica reaches the same verdict
+/// from the same committed log, so the decision survives failover. The
+/// propose side cannot do this — any node may accept a produce, and its
+/// table is neither shared nor durable.
+#[cfg(feature = "kafka")]
+#[path = "../../common/cores/kafka_idem_core.rs"]
+mod kafka_idem;
+
+/// Kafka partition-log semantics — here for the retention decision and
+/// the RecordBatch timestamp it reads. Shared with the host test bed so
+/// "has this record aged out?" has one definition.
+#[cfg(feature = "kafka")]
+#[allow(
+    dead_code,
+    reason = "the core is compiled verbatim into every module that shares it; \
+              this module uses the retention half, the host tests the whole \
+              surface. Trimming it per consumer would fork the one definition \
+              the core exists to provide"
+)]
+#[path = "../../common/cores/kafka_log_core.rs"]
+mod kafka_log;
+
+/// Placement: which PRG owns a shard, whether it is this node's, and
+/// whether it is mid-fence. The same core `topic_engine` decides
+/// against, so both modules resolve a shard to the same owner.
+#[allow(
+    dead_code,
+    reason = "the core is compiled verbatim into every module that shares it \
+              and into the host test bed; this module uses the placement half \
+              (EdgeView + apply_placement_update), while topic_engine uses the \
+              routing half. Trimming it per consumer would fork the one \
+              definition the core exists to provide"
+)]
+#[path = "../../common/cores/edge_routing_core.rs"]
+mod edge;
+
 mod consumers;
 mod correlate;
 mod sessions;
@@ -69,10 +160,19 @@ mod types;
 use types::*;
 
 const MAX_SESSIONS: usize = 1024;
+
+/// Apply cursors, one per hosted raft partition. Must be at least
+/// clustor's `consensus` `K_MAX` (64); a partition id at or above this
+/// falls back to cursor 0, which degrades to the old single-cursor
+/// behaviour for that partition rather than indexing out of bounds.
+const MAX_APPLY_PARTITIONS: usize = 64;
 const MAX_INFLIGHT_PER_SESSION: usize = 16;
+/// Proposal credit the codec drain requires before it takes a packet
+/// off `codec_in`: the substrate's entry cap, so no admitted packet can
+/// find the credit gone when it reaches admission.
+const ADMISSION_GATE_BYTES: i32 = 2048;
 /// Read/write buffer cap for codec ↔ session_processor and
-/// session_processor ↔ topic_engine / forward_coordinator /
-/// messaging-fan-out traffic. Sized to the wire-channel per-message
+/// session_processor ↔ topic_engine / messaging-fan-out traffic. Sized to the wire-channel per-message
 /// capacity (`fluxor-abi::CHANNEL_BUFFER_SIZE` = 8192) so a worst-case
 /// MQTT packet (`protocol::mqtt`'s `MAX_PACKET` = 4096) plus routing headers
 /// (`MSG_TOPIC_PUBLISH` topic prefix, `MSG_TOPIC_DELIVER` session-slot
@@ -126,6 +226,7 @@ const PENDING_ACK_SLOTS: usize = MAX_PENDING_CORRELATIONS;
 // MQTT packet types (mirrored in `protocol::mqtt`)
 const PKT_CONNECT: u8 = 1;
 const PKT_CONNACK: u8 = 2;
+
 const PKT_PUBLISH: u8 = 3;
 const PKT_PUBACK: u8 = 4;
 const PKT_PUBREC: u8 = 5;
@@ -135,6 +236,9 @@ const PKT_SUBSCRIBE: u8 = 8;
 const PKT_SUBACK: u8 = 9;
 const PKT_UNSUBSCRIBE: u8 = 10;
 const PKT_UNSUBACK: u8 = 11;
+/// Server-initiated DISCONNECT. v5 only — the codec drops it for 3.1.1,
+/// which has no such packet.
+const PKT_DISCONNECT: u8 = 14;
 
 /// Direction tag for an inflight slot. Publisher and subscriber packet_id
 /// spaces are assigned independently (one by the remote client, one by us),
@@ -263,6 +367,9 @@ const KERR_NONE: i16 = 0;
 const KERR_REQUEST_TIMED_OUT: i16 = 7;
 const KERR_MESSAGE_TOO_LARGE: i16 = 10;
 const KERR_INVALID_REQUEST: i16 = 42;
+/// Kafka `OFFSET_OUT_OF_RANGE`. The client's response is to apply its
+/// `auto.offset.reset` policy — which it can only do if we TELL it.
+const KERR_OFFSET_OUT_OF_RANGE: i16 = 1;
 
 /// Largest record batch accepted per Produce request. The clustor
 /// substrate pins log entries at ~2 KiB end to end (raft
@@ -280,6 +387,13 @@ const KAFKA_MAX_RECORDS_BYTES: usize = 1900;
 /// AMQP → Basic.Ack (publisher confirm).
 const KIN_PROTO_KAFKA: u8 = 1;
 const KIN_PROTO_AMQP: u8 = 2;
+/// A Kafka OffsetCommit whose response is parked until its proposals
+/// are quorum-durable. Distinguished from `KIN_PROTO_KAFKA` because the
+/// completion emits a stored body rather than rebuilding a produce
+/// response from per-partition offsets.
+const KIN_PROTO_KAFKA_OFFSET: u8 = 3;
+/// OffsetCommit op tag for `correlate`.
+const OP_KOFFSET: u8 = 3;
 
 /// Max partitions serviced in ONE Produce request (one topic). The
 /// partition index is packed into the correlation `packet_id` high
@@ -348,7 +462,18 @@ const AMQP_DELIVER_QUOTA: usize = 4;
 // 24 × 16 KiB = 384 KiB.
 const KSTORE_PARTS: usize = 24;
 const KSTORE_BYTES: usize = 16384;
-const KENTRY_HDR: usize = 2 + 1 + 8 + 4;
+/// Ring entry header: `len(2) flags(1) offset(8) nrec(4) appended_ms(8)`.
+///
+/// `appended_ms` is the broker's MONOTONIC clock at append, and it is
+/// what time retention measures age from — the producer's timestamp is
+/// on a different clock entirely (see `kafka_log_core::retention_expired`).
+///
+/// Extending this header is safe precisely because the ring is never
+/// persisted: it is rebuilt by applying the raft log, so there is no
+/// stored layout to stay compatible with. The consequence, stated
+/// plainly, is that a restart resets every record's age — retention
+/// after a restart runs a fresh window rather than resuming the old one.
+const KENTRY_HDR: usize = 2 + 1 + 8 + 4 + 8;
 const KFLAG_BATCH: u8 = 1;
 /// `len` sentinel marking "wrap to ring start" (never a real entry len).
 const KWRAP: u16 = 0xFFFF;
@@ -366,22 +491,122 @@ struct ModuleState {
     in_flow: i32,
     in_ack: i32,
     in_cp: i32,
+    /// Placement view learned from the control plane over `cp_in`.
+    /// Until W9 hands per-shard state over on a migration, this is
+    /// read-only: it lets the module SAY which shards it owns
+    /// (`shard_owned_locally`) without yet moving state, so the
+    /// ownership answer is available to the stores and to tests before
+    /// the handover machinery that consumes it exists.
+    view: edge::EdgeMap,
+    /// Placement updates applied.
+    placement_updates: u32,
+    /// Shard-map (ownership override) updates applied and refused.
+    shard_map_updates: u32,
+    shard_map_stale: u32,
+    /// Sessions dropped because their shard was reassigned away.
+    /// Non-zero means this node handed shards over; it should track the
+    /// migrations that moved them.
+    sessions_released_foreign: u32,
     in_messaging: i32,
     in_deliver: i32,
     in_assigned: i32,
     out_proposals: i32,
+    /// This node's replica id (param 1). Stamped into proposals this
+    /// node originates; see the `define_params!` block.
+    self_id: u8,
+    /// Kafka time-retention window; 0 disables it.
+    kafka_retention_ms: u32,
+    /// Non-zero enables key compaction.
+    kafka_compact: u8,
+    /// Records dropped by time retention.
+    #[cfg(feature = "kafka")]
+    kafka_retention_evictions: u32,
     out_codec: i32,
     out_topic: i32,
     out_messaging: i32,
     out_forward: i32,
     out_audit: i32,
     out_metrics: i32,
+    /// Cold-read request/reply to `durability`, for a Fetch whose offset
+    /// has aged out of the in-memory ring.
+    #[cfg(feature = "kafka")]
+    out_wal_request: i32,
+    /// out[9]: `MSG_COMPACTION_FLOOR` to `durability.retention_floor`.
+    out_retention_floor: i32,
+    /// out[10]: committed entries that are not Quantum operations,
+    /// forwarded verbatim for `control_plane` (see the manifest).
+    out_cp: i32,
+    /// Records forwarded on `out_cp`, and the writes it refused.
+    cp_forwarded: u32,
+    cp_refused: u32,
+    /// Last floor published per raft partition, so an unchanged floor
+    /// is not re-sent every interval; `floor_sent_mask` says which
+    /// entries have been published at all, because a floor of 0 is a
+    /// real value ("keep everything"), not an unset one.
+    last_floor_sent: [u64; MAX_APPLY_PARTITIONS],
+    floor_sent_mask: u64,
+    floor_emitted: u32,
+    /// Publishes whose proposal channel refused the write.
+    proposals_refused: u32,
+    /// Raft partition of the entry being applied right now.
+    applying_partition: u16,
+    /// One sampled QoS 1 publish traced from proposal to PUBACK:
+    /// `(session_slot, packet_id)` armed at assignment, its issue time,
+    /// and the ms the assignment took. Logged as `[sess] qos1 age` at
+    /// the PUBACK so the follower-relay path can be read off the log.
+    trace_slot: u32,
+    trace_packet: u16,
+    trace_armed: bool,
+    trace_issued_ms: u64,
+    trace_assign_ms: u32,
+    #[cfg(feature = "kafka")]
+    in_wal_reply: i32,
+    #[cfg(feature = "kafka")]
+    cold: [ColdFetch; COLD_FETCH_SLOTS],
+    #[cfg(feature = "kafka")]
+    next_cold_id: u32,
+    #[cfg(feature = "kafka")]
+    cold_served: u32,
+    #[cfg(feature = "kafka")]
+    cold_refused: u32,
     out_proposals_tagged: i32,
 
     credit_base_window: u32,
     keep_alive_factor_pct: u32,
     max_inflight_default: u16,
     pid_entry_credits: i32,
+    /// Steps the codec drain sat out for want of proposal credit.
+    codec_gated: u32,
+    /// A publish proposal the router edge refused, kept whole with its
+    /// channel and shard and offered again ahead of the next codec
+    /// drain (length 0 = none). The packet is already off `codec_in`
+    /// and its correlation and inflight slot are allocated; dropping it
+    /// here is a QoS 1 publish the client never hears about.
+    prop_hold_len: u16,
+    prop_hold_chan: i32,
+    prop_hold_shard: u32,
+    prop_hold: [u8; BUF_SIZE],
+    /// Proposals held on a refused edge (retried, never dropped).
+    proposals_held: u32,
+    /// Committed publishes fanned out although the dedup table could
+    /// not file them: the entry is committed and acknowledged, so a
+    /// verdict the table cannot give is not a reason to lose it.
+    dedup_refused_delivered: u32,
+    /// Per-second accounting for the `[sess] hb` line: packets taken
+    /// off `codec_in`, publishes admitted, proposals written,
+    /// assignments received, ack registrations written, committed
+    /// entries applied. Reset when the line goes out.
+    hb_codec: u32,
+    hb_pub: u32,
+    hb_prop: u32,
+    hb_assigned: u32,
+    hb_reg: u32,
+    hb_commit: u32,
+    last_hb_ms: u64,
+    /// CONNECT applies that found no slot for their stream and
+    /// allocated one: on the proposing node this means the transient
+    /// slot the CONNACK stood on was not the one the apply reconciled.
+    apply_connect_no_prior: u32,
     pid_byte_credits: i32,
     follower_factor_q16: i32,
 
@@ -413,6 +638,37 @@ struct ModuleState {
     kafka_produce_rx: u32,
     kafka_produce_acked: u32,
     kafka_produce_errors: u32,
+    /// Per-`(producer_id, partition)` sequence state, maintained from
+    /// the committed log so a producer's retry after a lost response is
+    /// recognised instead of appended twice.
+    #[cfg(feature = "kafka")]
+    idem: kafka_idem::IdemTable,
+    /// Batches not appended because they repeated an already-applied
+    /// sequence — i.e. duplicates this feature suppressed.
+    #[cfg(feature = "kafka")]
+    kafka_idem_duplicates: u32,
+    /// Batches not appended because their sequence was out of order or
+    /// their producer epoch was fenced. Non-zero means a producer is
+    /// losing batches; it is a signal, not routine.
+    #[cfg(feature = "kafka")]
+    kafka_idem_rejected: u32,
+    /// Group-generation records that could not be applied because the
+    /// group table is full. Non-zero means a coordinator may reissue a
+    /// generation after failover — the exact hazard the record exists
+    /// to close — so it is counted rather than ignored.
+    #[cfg(feature = "kafka")]
+    kafka_group_gen_dropped: u32,
+    /// Group-generation records proposed.
+    #[cfg(feature = "kafka")]
+    kafka_group_gen_proposed: u32,
+    /// Member records proposed.
+    #[cfg(feature = "kafka")]
+    kafka_group_members_proposed: u32,
+    /// Highest generation already proposed per group slot, so the
+    /// reconciliation sweep proposes a change once rather than every
+    /// step.
+    #[cfg(feature = "kafka")]
+    gen_proposed: [i32; KGROUPS],
 
     // ── Apply-side message store + AMQP counters ──
     store: store::Store,
@@ -429,6 +685,21 @@ struct ModuleState {
     consumers: consumers::Consumers,
     kafka_group_ops: u32,
     kafka_offset_commits: u32,
+    /// Fetches refused as OFFSET_OUT_OF_RANGE. Non-zero means consumers
+    /// are falling behind the store's retention — the signal that used
+    /// to be invisible because the answer looked like "caught up".
+    kafka_fetch_out_of_range: u32,
+    /// Fetches answered with a placement error because the partition's
+    /// shard is not served here. Rising means clients are reaching the
+    /// wrong broker — normal briefly after a migration, persistent
+    /// means Metadata is telling them the wrong thing.
+    #[cfg(feature = "kafka")]
+    kafka_fetch_not_owned: u32,
+    /// OffsetCommits answered WITHOUT durability gating — no inflight
+    /// slot or correlation was free, or the response was too large to
+    /// park. Non-zero means some commits were acknowledged before they
+    /// were durable.
+    kafka_offset_ungated: u32,
     amqp_delivers: u32,
     amqp_consumer_acks: u32,
 
@@ -439,6 +710,18 @@ struct ModuleState {
     publishes: u32,
     applied: u32,
     acks_emitted: u32,
+    /// Subscriber-side inflight slots released on session resume
+    /// because they can never be redelivered. Non-zero means a resumed
+    /// subscriber lost messages it had not acknowledged; the count is
+    /// what makes that loss visible rather than silent.
+    sub_inflight_dropped_on_resume: u32,
+    /// Stale `conn_id` bindings evicted when a new CONNECT claimed the
+    /// same recycled connection slot. Non-zero means clients are
+    /// closing abruptly — normal — and that this guard is doing work
+    /// that would otherwise have been cross-client corruption.
+    conn_bindings_evicted: u32,
+    /// CONNECTs refused because the session's shard is served elsewhere.
+    connects_redirected: u32,
     /// MQTT completions dropped because the session generation they
     /// were registered under no longer occupies the slot.
     acks_stale_epoch: u32,
@@ -457,16 +740,28 @@ struct ModuleState {
     deliveries_throttled: u32,
     redeliver_signals: u32,
     /// Count of per-entry MSG_COMMITTED_ENTRY notices observed on
-    /// `in_entries`. The apply-side state machine is staged across
-    /// future turns; this surfaces the substrate wiring so reviewers can
-    /// confirm the stream is actually flowing.
+    /// `in_entries`. Surfaces the substrate wiring: a zero here while
+    /// commits are happening means the stream is not reaching apply.
     committed_entries_observed: u32,
     /// Highest WAL index applied via `apply_committed_op`. Used to
     /// detect forward-jumps in the `MSG_COMMITTED_ENTRY` index
     /// sequence (snapshot install / leader log truncation) — see
     /// `docs/architecture/apply_path.md §Apply-pipeline reset. Reset to the
     /// new index after `apply_reset` clears state.
-    apply_index: u64,
+    /// Last COMPLETED apply index, PER PARTITION.
+    ///
+    /// One engine hosts K raft groups whose logs each number from 1, and
+    /// all of them feed this one `committed_in` stream. A single cursor
+    /// therefore saw partition 1's index 1 arrive after partition 0's
+    /// and skipped it as a duplicate — or, when a partition ran ahead,
+    /// read the jump as a gap and wiped all apply-derived state. At K=4
+    /// only ~1/4 of topics ever delivered, the same ones every run.
+    /// The ack path keys on `(partition_id, wal_index)` for exactly
+    /// this reason; the apply cursor must be keyed the same way.
+    apply_index: [u64; MAX_APPLY_PARTITIONS],
+    /// Raft index of the entry currently being applied. See the
+    /// assignment site: `apply_index` is the last COMPLETED entry.
+    applying_index: u64,
     /// Count of apply-side resets observed since boot. Surfaced in
     /// metrics so operators can correlate reset events with
     /// snapshot installs / leader transfers.
@@ -508,8 +803,8 @@ pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
-    _params: *const u8,
-    _params_len: usize,
+    params: *const u8,
+    params_len: usize,
     state: *mut u8,
     state_size: usize,
     syscalls: *const c_void,
@@ -526,10 +821,20 @@ pub unsafe extern "C" fn module_new(
         s.syscalls = sys;
         s.in_codec = in_chan;
         s.out_proposals = out_chan;
+        set_defaults(s);
+        if !params.is_null() && params_len >= 4 {
+            parse_tlv(s, params, params_len);
+        }
         s.in_committed = dev_channel_port(sys, 0, 1);
         s.in_flow = dev_channel_port(sys, 0, 2);
         s.in_ack = dev_channel_port(sys, 0, 3);
         s.in_cp = dev_channel_port(sys, 0, 4);
+        // Single PRG, epoch 0, until the control plane speaks: a node
+        // that has heard no placement owns everything it is asked
+        // about, which is exactly the single-node behaviour.
+        s.view = edge::EdgeMap::new(0, 0);
+        s.placement_updates = 0;
+        s.sessions_released_foreign = 0;
         s.in_messaging = dev_channel_port(sys, 0, 5);
         s.in_deliver = dev_channel_port(sys, 0, 6);
         s.in_assigned = dev_channel_port(sys, 0, 7);
@@ -540,13 +845,41 @@ pub unsafe extern "C" fn module_new(
         s.out_proposals_tagged = dev_channel_port(sys, 1, 7);
         s.out_audit = dev_channel_port(sys, 1, 5);
         s.out_metrics = dev_channel_port(sys, 1, 6);
+        // Declared LAST in the manifest, so these take the highest
+        // indices and nothing above shifted.
+        #[cfg(feature = "kafka")]
+        {
+            s.out_wal_request = dev_channel_port(sys, 1, 8);
+            s.out_retention_floor = dev_channel_port(sys, 1, 9);
+            s.out_cp = dev_channel_port(sys, 1, 10);
+            s.cp_forwarded = 0;
+            s.cp_refused = 0;
+            s.in_wal_reply = dev_channel_port(sys, 0, 8);
+            s.cold = [ColdFetch::zero(); COLD_FETCH_SLOTS];
+            s.next_cold_id = 1;
+        }
         s.credit_base_window = 10;
         s.keep_alive_factor_pct = 150;
         s.max_inflight_default = 10;
         s.pid_entry_credits = 4096;
+        s.codec_gated = 0;
+        s.prop_hold_len = 0;
+        s.prop_hold_chan = -1;
+        s.prop_hold_shard = 0;
+        s.proposals_held = 0;
+        s.dedup_refused_delivered = 0;
+        s.hb_codec = 0;
+        s.hb_pub = 0;
+        s.hb_prop = 0;
+        s.hb_assigned = 0;
+        s.hb_reg = 0;
+        s.hb_commit = 0;
+        s.last_hb_ms = 0;
+        s.apply_connect_no_prior = 0;
         s.pid_byte_credits = 64 * 1024;
         s.follower_factor_q16 = 65536;
-        s.apply_index = 0;
+        s.apply_index = [0; MAX_APPLY_PARTITIONS];
+        s.applying_index = 0;
         s.apply_resets = 0;
         for i in 0..MAX_SESSIONS {
             sessions::clear(&mut s.sessions, i);
@@ -554,9 +887,21 @@ pub unsafe extern "C" fn module_new(
         }
         correlate::init(&mut s.correlate);
         store::init(&mut s.store);
+        s.sub_inflight_dropped_on_resume = 0;
+        s.conn_bindings_evicted = 0;
         s.kafka_produce_rx = 0;
         s.kafka_produce_acked = 0;
         s.kafka_produce_errors = 0;
+        #[cfg(feature = "kafka")]
+        {
+            s.idem = kafka_idem::IdemTable::new();
+            s.kafka_idem_duplicates = 0;
+            s.kafka_idem_rejected = 0;
+            s.kafka_group_gen_dropped = 0;
+            s.kafka_group_gen_proposed = 0;
+            s.kafka_group_members_proposed = 0;
+            s.gen_proposed = [0; KGROUPS];
+        }
 
         s.kafka_fetch_rx = 0;
         s.store.full = 0;
@@ -567,6 +912,12 @@ pub unsafe extern "C" fn module_new(
         consumers::init(&mut s.consumers);
         s.kafka_group_ops = 0;
         s.kafka_offset_commits = 0;
+        s.kafka_fetch_out_of_range = 0;
+        #[cfg(feature = "kafka")]
+        {
+            s.kafka_fetch_not_owned = 0;
+        }
+        s.kafka_offset_ungated = 0;
         s.amqp_delivers = 0;
         s.amqp_consumer_acks = 0;
         dev_log(sys, 3, b"[sess] init v9".as_ptr(), 14);
@@ -884,27 +1235,35 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
             if p_errs[pi] != 0 {
                 continue;
             }
-            let op_body_len = 2 + 2 + topic_len + p_lens[pi];
+            let op_body_len = 1 + 2 + 2 + topic_len + p_lens[pi];
             let hdr = wire::QPROP_HEADER_LEN;
             if hdr + op_body_len > s.out_buf.len() {
                 continue;
             }
             wire::encode_qprop_header(&mut s.out_buf[..hdr], wire::QOP_KAFKA_PRODUCE, 0, 0);
-            s.out_buf[hdr..hdr + 2].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
-            s.out_buf[hdr + 2..hdr + 4].copy_from_slice(&(topic_len as u16).to_le_bytes());
-            s.out_buf[hdr + 4..hdr + 4 + topic_len].copy_from_slice(&topic[..topic_len]);
+            // No client is waiting on an acks=0 produce, so no origin.
+            s.out_buf[hdr] = wire::PRODUCE_ORIGIN_NONE;
+            s.out_buf[hdr + 1..hdr + 3].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
+            s.out_buf[hdr + 3..hdr + 5].copy_from_slice(&(topic_len as u16).to_le_bytes());
+            s.out_buf[hdr + 5..hdr + 5 + topic_len].copy_from_slice(&topic[..topic_len]);
             core::ptr::copy_nonoverlapping(
                 s.in_buf.as_ptr().add(p_offs[pi]),
-                s.out_buf.as_mut_ptr().add(hdr + 4 + topic_len),
+                s.out_buf.as_mut_ptr().add(hdr + 5 + topic_len),
                 p_lens[pi],
             );
-            if try_emit(
+            // A Kafka partition is the unit of placement: its log lives
+            // on one shard so offsets stay contiguous and ordered.
+            // Tenant is the placeholder 0 until multi-tenancy is wired.
+            let shard = wire::shard_kafka(0, &topic[..topic_len], p_ids[pi] as u32);
+            if try_emit_keyed(
                 sys,
                 s.out_proposals,
-                wire::MSG_CLIENT_PROPOSAL,
+                &s.view,
+                shard,
                 &s.out_buf[..hdr + op_body_len],
             ) {
                 s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                s.hb_prop = s.hb_prop.wrapping_add(1);
             }
         }
         return;
@@ -940,7 +1299,7 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
             p_errs[pi] = KERR_REQUEST_TIMED_OUT;
             continue;
         };
-        let op_body_len = 2 + 2 + topic_len + p_lens[pi];
+        let op_body_len = 1 + 2 + 2 + topic_len + p_lens[pi];
         let prop_total = wire::QPROP_TAGGED_HDR_LEN + op_body_len;
         if prop_total > s.out_buf.len() {
             let _ = correlate::take(&mut s.correlate, cid);
@@ -955,23 +1314,41 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
             slot,
         );
         let ob = wire::QPROP_TAGGED_HDR_LEN;
-        s.out_buf[ob..ob + 2].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
-        s.out_buf[ob + 2..ob + 4].copy_from_slice(&(topic_len as u16).to_le_bytes());
-        s.out_buf[ob + 4..ob + 4 + topic_len].copy_from_slice(&topic[..topic_len]);
+        // This node accepted the produce, so apply on THIS node — and
+        // only this node — may resolve the waiting inflight slot.
+        s.out_buf[ob] = s.self_id;
+        s.out_buf[ob + 1..ob + 3].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
+        s.out_buf[ob + 3..ob + 5].copy_from_slice(&(topic_len as u16).to_le_bytes());
+        s.out_buf[ob + 5..ob + 5 + topic_len].copy_from_slice(&topic[..topic_len]);
         core::ptr::copy_nonoverlapping(
             s.in_buf.as_ptr().add(p_offs[pi]),
-            s.out_buf.as_mut_ptr().add(ob + 4 + topic_len),
+            s.out_buf.as_mut_ptr().add(ob + 5 + topic_len),
             p_lens[pi],
         );
-        if try_emit(
+        let shard = wire::shard_kafka(0, &topic[..topic_len], p_ids[pi] as u32);
+        // Ownership is decided BEFORE the emit so the client is told
+        // WHY. `try_emit_keyed` refuses the same work, but its `false`
+        // is indistinguishable from backpressure, and answering a moved
+        // partition with `REQUEST_TIMED_OUT` makes the client retry this
+        // broker until it gives up instead of refreshing metadata and
+        // going to the right one.
+        if let Some(e) = kafka_shard_error(&s.view, shard) {
+            let _ = correlate::take(&mut s.correlate, cid);
+            p_errs[pi] = e;
+            continue;
+        }
+        if try_emit_keyed(
             sys,
             s.out_proposals_tagged,
-            wire::MSG_CLIENT_PROPOSAL,
+            &s.view,
+            shard,
             &s.out_buf[..prop_total],
         ) {
             s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+            s.hb_prop = s.hb_prop.wrapping_add(1);
             pending += 1;
         } else {
+            // Reached only under genuine backpressure now.
             let _ = correlate::take(&mut s.correlate, cid);
             p_errs[pi] = KERR_REQUEST_TIMED_OUT;
         }
@@ -1055,6 +1432,125 @@ unsafe fn emit_kafka_produce_response_multi(
 // ── Apply-side message store ────────────────────────────────────────────────
 
 #[cfg(feature = "kafka")]
+/// Replicate one member's identity and assignment so a coordinator
+/// change does not cost a rebalance.
+///
+/// Best-effort: a dropped proposal costs the group a rebalance after
+/// the next failover, which is what happens today anyway, so it is
+/// counted rather than retried. It must never block SyncGroup.
+///
+/// # Safety
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable`.
+unsafe fn propose_group_member(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    gi: usize,
+    member_id: &[u8],
+    assign: &[u8],
+) {
+    let mut name = [0u8; KG_NAME];
+    let Some((nl, _)) = consumers::group_snapshot(&s.consumers, gi, &mut name) else {
+        return;
+    };
+    let ml = member_id.len();
+    let al = assign.len();
+    if ml == 0 || ml > KG_NAME || al > KG_META {
+        return;
+    }
+    let body_len = 2 + nl + 1 + ml + 2 + al;
+    let total = wire::QPROP_UNTAGGED_HDR_LEN + body_len;
+    if total > s.out_buf.len() {
+        return;
+    }
+    wire::encode_qprop_header(
+        &mut s.out_buf[..wire::QPROP_HEADER_LEN],
+        wire::QOP_KAFKA_GROUP_MEMBER,
+        0,
+        0,
+    );
+    let mut o = wire::QPROP_UNTAGGED_HDR_LEN;
+    s.out_buf[o..o + 2].copy_from_slice(&(nl as u16).to_le_bytes());
+    o += 2;
+    s.out_buf[o..o + nl].copy_from_slice(&name[..nl]);
+    o += nl;
+    s.out_buf[o] = ml as u8;
+    o += 1;
+    s.out_buf[o..o + ml].copy_from_slice(member_id);
+    o += ml;
+    s.out_buf[o..o + 2].copy_from_slice(&(al as u16).to_le_bytes());
+    o += 2;
+    s.out_buf[o..o + al].copy_from_slice(assign);
+    if try_emit(
+        sys,
+        s.out_proposals,
+        wire::MSG_CLIENT_PROPOSAL,
+        &s.out_buf[..total],
+    ) {
+        s.kafka_group_members_proposed = s.kafka_group_members_proposed.wrapping_add(1);
+        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+        s.hb_prop = s.hb_prop.wrapping_add(1);
+    }
+}
+
+#[cfg(feature = "kafka")]
+/// Replicate any group generation that has advanced since we last
+/// proposed it.
+///
+/// A SWEEP rather than an emission at each bump site, because the
+/// generation moves on three separate paths — join, leave, and the bulk
+/// `release_conn` that reclaims members of a dropped connection — and
+/// one of them lives inside `consumers` where there is no syscall table
+/// to propose from. Reconciling in one place cannot miss a path that a
+/// future fourth mutation site would also have to remember.
+///
+/// Safe to repeat: apply raises the generation to a MAXIMUM, so a
+/// duplicate or out-of-order record converges on the same value.
+///
+/// # Safety
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable`.
+unsafe fn reconcile_group_generations(s: &mut ModuleState, sys: &SyscallTable) {
+    for gi in 0..KGROUPS {
+        let mut name = [0u8; KG_NAME];
+        let Some((nl, generation)) = consumers::group_snapshot(&s.consumers, gi, &mut name) else {
+            continue;
+        };
+        if generation <= s.gen_proposed[gi] {
+            continue;
+        }
+        let body_len = 2 + nl + 4;
+        let total = wire::QPROP_UNTAGGED_HDR_LEN + body_len;
+        if total > s.out_buf.len() {
+            continue;
+        }
+        wire::encode_qprop_header(
+            &mut s.out_buf[..wire::QPROP_HEADER_LEN],
+            wire::QOP_KAFKA_GROUP_GEN,
+            0,
+            0,
+        );
+        let ob = wire::QPROP_UNTAGGED_HDR_LEN;
+        s.out_buf[ob..ob + 2].copy_from_slice(&(nl as u16).to_le_bytes());
+        s.out_buf[ob + 2..ob + 2 + nl].copy_from_slice(&name[..nl]);
+        s.out_buf[ob + 2 + nl..ob + 2 + nl + 4].copy_from_slice(&generation.to_le_bytes());
+        if try_emit(
+            sys,
+            s.out_proposals,
+            wire::MSG_CLIENT_PROPOSAL,
+            &s.out_buf[..total],
+        ) {
+            // Record only on a successful write: a dropped proposal must
+            // be retried, or the generation this coordinator issued is
+            // never replicated and a successor could reissue it.
+            s.gen_proposed[gi] = generation;
+            s.kafka_group_gen_proposed = s.kafka_group_gen_proposed.wrapping_add(1);
+            s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+            s.hb_prop = s.hb_prop.wrapping_add(1);
+        }
+    }
+}
+
 /// Apply-side QOP_KAFKA_PRODUCE: store the committed record batches and
 /// patch each baseOffset to the partition's contiguous logical offset
 /// (bytes 0..8 of a v2 batch sit OUTSIDE the batch CRC, so the patch is
@@ -1064,18 +1560,50 @@ unsafe fn emit_kafka_produce_response_multi(
 /// accumulates multiple record batches for one partition sends them
 /// back-to-back); each is stored as its own entry with its own
 /// contiguous baseOffset so consumer offset accounting stays monotonic.
-fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
-    if body.len() < 4 {
+#[cfg(feature = "kafka")]
+unsafe fn apply_kafka_produce(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    body: &[u8],
+    session_slot: u32,
+) {
+    if body.len() < 5 {
         return;
     }
-    let partition = u16::from_le_bytes([body[0], body[1]]);
-    let tl = u16::from_le_bytes([body[2], body[3]]) as usize;
-    if tl == 0 || tl > KAFKA_MAX_TOPIC || 4 + tl >= body.len() {
+    let origin = body[0];
+    let partition = u16::from_le_bytes([body[1], body[2]]);
+    let tl = u16::from_le_bytes([body[3], body[4]]) as usize;
+    if tl == 0 || tl > KAFKA_MAX_TOPIC || 5 + tl >= body.len() {
         return;
     }
     let mut topic = [0u8; KAFKA_MAX_TOPIC];
-    topic[..tl].copy_from_slice(&body[4..4 + tl]);
-    let records = &body[4 + tl..];
+    topic[..tl].copy_from_slice(&body[5..5 + tl]);
+    let records = &body[5 + tl..];
+
+    // Resolve the client waiting on this batch, if it is ours. The
+    // origin check is what makes this safe on a follower: a replica
+    // that did not accept the produce never touches an inflight slot,
+    // so it cannot stamp an offset onto an unrelated client's request.
+    // `inflight_valid` then rejects a slot that has been freed and
+    // reused since (EPOCH TAGGING), and the topic/partition check
+    // rejects a slot whose occupant is a different request.
+    let mut waiting: Option<(usize, usize)> = None;
+    if origin != wire::PRODUCE_ORIGIN_NONE && origin == s.self_id {
+        let (ki, epoch) = store::kin_decode_slot(session_slot);
+        if ki < KAFKA_INFLIGHT && store::inflight_valid(&s.store, ki, epoch) {
+            if let Some(e) = store::inflight_get(&s.store, ki) {
+                if e.topic_len as usize == tl && e.topic[..tl] == topic[..tl] {
+                    let n = e.n_parts as usize;
+                    for pidx in 0..n.min(KIN_MAX_PARTS) {
+                        if e.part_ids[pidx] == partition as i32 {
+                            waiting = Some((ki, pidx));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let Some(pi) = store::find_or_create(&mut s.store, &topic[..tl], partition) else {
         s.store.full = s.store.full.wrapping_add(1);
         return;
@@ -1086,6 +1614,9 @@ fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
     // A batch spans 12 + batchLength bytes.
     let mut bo = 0usize;
     let mut guard = 0u32;
+    // `base_offset` is where the REQUEST's data begins, so only the
+    // first accepted batch of this op-body sets it.
+    let mut stamped = false;
     while bo + 61 <= records.len() && guard < 256 {
         guard += 1;
         let batch_len = i32::from_be_bytes([
@@ -1111,13 +1642,136 @@ fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
             break;
         }
         let nrec = (nrec_minus1 + 1) as u32;
+
+        // Idempotence gate. A v2 batch carries the producer identity and
+        // the sequence range it covers:
+        //   producerId @43 (i64), producerEpoch @51 (i16),
+        //   baseSequence @53 (i32); lastOffsetDelta @23 spans the range.
+        // Deciding here — on the committed entry, on every replica —
+        // is what makes the verdict survive failover: the propose side
+        // would have to guess, because any node may accept a produce.
+        let producer_id = i64::from_be_bytes([
+            records[bo + 43],
+            records[bo + 44],
+            records[bo + 45],
+            records[bo + 46],
+            records[bo + 47],
+            records[bo + 48],
+            records[bo + 49],
+            records[bo + 50],
+        ]);
+        let producer_epoch = i16::from_be_bytes([records[bo + 51], records[bo + 52]]);
+        let base_seq = i32::from_be_bytes([
+            records[bo + 53],
+            records[bo + 54],
+            records[bo + 55],
+            records[bo + 56],
+        ]);
+        let last_seq = base_seq.saturating_add(nrec_minus1);
+        let verdict = s.idem.classify(
+            producer_id,
+            producer_epoch,
+            partition as u32,
+            base_seq,
+            last_seq,
+        );
+        match verdict {
+            kafka_idem::IdemVerdict::Duplicate { base_offset } => {
+                // The producer retried a batch we already have. NOT
+                // appending it is the entire point: this is the case
+                // that silently duplicated data before. Acknowledge it
+                // with the offset the ORIGINAL landed at — answering a
+                // different one would make a retrying producer record
+                // the wrong position.
+                s.kafka_idem_duplicates = s.kafka_idem_duplicates.wrapping_add(1);
+                if let Some((ki, pidx)) = waiting {
+                    if !stamped {
+                        store::inflight_set_part_offset(&mut s.store, ki, pidx, base_offset);
+                        stamped = true;
+                    }
+                }
+                bo += total;
+                continue;
+            }
+            kafka_idem::IdemVerdict::Reject(code) => {
+                // A gap or a fenced epoch. Appending would either leave
+                // an unfillable hole or accept a zombie's writes. Tell
+                // the producer WHICH, so its driver can act: an
+                // OUT_OF_ORDER_SEQUENCE_NUMBER is retriable after a
+                // reset, an INVALID_PRODUCER_EPOCH is fatal for that
+                // producer instance. Reporting success here would let it
+                // believe data landed that never did.
+                s.kafka_idem_rejected = s.kafka_idem_rejected.wrapping_add(1);
+                if let Some((ki, pidx)) = waiting {
+                    store::inflight_set_part_err(&mut s.store, ki, pidx, code);
+                }
+                bo += total;
+                continue;
+            }
+            kafka_idem::IdemVerdict::Accept => {}
+        }
+
         // `records` aliases s.in_buf; store::push writes only the store.
         let rec = unsafe { core::slice::from_raw_parts(records.as_ptr().add(bo), total) };
-        if let Some((offset, data_pos)) = store::push(&mut s.store, pi, KFLAG_BATCH, nrec, rec) {
+        if let Some((offset, data_pos)) =
+            store::push(&mut s.store, pi, KFLAG_BATCH, nrec, rec, dev_millis(sys))
+        {
             store::stamp_base_offset(&mut s.store, pi, data_pos, offset);
+            // Anchor this offset to the raft entry carrying it, so a
+            // Fetch that has fallen behind the in-memory ring can still
+            // be located in the WAL — the ring is a cache of the raft
+            // log, not the log itself. Sparse: the index ignores most
+            // calls, so this is cheap on every append.
+            // The anchor names the raft partition too: indexes from
+            // different partitions are NOT comparable — each log numbers
+            // from 1 — so a cold read must ask that partition's WAL and
+            // a retention floor must be published to that partition.
+            store::note_offset_anchor(
+                &mut s.store,
+                pi,
+                offset,
+                s.applying_index,
+                s.applying_partition,
+            );
             s.store.batches_applied = s.store.batches_applied.wrapping_add(1);
+            // Report the partition's LOGICAL offset, which is only
+            // known here. The propose side can only see the raft WAL
+            // index, which is unrelated to the offset a consumer will
+            // fetch. Stamp the FIRST batch's offset: `base_offset` names where the request's
+            // data starts, so later batches in the same request must
+            // not overwrite it.
+            if let Some((ki, pidx)) = waiting {
+                if !stamped {
+                    store::inflight_set_part_offset(&mut s.store, ki, pidx, offset as i64);
+                    stamped = true;
+                }
+            }
+            // Record ONLY after the append landed. Recording an append
+            // that failed would make the producer's retry look like a
+            // duplicate and be dropped without ever being stored.
+            s.idem.commit(
+                producer_id,
+                producer_epoch,
+                partition as u32,
+                last_seq,
+                offset as i64,
+            );
         }
         bo += total;
+    }
+
+    // This partition's apply has landed. Durability and apply are
+    // independent post-commit signals with no ordering between them —
+    // measured: the ack routinely arrives FIRST — so whichever completes
+    // last releases the response. Gating on durability alone reported an
+    // offset apply had not yet assigned.
+    if let Some((ki, _)) = waiting {
+        store::inflight_apply_part(&mut s.store, ki);
+        if store::inflight_ready(&s.store, ki) && emit_kafka_produce_response_multi(s, sys, ki) {
+            s.kafka_produce_acked = s.kafka_produce_acked.wrapping_add(1);
+            store::inflight_free(&mut s.store, ki);
+            s.acks_emitted = s.acks_emitted.wrapping_add(1);
+        }
     }
 }
 
@@ -1125,7 +1779,7 @@ fn apply_kafka_produce(s: &mut ModuleState, body: &[u8]) {
 /// Apply-side QOP_AMQP_PUBLISH: store the raw message body on the
 /// routing key's log (partition 0, raw-flagged — invisible to Kafka
 /// Fetch). Op-body: [rk_len:u16 LE][routing_key][payload].
-fn apply_amqp_publish(s: &mut ModuleState, body: &[u8]) {
+fn apply_amqp_publish(s: &mut ModuleState, body: &[u8], now_ms: u64) {
     if body.len() < 2 {
         return;
     }
@@ -1142,7 +1796,7 @@ fn apply_amqp_publish(s: &mut ModuleState, body: &[u8]) {
     let pl = payload.len();
     let pp = payload.as_ptr();
     let pay = unsafe { core::slice::from_raw_parts(pp, pl) };
-    let _ = store::push(&mut s.store, pi, 0, 1, pay);
+    let _ = store::push(&mut s.store, pi, 0, 1, pay, now_ms);
 }
 
 // ── Kafka Fetch / ListOffsets ───────────────────────────────────────────────
@@ -1182,9 +1836,164 @@ unsafe fn emit_kafka_response_outbuf(
     w > 0
 }
 
+/// Try to serve a Fetch from the WAL because its offset has aged out of
+/// the in-memory ring. Returns true when the request has been PARKED —
+/// the caller must then emit nothing, because the answer arrives on a
+/// later step.
+///
+/// Restricted to a single topic and a single partition. A Fetch can
+/// cover many partitions and the response is built as one frame, so
+/// parking one partition would park the whole reply; the simple
+/// consumer case is one partition, and every other shape keeps exactly
+/// today's behaviour.
+///
+/// The Kafka log IS the raft log, so a record evicted from the ring is
+/// still durable — what was missing was the way back from a Kafka
+/// OFFSET to a raft INDEX, which `store::seek_offset` now provides.
+#[cfg(feature = "kafka")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the parked request IS this argument list — conn, api version, \
+              correlation, topic, partition and offset must all be carried to \
+              a later step to answer on. Bundling them into a struct would \
+              just move the same fields behind a name the caller has to build"
+)]
+unsafe fn try_park_cold_fetch(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u8,
+    api_ver: i16,
+    corr: i32,
+    topic: &[u8],
+    partition: i32,
+    fetch_offset: i64,
+    pi: usize,
+    now: u64,
+) -> bool {
+    if s.out_wal_request < 0 || s.in_wal_reply < 0 || fetch_offset < 0 {
+        return false;
+    }
+    // Never serve below the RETENTION floor. An offset can be under
+    // `log_start` for two opposite reasons: evicted for capacity (still
+    // on disk, fair game) or deleted by a retention/compaction policy
+    // (gone, and a broker that serves it has not deleted it). Only the
+    // first is a cold read.
+    if (fetch_offset as u64) < store::retention_floor(&s.store, pi) {
+        return false;
+    }
+    // Only worth a WAL read if the index can actually locate it. Below
+    // the index floor the answer is still OFFSET_OUT_OF_RANGE.
+    let Some((raft_partition, raft_index)) = store::seek_offset(&s.store, pi, fetch_offset as u64)
+    else {
+        return false;
+    };
+    let Some(slot) = (0..COLD_FETCH_SLOTS).find(|&i| s.cold[i].active == 0) else {
+        // All slots busy: answer from the ring's rules rather than
+        // queueing. A cold read is the slow path and must not become an
+        // unbounded backlog.
+        return false;
+    };
+    let request_id = s.next_cold_id;
+    s.next_cold_id = s.next_cold_id.wrapping_add(1).max(1);
+
+    let mut buf = [0u8; wire::WAL_ENTRY_REQUEST_LEN];
+    wire::encode_wal_entry_request(&mut buf, request_id, raft_index);
+    // Partitioned envelope: one durability instance hosts every raft
+    // partition's WAL, and only the partition the anchor names holds
+    // this index.
+    if wire::channel_write_partitioned(
+        sys,
+        s.out_wal_request,
+        raft_partition,
+        wire::MSG_WAL_ENTRY_REQUEST,
+        &buf,
+    ) <= 0
+    {
+        return false;
+    }
+
+    let tl = topic.len().min(KAFKA_MAX_TOPIC);
+    let c = &mut s.cold[slot];
+    *c = ColdFetch::zero();
+    c.active = 1;
+    c.conn_id = conn_id;
+    c.api_ver = api_ver;
+    c.corr = corr;
+    c.partition = partition;
+    c.fetch_offset = fetch_offset;
+    c.request_id = request_id;
+    c.issued_ms = now;
+    c.topic_len = tl as u8;
+    c.part_idx = pi as u8;
+    c.topic[..tl].copy_from_slice(&topic[..tl]);
+    true
+}
+
+/// Emit a single-partition Fetch response. Used by the cold path, whose
+/// answer is built on a later step than the request.
+#[cfg(feature = "kafka")]
+unsafe fn emit_cold_fetch_response(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    slot: usize,
+    error: i16,
+    hw: i64,
+    log_start: i64,
+    records: &[u8],
+) {
+    let c = s.cold[slot];
+    let tl = c.topic_len as usize;
+    let mut p = 0usize;
+    if c.api_ver >= 1 {
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // throttle
+    }
+    s.out_buf[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    p += 4; // one topic
+    s.out_buf[p..p + 2].copy_from_slice(&(tl as i16).to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + tl].copy_from_slice(&c.topic[..tl]);
+    p += tl;
+    s.out_buf[p..p + 4].copy_from_slice(&1i32.to_be_bytes());
+    p += 4; // one partition
+    s.out_buf[p..p + 4].copy_from_slice(&c.partition.to_be_bytes());
+    p += 4;
+    s.out_buf[p..p + 2].copy_from_slice(&error.to_be_bytes());
+    p += 2;
+    s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes());
+    p += 8;
+    if c.api_ver >= 4 {
+        s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes());
+        p += 8; // LSO
+    }
+    if c.api_ver >= 5 {
+        s.out_buf[p..p + 8].copy_from_slice(&log_start.to_be_bytes());
+        p += 8;
+    }
+    if c.api_ver >= 4 {
+        s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+        p += 4; // aborted
+    }
+    let n = records.len().min(s.out_buf.len().saturating_sub(p + 4));
+    s.out_buf[p..p + 4].copy_from_slice(&(n as i32).to_be_bytes());
+    p += 4;
+    if n > 0 {
+        s.out_buf[p..p + n].copy_from_slice(&records[..n]);
+        p += n;
+    }
+    emit_kafka_response_outbuf(s, sys, c.conn_id, 1, c.api_ver, c.corr, p);
+    s.cold[slot].active = 0;
+}
+
 /// Bounds on how much of a Fetch/ListOffsets request we service in one
 /// response. A real assignment is a handful of topics × ≤16 partitions;
 /// excess entries are parsed-and-skipped, not answered (documented gap).
+/// `session_slot` in a `MSG_TOPIC_SUBSCRIBE` record when the subscriber's
+/// session lives on ANOTHER PRG. The topic's owner still records the
+/// subscription — it is the node that matches publishes — and addresses
+/// the subscriber by `stream_hash` instead.
+const SESSION_SLOT_REMOTE: u32 = u32::MAX;
+
 const KFETCH_MAX_TOPICS: usize = 8;
 const KFETCH_MAX_PARTS: usize = 16;
 
@@ -1195,6 +2004,8 @@ const KFETCH_MAX_PARTS: usize = 16;
 /// immediately and the client re-polls).
 ///
 /// # Safety
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` per the module ABI.
 unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let conn_id = s.in_buf[0];
     let api_ver = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
@@ -1322,9 +2133,73 @@ unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usiz
             if p + fixed > BUF_SIZE {
                 return;
             }
+            // Offset validity, BEFORE claiming success.
+            //
+            // The apply-side store is a bounded ring that evicts its
+            // oldest entries when full, so `log_start` advances past
+            // offsets a slow consumer has not read yet. Answering
+            // `error = 0` with no records tells that consumer it is
+            // CAUGHT UP: it skips the evicted range silently and never
+            // learns it lost data. Kafka's contract for this is
+            // OFFSET_OUT_OF_RANGE, which is what drives the client's
+            // `auto.offset.reset`.
+            //
+            // Same test above the high watermark: an offset past the
+            // end is out of range, not "nothing yet".
+            // (`kafka_log_core::Watermarks::readable_at` is the same
+            // predicate, stated once for the durable log.)
+            // Ownership FIRST, before the watermarks are trusted.
+            //
+            // This node's `hw` and `log_start` describe the log it
+            // holds. For a partition whose shard has moved away, that
+            // state has been released, so both read 0 and every arm
+            // below concludes `KERR_NONE` with no records — which tells
+            // the consumer it is CAUGHT UP on a partition it has not
+            // read. That is the same silent-skip failure the
+            // out-of-range test exists to prevent, except the consumer
+            // skips the whole partition rather than an evicted range.
+            // Answering with the placement disposition instead sends it
+            // to the broker that has the data.
+            let shard = wire::shard_kafka(0, &topic[..tl], partition as u32);
+            let partition_error = if let Some(e) = kafka_shard_error(&s.view, shard) {
+                s.kafka_fetch_not_owned = s.kafka_fetch_not_owned.wrapping_add(1);
+                e
+            } else if pi.is_none() {
+                KERR_NONE // unknown topic/partition answers empty
+            } else if fetch_offset < log_start {
+                // Below the ring — but the record may still be in the
+                // WAL, which is the same log. Park the request and
+                // answer from disk if the offset index can locate it;
+                // only a single-partition Fetch qualifies, because the
+                // response is one frame.
+                if topic_count == 1
+                    && part_count == 1
+                    && try_park_cold_fetch(
+                        s,
+                        sys,
+                        conn_id,
+                        api_ver,
+                        kafka_corr,
+                        &topic[..tl],
+                        partition,
+                        fetch_offset,
+                        pi.unwrap_or(0),
+                        dev_millis(sys),
+                    )
+                {
+                    return;
+                }
+                s.kafka_fetch_out_of_range = s.kafka_fetch_out_of_range.wrapping_add(1);
+                KERR_OFFSET_OUT_OF_RANGE
+            } else if fetch_offset > hw {
+                s.kafka_fetch_out_of_range = s.kafka_fetch_out_of_range.wrapping_add(1);
+                KERR_OFFSET_OUT_OF_RANGE
+            } else {
+                KERR_NONE
+            };
             s.out_buf[p..p + 4].copy_from_slice(&partition.to_be_bytes());
             p += 4;
-            s.out_buf[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+            s.out_buf[p..p + 2].copy_from_slice(&partition_error.to_be_bytes());
             p += 2;
             s.out_buf[p..p + 8].copy_from_slice(&hw.to_be_bytes());
             p += 8;
@@ -1342,11 +2217,14 @@ unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usiz
             }
             let records_len_pos = p;
             p += 4;
+            // An out-of-range fetch returns no records — the error is
+            // the answer. Serving from `log_start` instead would hand
+            // the consumer a silent jump over the evicted range.
             let rb = match pi {
-                Some(pi) => {
+                Some(pi) if partition_error == KERR_NONE => {
                     store::fetch_into(&s.store, pi, fetch_offset, &mut s.out_buf, p, budget_end)
                 }
-                None => 0,
+                _ => 0,
             };
             s.out_buf[records_len_pos..records_len_pos + 4]
                 .copy_from_slice(&(rb as i32).to_be_bytes());
@@ -1577,6 +2455,23 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
         return;
     }
 
+    // Placement. AMQP 0-9-1 has no redirect — `Connection.Redirect`
+    // existed in 0-8 and was removed — so unlike Kafka and MQTT there
+    // is nothing to point the client AT. What the protocol does have is
+    // a negative confirm, and the honest answer for a queue served by
+    // another node is to use it: a confirm-mode publisher then knows
+    // its message was not stored instead of blocking on a confirm that
+    // will never come. A publisher NOT in confirm mode gets nothing,
+    // which is inherent to the protocol rather than a choice here.
+    {
+        let shard = wire::shard_amqp_queue(0, &s.in_buf[15..15 + rl]);
+        if !s.view.owns_shard(shard) {
+            s.amqp_publish_errors = s.amqp_publish_errors.wrapping_add(1);
+            nack(s, sys);
+            return;
+        }
+    }
+
     if delivery_tag == 0 {
         let hdr = wire::QPROP_HEADER_LEN;
         wire::encode_qprop_header(&mut s.out_buf[..hdr], wire::QOP_AMQP_PUBLISH, 0, 0);
@@ -1586,13 +2481,17 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
             s.out_buf.as_mut_ptr().add(hdr + 2),
             rl + body_len,
         );
-        if try_emit(
+        // AMQP routing key names the queue, which owns the messages.
+        let shard = wire::shard_amqp_queue(0, &s.in_buf[15..15 + rl]);
+        if try_emit_keyed(
             sys,
             s.out_proposals,
-            wire::MSG_CLIENT_PROPOSAL,
+            &s.view,
+            shard,
             &s.out_buf[..hdr + op_body_len],
         ) {
             s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+            s.hb_prop = s.hb_prop.wrapping_add(1);
         }
         return;
     }
@@ -1620,10 +2519,12 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
         s.out_buf.as_mut_ptr().add(ob + 2),
         rl + body_len,
     );
-    if !try_emit(
+    let shard = wire::shard_amqp_queue(0, &s.in_buf[15..15 + rl]);
+    if !try_emit_keyed(
         sys,
         s.out_proposals_tagged,
-        wire::MSG_CLIENT_PROPOSAL,
+        &s.view,
+        shard,
         &s.out_buf[..ob + op_body_len],
     ) {
         let _ = correlate::take(&mut s.correlate, cid);
@@ -1631,6 +2532,7 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
         return;
     }
     s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+    s.hb_prop = s.hb_prop.wrapping_add(1);
     store::inflight_open(
         &mut s.store,
         ki,
@@ -2032,6 +2934,12 @@ unsafe fn handle_kafka_sync_group(s: &mut ModuleState, sys: &SyscallTable, plen:
             let mut abuf = [0u8; KG_META];
             core::ptr::copy_nonoverlapping(s.in_buf.as_ptr().add(off), abuf.as_mut_ptr(), al);
             consumers::member_set_assignment(&mut s.consumers, gi, &mid[..idl], &abuf[..al]);
+            // Replicate the stable membership. Emitted here, at the one
+            // site where an assignment is decided, rather than by a
+            // sweep: unlike the generation (which moves on join, leave
+            // AND the bulk conn release), an assignment changes in
+            // exactly this loop.
+            propose_group_member(s, sys, gi, &mid[..idl], &abuf[..al]);
             off += bl;
         }
     }
@@ -2127,7 +3035,12 @@ unsafe fn handle_kafka_heartbeat_leave(
 /// (response is not durability-gated — see wire.rs).
 ///
 /// # Safety
-unsafe fn handle_kafka_offset_commit(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
+unsafe fn handle_kafka_offset_commit(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    now: u64,
+    plen: usize,
+) {
     let conn_id = s.in_buf[0];
     let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
     let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
@@ -2156,6 +3069,19 @@ unsafe fn handle_kafka_offset_commit(s: &mut ModuleState, sys: &SyscallTable, pl
         }
         off += 8; // retention_time
     }
+
+    // DURABILITY GATING. The offset is proposed to raft; the response
+    // must not claim success until that proposal is quorum-durable.
+    // Acking early is not data loss — after a crash the consumer
+    // re-reads from an older offset — but it IS a broken promise: a
+    // client told "committed" will not commit that offset again.
+    //
+    // The response is parked in an inflight slot and fired from the
+    // same MSG_ACK_EMIT path that gates PUBACK and the produce
+    // response, so it inherits their counting, lifecycle and expiry
+    // sweep rather than adding a second mechanism beside them.
+    let gate = store::inflight_alloc(&mut s.store);
+    let mut gated_parts = 0u8;
     if off + 4 > end {
         return;
     }
@@ -2266,12 +3192,92 @@ unsafe fn handle_kafka_offset_commit(s: &mut ModuleState, sys: &SyscallTable, pl
             q += 2;
             prop[q..q + 8].copy_from_slice(&ofs_offset.to_le_bytes());
             q += 8;
-            if try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, &prop[..q]) {
-                s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+            // Committed offsets belong to the group coordinator's
+            // shard, so a group's offsets stay on one partition.
+            let shard = wire::shard_kafka_group(0, &group[..gl]);
+            let mut emitted_gated = false;
+            if let Some((ki, slot)) = gate {
+                if gated_parts < u8::MAX {
+                    // Tagged, so durability comes back as
+                    // MSG_PROPOSAL_ASSIGNED -> ack registration ->
+                    // MSG_ACK_EMIT, which is what releases the response.
+                    let packet_id = (ki as u16) | ((gated_parts as u16) << 8);
+                    if let Some(cid) =
+                        correlate::allocate(&mut s.correlate, slot, packet_id, OP_KOFFSET, now)
+                    {
+                        let mut tagged = [0u8; 208];
+                        tagged[0..8].copy_from_slice(&cid.to_le_bytes());
+                        tagged[8..8 + q].copy_from_slice(&prop[..q]);
+                        if try_emit_keyed(
+                            sys,
+                            s.out_proposals_tagged,
+                            &s.view,
+                            shard,
+                            &tagged[..8 + q],
+                        ) {
+                            s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                            s.hb_prop = s.hb_prop.wrapping_add(1);
+                            gated_parts += 1;
+                            emitted_gated = true;
+                        } else {
+                            let _ = correlate::take(&mut s.correlate, cid);
+                        }
+                    }
+                }
+            }
+            if !emitted_gated {
+                // No slot or no correlation free: fall back to the
+                // previous ungated emit rather than dropping the
+                // commit, and count it — the guarantee does not hold
+                // for these and that must be visible.
+                if try_emit_keyed(sys, s.out_proposals, &s.view, shard, &prop[..q]) {
+                    s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                    s.hb_prop = s.hb_prop.wrapping_add(1);
+                    s.kafka_offset_ungated = s.kafka_offset_ungated.wrapping_add(1);
+                }
             }
         }
     }
-    emit_kafka_response_outbuf(s, sys, conn_id, 8, v, corr, p);
+    // Park the response when anything was gated; otherwise answer now.
+    let parked = match gate {
+        Some((ki, _)) if gated_parts > 0 => {
+            if store::inflight_set_response(&mut s.store, ki, &s.out_buf[..p]) {
+                store::inflight_open(
+                    &mut s.store,
+                    ki,
+                    store::InflightOpen {
+                        conn_id,
+                        proto: KIN_PROTO_KAFKA_OFFSET,
+                        topic_len: 0,
+                        n_parts: gated_parts,
+                        n_done: 0,
+                        api_ver: v,
+                        acks: 1,
+                        kafka_corr: corr,
+                        channel: 0,
+                        delivery_tag: 0,
+                        ts_ms: now,
+                    },
+                    &[],
+                );
+                true
+            } else {
+                // Larger than a slot can park. Answer now and count it.
+                store::inflight_free(&mut s.store, ki);
+                s.kafka_offset_ungated = s.kafka_offset_ungated.wrapping_add(1);
+                false
+            }
+        }
+        other => {
+            if let Some((ki, _)) = other {
+                store::inflight_free(&mut s.store, ki);
+            }
+            false
+        }
+    };
+    if !parked {
+        emit_kafka_response_outbuf(s, sys, conn_id, 8, v, corr, p);
+    }
 }
 
 #[cfg(feature = "kafka")]
@@ -2599,7 +3605,7 @@ unsafe fn amqp_delivery_pump(s: &mut ModuleState, sys: &SyscallTable) {
 unsafe fn outputs_ready_for_apply(s: &ModuleState, sys: &SyscallTable) -> bool {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-        for chan in [s.out_messaging, s.out_topic] {
+        for chan in [s.out_messaging, s.out_topic, s.out_cp] {
             if chan < 0 {
                 continue;
             }
@@ -2625,6 +3631,178 @@ unsafe fn try_emit(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) 
     w == total
 }
 
+/// Emit a keyed proposal: the same single atomic channel write as
+/// [`try_emit`], with the proposer's virtual-shard id prefixed so
+/// `partition_router` places it by routing key rather than by hashing
+/// the body.
+///
+/// `payload` is exactly what would have gone to [`try_emit`] under
+/// `MSG_CLIENT_PROPOSAL` — a bare op body on `out_proposals`, or
+/// `[correlation_id:u64 LE][op body]` on `out_proposals_tagged`. The
+/// router strips the shard prefix, so the bytes that reach the WAL are
+/// unchanged and the substrate's opaque-command contract holds.
+///
+/// Fetches parked awaiting a WAL read-back. Small on purpose: a cold
+/// read is the slow path, and letting many of them queue would turn a
+/// lagging consumer into a memory cost on the broker.
+#[cfg(feature = "kafka")]
+const COLD_FETCH_SLOTS: usize = 4;
+
+/// A Fetch waiting on `durability` to return the raft entry that carries
+/// its offset.
+#[cfg(feature = "kafka")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ColdFetch {
+    active: u8,
+    conn_id: u8,
+    topic_len: u8,
+    /// Store slot, so the reply can report the CURRENT high watermark
+    /// and log start. Reporting 0 would tell a consumer that has just
+    /// been served from disk that the log is empty, and it is exactly a
+    /// lagging consumer that needs to know how far behind it still is.
+    part_idx: u8,
+    api_ver: i16,
+    corr: i32,
+    partition: i32,
+    fetch_offset: i64,
+    request_id: u32,
+    issued_ms: u64,
+    topic: [u8; KAFKA_MAX_TOPIC],
+}
+
+#[cfg(feature = "kafka")]
+impl ColdFetch {
+    const fn zero() -> Self {
+        Self {
+            active: 0,
+            conn_id: 0,
+            topic_len: 0,
+            part_idx: 0,
+            api_ver: 0,
+            corr: 0,
+            partition: 0,
+            fetch_offset: 0,
+            request_id: 0,
+            issued_ms: 0,
+            topic: [0; KAFKA_MAX_TOPIC],
+        }
+    }
+}
+
+/// How long a parked cold fetch waits before it is answered
+/// OFFSET_OUT_OF_RANGE and its slot reclaimed. A WAL read is a disk
+/// read; a client that waited this long is better served an answer it
+/// can act on than a slot held for ever.
+#[cfg(feature = "kafka")]
+const COLD_FETCH_TIMEOUT_MS: u64 = 3_000;
+
+/// The Kafka error a client must be told when this node cannot serve a
+/// shard, or `None` when it can.
+///
+/// The propose-side gate in [`try_emit_keyed`] REFUSES such work, but a
+/// refusal alone is not an answer: a Kafka client that gets silence, or
+/// gets `REQUEST_TIMED_OUT`, retries the same broker until its own
+/// timeout and never learns that the partition moved. `kafka_error_for`
+/// turns the placement disposition into the code the protocol already
+/// has for this — `NOT_LEADER_OR_FOLLOWER` for a settled elsewhere-owner
+/// (refresh metadata, go to the right broker) and `LEADER_NOT_AVAILABLE`
+/// for the transient states (fenced, or our view is behind), which the
+/// client retries.
+///
+/// So the Kafka side of a redirect is an error code and not a proxy:
+/// the protocol already has a redirect, and forwarding the request
+/// would reinvent one while pinning the client to the wrong broker for
+/// ever.
+///
+/// `sender_epoch` is 0 — a plain client states no epoch, which
+/// `classify` never treats as stale.
+#[cfg(feature = "kafka")]
+fn kafka_shard_error(view: &edge::EdgeMap, shard: u32) -> Option<i16> {
+    edge::kafka_error_for(edge::classify(&view.view, view.owner_prg(shard), 0))
+}
+
+/// ## The ownership gate (EDGE-FENCE)
+///
+/// Every shard-keyed proposal this module makes passes through here,
+/// which is why the gate lives at this one chokepoint rather than at
+/// the sixteen call sites: a gate that can be forgotten at a new call
+/// site is not a fence.
+///
+/// A proposal for a shard this node does not currently own is REFUSED.
+/// While a shard is mid-transfer the losing PRG has stopped accepting
+/// and the gaining one has not started; accepting at either end is
+/// exactly how two groups come to own one shard.
+///
+/// **Gated at PROPOSE, never at APPLY** — and note this is the INVERSE
+/// of the Kafka idempotence rule, deliberately. Idempotence is a
+/// state-machine decision, so it must be taken at apply where every
+/// replica reaches the same verdict from the same log. Ownership is an
+/// ADMISSION decision: it is about whether to accept new work, and the
+/// answer legitimately differs per node and per epoch. Applying is
+/// replaying the log, and a replica must apply every committed entry
+/// unconditionally — gating apply on a live placement view would make
+/// the state machine diverge between nodes that learned a placement at
+/// different times, which is a far worse failure than the one being
+/// prevented.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn try_emit_keyed(
+    sys: &SyscallTable,
+    chan: i32,
+    view: &edge::EdgeMap,
+    shard_id: u32,
+    payload: &[u8],
+) -> bool {
+    if chan < 0 {
+        return false;
+    }
+    if !view.owns_shard(shard_id) {
+        return false;
+    }
+    emit_keyed_unowned(sys, chan, view, shard_id, payload)
+}
+
+/// Emit a keyed proposal WITHOUT the ownership gate.
+///
+/// The gate exists to stop two PRGs accepting for one shard, and that is
+/// the right rule for STATE — a session, a retained value, an offline
+/// queue. A PUBLISH is not state this node owns; it is a message to be
+/// ROUTED, and the shard key says where it must land, not who may accept
+/// it. `partition_router` puts it on the topic's partition and exactly
+/// one node applies and delivers it, so nothing is split.
+///
+/// Gating publishes on ownership was over-applying the rule, and it did
+/// not fail loudly: a client publishing to a topic owned by another PRG
+/// had the proposal REFUSED at propose, so the message never entered the
+/// log and no node could deliver it. With QoS 0 there is no ack to
+/// carry the refusal either — the publish simply vanished. Measured at
+/// `prg_count = 3`: a subscriber received nothing even when its session
+/// and the publisher shared a node.
+unsafe fn emit_keyed_unowned(
+    sys: &SyscallTable,
+    chan: i32,
+    view: &edge::EdgeMap,
+    shard_id: u32,
+    payload: &[u8],
+) -> bool {
+    if chan < 0 {
+        return false;
+    }
+    // Ownership does not gate a routed message, but the FENCE does. A
+    // fenced shard is mid-transfer: the losing owner has stopped
+    // accepting and the gaining one has not started, so accepting at
+    // EITHER end is the split ownership the fence exists to prevent.
+    // Dropping this check let a publish through mid-migration —
+    // `fence_gate.sh` caught it immediately.
+    if view.is_shard_fenced(shard_id) {
+        return false;
+    }
+    let total = (wire::ENVELOPE_HDR + wire::KEYED_PROPOSAL_HDR + payload.len()) as i32;
+    wire::channel_write_keyed_proposal(sys, chan, shard_id, payload) == total
+}
+
 /// Resolve a stash slot. Returns `true` when the slot is now free; `false`
 /// if the topic emit failed under backpressure and the slot must be
 /// retried on a subsequent tick. The retry scan in `module_step` Phase 5
@@ -2637,8 +3815,15 @@ unsafe fn try_emit(sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) 
 /// # Safety
 unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usize) -> bool {
     let env_len = correlate::stash_env_len(&s.correlate, stash_idx);
-    match correlate::stash_dedup_state(&s.correlate, stash_idx) {
-        STASH_DEDUP_OK if env_len >= 18 => {
+    let state = correlate::stash_dedup_state(&s.correlate, stash_idx);
+    if state == STASH_DEDUP_REFUSED {
+        // The table could not file the key, so it cannot call this a
+        // duplicate either. The entry is committed and the publisher
+        // acknowledged; it fans out like a fresh one, counted.
+        s.dedup_refused_delivered = s.dedup_refused_delivered.wrapping_add(1);
+    }
+    match state {
+        STASH_DEDUP_OK | STASH_DEDUP_REFUSED if env_len >= 18 => {
             // Stash holds the QOP_PUBLISH V2 op-body:
             //   [pub_qos:u8][packet_id:u16 BE][stream_hash:u64 LE]
             //   [session_epoch:u32 LE][retain:u8][topic_len:u16 BE]
@@ -2704,14 +3889,6 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
         }
         STASH_DEDUP_DUPLICATE => {
             correlate::stash_release(&mut s.correlate, stash_idx);
-            true
-        }
-        STASH_DEDUP_REFUSED => {
-            // No dedupe entry exists, so fanning out would deliver a
-            // message nothing can de-duplicate on retry. Drop it
-            // un-acked: the client still holds it.
-            correlate::stash_release(&mut s.correlate, stash_idx);
-            s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
             true
         }
         _ => {
@@ -2941,6 +4118,14 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
     }
 }
 
+/// Cursor slot for a partition id, saturating rather than panicking:
+/// a `no_std` PIC module cannot unwind, so an out-of-range id must
+/// degrade, not abort.
+#[inline]
+fn apply_slot(partition_id: u16) -> usize {
+    (partition_id as usize).min(MAX_APPLY_PARTITIONS - 1)
+}
+
 /// Apply-pipeline reset (docs/architecture/apply_path.md §Apply-pipeline reset).
 /// Wipes every apply-derived arena in `session_processor`, fast-forwards
 /// `apply_index` to `reset_index`, and emits `MSG_APPLY_RESET_FANOUT` on
@@ -2952,7 +4137,12 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
 /// # Safety
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable`.
-unsafe fn apply_reset(s: &mut ModuleState, sys: &SyscallTable, reset_index: u64) {
+unsafe fn apply_reset(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    partition_id: u16,
+    reset_index: u64,
+) {
     s.apply_resets = s.apply_resets.wrapping_add(1);
 
     // The message store is purely apply-derived: wipe and let replay
@@ -2971,7 +4161,12 @@ unsafe fn apply_reset(s: &mut ModuleState, sys: &SyscallTable, reset_index: u64)
     }
     s.session_count = 0;
     correlate::reset(&mut s.correlate);
-    s.apply_index = reset_index;
+    // The wipe is global — every arena above is shared across partitions —
+    // so every cursor must restart too, or a partition whose cursor
+    // survived would skip the entries needed to rebuild what was just
+    // cleared. Only the partition that triggered the reset fast-forwards.
+    s.apply_index = [0; MAX_APPLY_PARTITIONS];
+    s.apply_index[apply_slot(partition_id)] = reset_index;
 
     // Fan the reset out to downstream modules. `out_topic` covers
     // topic_engine; `out_messaging` covers messaging's dedup, retained and
@@ -3005,7 +4200,9 @@ unsafe fn apply_committed_op(
     now: u64,
 ) {
     match p.op {
-        wire::QOP_CONNECT => apply_qop_connect(s, sys, p.tenant, body_start, body_end, now),
+        wire::QOP_CONNECT => {
+            apply_qop_connect(s, sys, p.tenant, body_start, body_end, now, p.session_slot)
+        }
         wire::QOP_DISCONNECT => apply_qop_disconnect(s, sys, p.tenant, body_start, body_end, now),
         wire::QOP_SUBSCRIBE => apply_qop_subscribe(s, sys, p.tenant, body_start, body_end),
         wire::QOP_UNSUBSCRIBE => apply_qop_unsubscribe(s, sys, p.tenant, body_start, body_end),
@@ -3019,7 +4216,7 @@ unsafe fn apply_committed_op(
                 s.in_buf.as_ptr().add(body_start),
                 body_end - body_start,
             );
-            apply_kafka_produce(s, body);
+            apply_kafka_produce(s, sys, body, p.session_slot);
         }
         #[cfg(feature = "amqp")]
         wire::QOP_AMQP_PUBLISH => {
@@ -3027,7 +4224,7 @@ unsafe fn apply_committed_op(
                 s.in_buf.as_ptr().add(body_start),
                 body_end - body_start,
             );
-            apply_amqp_publish(s, body);
+            apply_amqp_publish(s, body, dev_millis(sys));
         }
         // Durable consumer-group offset commit: replay repopulates the
         // offsets table (leader stores at propose time too — idempotent).
@@ -3069,6 +4266,68 @@ unsafe fn apply_committed_op(
                 }
             }
         }
+        // Group membership, replicated so a coordinator change does not
+        // force every group it hosted through a rebalance.
+        #[cfg(feature = "kafka")]
+        wire::QOP_KAFKA_GROUP_MEMBER => {
+            let b = core::slice::from_raw_parts(
+                s.in_buf.as_ptr().add(body_start),
+                body_end - body_start,
+            );
+            if b.len() >= 3 {
+                let gl = u16::from_le_bytes([b[0], b[1]]) as usize;
+                if gl > 0 && gl <= KG_NAME && 2 + gl < b.len() {
+                    let ml = b[2 + gl] as usize;
+                    let mo = 3 + gl;
+                    if ml > 0 && ml <= KG_NAME && mo + ml + 2 <= b.len() {
+                        let ao = mo + ml;
+                        let al = u16::from_le_bytes([b[ao], b[ao + 1]]) as usize;
+                        if al <= KG_META && ao + 2 + al <= b.len() {
+                            let mut group = [0u8; KG_NAME];
+                            group[..gl].copy_from_slice(&b[2..2 + gl]);
+                            let mut mid = [0u8; KG_NAME];
+                            mid[..ml].copy_from_slice(&b[mo..mo + ml]);
+                            let mut asg = [0u8; KG_META];
+                            asg[..al].copy_from_slice(&b[ao + 2..ao + 2 + al]);
+                            if !consumers::member_restore(
+                                &mut s.consumers,
+                                &group[..gl],
+                                &mid[..ml],
+                                &asg[..al],
+                            ) {
+                                s.kafka_group_gen_dropped =
+                                    s.kafka_group_gen_dropped.wrapping_add(1);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Group generation, replicated so a coordinator change cannot
+        // reissue a generation a zombie consumer still holds.
+        #[cfg(feature = "kafka")]
+        wire::QOP_KAFKA_GROUP_GEN => {
+            let b = core::slice::from_raw_parts(
+                s.in_buf.as_ptr().add(body_start),
+                body_end - body_start,
+            );
+            if b.len() >= 2 {
+                let gl = u16::from_le_bytes([b[0], b[1]]) as usize;
+                if gl > 0 && gl <= KG_NAME && 2 + gl + 4 <= b.len() {
+                    let mut group = [0u8; KG_NAME];
+                    group[..gl].copy_from_slice(&b[2..2 + gl]);
+                    let go = 2 + gl;
+                    let generation = i32::from_le_bytes([b[go], b[go + 1], b[go + 2], b[go + 3]]);
+                    if !consumers::group_generation_raise(
+                        &mut s.consumers,
+                        &group[..gl],
+                        generation,
+                    ) {
+                        s.kafka_group_gen_dropped = s.kafka_group_gen_dropped.wrapping_add(1);
+                    }
+                }
+            }
+        }
         // QOP_RETAINED_CLEAR has no propose-side emitter yet.
         _ => {}
     }
@@ -3090,6 +4349,11 @@ unsafe fn apply_qop_connect(
     body_start: usize,
     body_end: usize,
     _now: u64,
+    // Slot the PROPOSE side bound this connection to. Leader-local, so
+    // it cannot be used for slot resolution on a follower or replay —
+    // which is exactly why the apply path re-derives the slot from
+    // `stream_hash` instead of trusting this one.
+    _propose_slot: u32,
 ) {
     if body_end < body_start {
         return;
@@ -3207,6 +4471,7 @@ unsafe fn apply_qop_connect(
     let session_idx = if let Some(i) = prior {
         Some(i)
     } else {
+        s.apply_connect_no_prior = s.apply_connect_no_prior.wrapping_add(1);
         sessions::allocate(&s.sessions)
     };
     let Some(i) = session_idx else {
@@ -3282,6 +4547,18 @@ unsafe fn apply_qop_connect(
     // slot in try_deliver and re-parks via the persisted path. No
     // message loss because the offline-queue state is replicated.
     if !clean_start && was_persisted {
+        // Subscriber-side inflight cannot be redelivered — the slot
+        // records no reference to the message — so releasing
+        // it is strictly better than holding it: held, it keeps
+        // counting toward ReceiveMaximum until the cap is reached and
+        // the subscriber can never receive again. The messages are
+        // already lost either way; this at least keeps the session
+        // alive. Counted, so the loss is visible rather than silent.
+        let dropped = sessions::release_sub_inflight(&mut s.sessions, i, INFLIGHT_SUB);
+        if dropped > 0 {
+            s.sub_inflight_dropped_on_resume =
+                s.sub_inflight_dropped_on_resume.wrapping_add(dropped);
+        }
         let body_reconnect = (i as u32).to_le_bytes();
         try_emit(
             sys,
@@ -3570,15 +4847,46 @@ unsafe fn apply_qop_subscribe(
         return;
     }
     let topic_off = body_start + 11;
-    let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
-        return;
-    };
-    let session_slot = i as u32;
 
-    // MSG_TOPIC_SUBSCRIBE body (matches the legacy propose-side shape):
+    // A subscription is recorded on the TOPIC's PRG as well as the
+    // session's.
+    //
+    // Publishes route by topic, so the node that must MATCH a
+    // subscription against a publish is the topic's owner. Recording
+    // only where the session lives leaves that node with nothing to
+    // match, and at `prg_count > 1` the two are usually different
+    // nodes — so the subscriber receives nothing.
+    //
+    // This handler is apply-side and runs on every replica, so the
+    // topic's owner reaches this point too; it simply has no local
+    // session slot. `session_slot` is therefore `SESSION_SLOT_REMOTE`
+    // there, and `stream_hash` — which the proposal already carries — is
+    // what names the subscriber across nodes.
+    let local_session = sessions::find_by_stream(&s.sessions, tenant, stream_hash);
+    let owns_topic = s.view.owns_shard(wire::shard_mqtt_topic(
+        tenant,
+        &s.in_buf[topic_off..topic_off + topic_len],
+    ));
+    // Recorded on BOTH the topic's owner and the session's owner, and
+    // nowhere else. Each needs it for a different half of the delivery:
+    // the topic's owner is where publishes arrive and must MATCH, and
+    // the session's owner is the only node that can actually write to
+    // the subscriber's socket. At `prg_count == 1` they are the same
+    // node and the two conditions collapse into one.
+    if !owns_topic && local_session.is_none() {
+        return;
+    }
+    let session_slot = match local_session {
+        Some(i) => i as u32,
+        None => SESSION_SLOT_REMOTE,
+    };
+
+    // MSG_TOPIC_SUBSCRIBE body:
     //   [tenant:u32 LE][session_slot:u32 LE][req_qos:u8][_pad:u8]
-    //   [topic_len:u16 LE][topic]
-    let sub_len = 4 + 4 + 1 + 1 + 2 + topic_len;
+    //   [topic_len:u16 LE][topic][stream_hash:u64 LE]
+    // `stream_hash` is appended LAST so the prefix is byte-identical to
+    // the shape topic_engine already parsed.
+    let sub_len = 4 + 4 + 1 + 1 + 2 + topic_len + 8;
     if sub_len <= s.out_buf.len() {
         s.out_buf[0..4].copy_from_slice(&tenant.to_le_bytes());
         s.out_buf[4..8].copy_from_slice(&session_slot.to_le_bytes());
@@ -3586,6 +4894,7 @@ unsafe fn apply_qop_subscribe(
         s.out_buf[9] = 0;
         s.out_buf[10..12].copy_from_slice(&(topic_len as u16).to_le_bytes());
         let src = s.in_buf.as_ptr().add(topic_off);
+        s.out_buf[12 + topic_len..12 + topic_len + 8].copy_from_slice(&stream_hash.to_le_bytes());
         let dst = s.out_buf.as_mut_ptr().add(12);
         core::ptr::copy_nonoverlapping(src, dst, topic_len);
         try_emit(
@@ -3792,6 +5101,76 @@ unsafe fn apply_qop_pubrel(
     try_emit(sys, s.out_messaging, wire::MSG_DEDUP_PHASE, &ph);
 
     s.applied = s.applied.wrapping_add(1);
+}
+
+/// Tell `durability` the lowest raft index this broker still needs.
+///
+/// Kafka retention and raft compaction are two lifetimes over ONE set of
+/// bytes: the Kafka log IS the raft WAL, and compaction is driven by
+/// snapshots, which know nothing about a consumer's retention window.
+/// Without this a snapshot retires segments a consumer still inside its
+/// retention window can ask for, and the cold-read path then has
+/// nothing to read — the failure is silent, because an empty fetch and
+/// a caught-up fetch look identical.
+///
+/// OPT-IN, and deliberately so. With no retention policy configured the
+/// broker needs every record it has ever applied, so an honest floor
+/// would be "compact nothing" — which would grow the WAL without bound
+/// on every deployment that never asked for retention. No policy, no
+/// floor: `retention_floor_allows` permits any snapshot when the floor
+/// set is empty, which is exactly today's behaviour.
+///
+/// One floor per raft partition. Raft indexes are per-log — each
+/// partition numbers from 1 — and every anchor records the partition
+/// that carried it, so the floor for a partition is computed over that
+/// partition's anchors alone and published on the partitioned envelope
+/// to exactly that partition's WAL.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+#[cfg(feature = "kafka")]
+unsafe fn publish_retention_floor(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.out_retention_floor < 0 || s.kafka_retention_ms == 0 {
+        return;
+    }
+    let mut seen = store::raft_partitions_seen(&s.store);
+    while seen != 0 {
+        let partition = seen.trailing_zeros() as u16;
+        seen &= seen - 1;
+        let slot = apply_slot(partition);
+        let Some(oldest) = store::oldest_needed_raft_index(&s.store, partition) else {
+            continue;
+        };
+        // The highest index safe to compact at is one BELOW the oldest
+        // still needed. An off-by-one here deletes the very entry a
+        // cold read is about to want.
+        let floor = oldest.saturating_sub(1);
+        // A floor of 0 is NOT "nothing to say" — it is "I need everything
+        // from index 1, so nothing may be retired". Hence a sent mask
+        // rather than reading an initial 0 as already-published.
+        if s.floor_sent_mask & (1u64 << slot) != 0 && floor == s.last_floor_sent[slot] {
+            continue;
+        }
+        let poll = (sys.channel_poll)(s.out_retention_floor, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+            return;
+        }
+        let mut buf = [0u8; 10];
+        buf[0..2].copy_from_slice(&partition.to_le_bytes());
+        buf[2..10].copy_from_slice(&floor.to_le_bytes());
+        if wire::channel_write_partitioned(
+            sys,
+            s.out_retention_floor,
+            partition,
+            wire::MSG_COMPACTION_FLOOR,
+            &buf,
+        ) > 0
+        {
+            s.last_floor_sent[slot] = floor;
+            s.floor_sent_mask |= 1u64 << slot;
+            s.floor_emitted = s.floor_emitted.wrapping_add(1);
+        }
+    }
 }
 
 /// Apply-side handler for QOP_PUBLISH. For QoS 0, builds
@@ -4168,7 +5547,44 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // engine — becomes the pipeline's rate limiter. A smaller quota
             // caps pipelined Kafka produce bursts below the WAL's batch
             // capacity.
-            for _ in 0..32 {
+            // A held proposal goes first, and no packet is taken off the
+            // channel until it lands: the client's next packet may be
+            // the same session's, and order on a session is what the
+            // ack path keys by.
+            if s.prop_hold_len > 0 {
+                let len = s.prop_hold_len as usize;
+                let mut held = [0u8; BUF_SIZE];
+                held[..len].copy_from_slice(&s.prop_hold[..len]);
+                if emit_keyed_unowned(
+                    sys,
+                    s.prop_hold_chan,
+                    &s.view,
+                    s.prop_hold_shard,
+                    &held[..len],
+                ) {
+                    s.prop_hold_len = 0;
+                    s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                    s.hb_prop = s.hb_prop.wrapping_add(1);
+                }
+            }
+            let codec_budget = if s.prop_hold_len > 0 { 0 } else { 32 };
+            for _ in 0..codec_budget {
+                // Admission gate BEFORE the read. A packet taken off the
+                // channel with no credit to propose it has nowhere to go
+                // but the floor, and a QoS 1 PUBLISH on the floor is one
+                // the client never hears back about. Leaving it in the
+                // channel instead lets the codec, the router and finally
+                // the client's TCP window carry the pressure until
+                // `admission` refills the credit. The gate is the
+                // substrate's entry cap, the most any one packet can
+                // cost.
+                if s.pid_entry_credits <= 0 || s.pid_byte_credits < ADMISSION_GATE_BYTES {
+                    s.codec_gated = s.codec_gated.wrapping_add(1);
+                    if s.codec_gated & 0x3FF == 1 {
+                        dev_log(sys, 2, b"[sess] codec gated: no credit".as_ptr(), 28);
+                    }
+                    break;
+                }
                 let poll = (sys.channel_poll)(s.in_codec, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -4176,6 +5592,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
                 let (mt, plen) = {
                     worked += 1;
+                    s.hb_codec = s.hb_codec.wrapping_add(1);
                     wire::channel_read_msg(sys, s.in_codec, &mut s.in_buf)
                 };
 
@@ -4260,12 +5677,78 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // yet, so the tenant would have to come from the
                         // control plane. See docs/architecture/multi_tenancy.md.
                         let tenant: TenantId = 0;
+
+                        // Placement, BEFORE the optimistic CONNACK.
+                        //
+                        // A session's state belongs to the PRG owning
+                        // its shard. If that is not this node, the
+                        // proposal would be refused by the ownership
+                        // gate — but the optimistic CONNACK has already
+                        // told the client it is connected by then, so
+                        // the client proceeds to SUBSCRIBE against a
+                        // session that will never exist. Silently
+                        // accepting a connection whose state cannot be
+                        // stored is the worst of the options.
+                        //
+                        // MQTT has its own redirect, so this needs no
+                        // proxy for the same reason Kafka's half did
+                        // not: v5 reason code 0x9D "Server moved"
+                        // (0x9C "Use another server" for a transient
+                        // fence), and v3.1.1 CONNACK 0x03 "Server
+                        // unavailable", which is the only refusal that
+                        // version can express. Redirecting rather than
+                        // proxying also keeps EDGE-NOAFFINITY: the
+                        // client ends up talking to the node that owns
+                        // its session instead of being pinned to
+                        // whichever node it happened to reach first.
+                        if proto == PROTO_MQTT {
+                            let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                            let action = edge::classify(&s.view.view, s.view.owner_prg(shard), 0);
+                            if action != edge::EdgeAction::Local {
+                                // Version-agnostic: the codec spells it.
+                                // A fence or a stale view is transient
+                                // (come back), a reassignment is settled
+                                // (go elsewhere and stay).
+                                let reason = match action {
+                                    edge::EdgeAction::Fenced
+                                    | edge::EdgeAction::RefreshThenRetry => {
+                                        wire::MQTT_REASON_TRY_ELSEWHERE
+                                    }
+                                    _ => wire::MQTT_REASON_MOVED,
+                                };
+                                emit_codec_response(
+                                    sys,
+                                    s.out_codec,
+                                    conn_id,
+                                    PROTO_MQTT,
+                                    PKT_CONNACK,
+                                    0,
+                                    &[0u8, reason],
+                                );
+                                s.connects_redirected = s.connects_redirected.wrapping_add(1);
+                                continue;
+                            }
+                        }
+
                         let prior = sessions::find_by_stream(&s.sessions, tenant, stream_hash);
                         // Was the matched slot a persisted session that we're
                         // about to resurrect, vs an already-active reconnect
                         // (e.g. same client_id re-CONNECT before DISCONNECT)?
                         // Only the persisted path sets session_present=1 in
                         // the optimistic CONNACK.
+                        //
+                        // NOTE: this predicate is too NARROW — a client that
+                        // reconnects before its DISCONNECT has applied is told
+                        // `session_present = 0` and throws away subscriptions
+                        // and inflight state the broker still holds; the same
+                        // client one second later is told 1. Broadening it to
+                        // `prior.is_some() && !clean_start` fixes that case and
+                        // BREAKS a worse one: the expiry sweep only purges
+                        // `persisted` slots, so a slot that lingers un-persisted
+                        // is never purged and would then report 1 for ever —
+                        // erring toward "your state is here" when it is not,
+                        // which makes a client skip resubscribing. The real fix
+                        // is in the session lifecycle, not this predicate.
                         let resurrecting_persisted = match prior {
                             Some(i) => sessions::is_persisted(&s.sessions, i) && !clean_start,
                             None => false,
@@ -4314,6 +5797,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         } else {
                             None
                         };
+
+                        // Enforce "one session per conn_id" BEFORE anything
+                        // on this connection is routed. `conn_id` is a
+                        // recycled transport slot, and a client that closed
+                        // abruptly leaves its session still claiming the id —
+                        // so without this the new client's SUBSCRIBE and
+                        // publishes resolve to the PREVIOUS client's session
+                        // (`find_by_conn` returns the first match by slot
+                        // index). Measured: a subscriber bound to slot 1 had
+                        // its SUBSCRIBE anchored to slot 0 and was then flow-
+                        // controlled by that session's ReceiveMaximum.
+                        if let Some(i) = session_idx {
+                            let evicted = sessions::unbind_other_conns(&mut s.sessions, i, conn_id);
+                            if evicted > 0 {
+                                s.conn_bindings_evicted =
+                                    s.conn_bindings_evicted.wrapping_add(evicted);
+                            }
+                        }
 
                         // CONNACK body = [session_present:u8][reason_code:u8].
                         // MQTT 3.1.1 §3.2.2.2 requires session_present=1
@@ -4432,6 +5933,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         } else {
                             0
                         };
+                        // Apply the cap to the slot NOW, not only at
+                        // QOP_CONNECT apply. The CONNACK is optimistic, so
+                        // the client may SUBSCRIBE and start receiving before
+                        // the CONNECT has committed — and until then the slot
+                        // still carried the previous occupant's cap (0 = no
+                        // cap on a fresh slot). Deliveries in that window
+                        // ignored the ReceiveMaximum the client had just
+                        // asked for, which is the flow control it uses to
+                        // protect itself. Apply sets it again; the write is
+                        // idempotent, and a CONNECT that never commits takes
+                        // its transient slot with it.
+                        if let Some(i) = session_idx {
+                            sessions::set_receive_maximum(&mut s.sessions, i, receive_maximum_s);
+                        }
 
                         // Encode QOP_CONNECT canonical envelope and propose.
                         // Body shape (from wire::QOP_CONNECT docstring):
@@ -4500,13 +6015,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 .copy_from_slice(&session_expiry_s.to_le_bytes());
                             s.out_buf[wpos + 4..wpos + 6]
                                 .copy_from_slice(&receive_maximum_s.to_le_bytes());
-                            if try_emit(
+                            // Session state is owned by the session
+                            // shard. `stream_hash` is the session
+                            // identity the module indexes on, so every
+                            // op for one session shares this shard.
+                            let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                            if try_emit_keyed(
                                 sys,
                                 s.out_proposals,
-                                wire::MSG_CLIENT_PROPOSAL,
+                                &s.view,
+                                shard,
                                 &s.out_buf[..prop_total],
                             ) {
                                 s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                s.hb_prop = s.hb_prop.wrapping_add(1);
                             }
                         }
 
@@ -4549,13 +6071,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 s.out_buf[off] = wire::QDISC_REASON_CLEAN;
                                 s.out_buf[off + 1..off + 9]
                                     .copy_from_slice(&stream_hash.to_le_bytes());
-                                if try_emit(
+                                let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                if try_emit_keyed(
                                     sys,
                                     s.out_proposals,
-                                    wire::MSG_CLIENT_PROPOSAL,
+                                    &s.view,
+                                    shard,
                                     &s.out_buf[..prop_total],
                                 ) {
                                     s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                    s.hb_prop = s.hb_prop.wrapping_add(1);
                                 }
                             }
                         }
@@ -4598,10 +6123,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let up_off = 4 + topic_len;
                                 let Some(up_len) = user_props_block_len(&body[up_off..]) else {
                                     s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
+                                    dev_log(sys, 2, b"[sess] pub props unparsable".as_ptr(), 27);
                                     continue;
                                 };
                                 if up_len > MAX_USER_PROPS_BYTES {
                                     s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
+                                    dev_log(sys, 2, b"[sess] pub props oversize".as_ptr(), 25);
                                     continue;
                                 }
                                 let payload_off = up_off + up_len;
@@ -4612,10 +6139,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     .map(|i| sessions::tenant(&s.sessions, i))
                                     .unwrap_or(0);
 
-                                // PID admission.
+                                // PID admission. The gate at the top of
+                                // the drain keeps this from firing for
+                                // any packet within the entry cap; it
+                                // remains for a body past the gate, and
+                                // says so.
                                 let body_cost = body.len() as i32;
                                 if s.pid_entry_credits <= 0 || s.pid_byte_credits < body_cost {
                                     s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
+                                    dev_log(sys, 2, b"[sess] publish throttled".as_ptr(), 24);
                                     continue;
                                 }
 
@@ -4628,8 +6160,32 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // contract to QoS 0 and break PUBACK matching.
                                 if qos > 0 {
                                     let Some(si) = session_idx else {
+                                        // No session is bound to this
+                                        // connection: the publish has no
+                                        // owner to ack it. Said with the
+                                        // connection so the binding that
+                                        // went missing can be traced.
                                         s.publishes_throttled =
                                             s.publishes_throttled.wrapping_add(1);
+                                        let mut line = [0u8; 40];
+                                        let mut pos = 0usize;
+                                        for &b in b"[sess] pub no session c=" {
+                                            line[pos] = b;
+                                            pos += 1;
+                                        }
+                                        pos += fmt_u32_raw(
+                                            line.as_mut_ptr().add(pos),
+                                            u32::from(conn_id),
+                                        );
+                                        for &b in b" f=" {
+                                            line[pos] = b;
+                                            pos += 1;
+                                        }
+                                        pos += fmt_u32_raw(
+                                            line.as_mut_ptr().add(pos),
+                                            sessions::conn_flags(&s.sessions, conn_id),
+                                        );
+                                        dev_log(sys, 2, line.as_ptr(), pos);
                                         continue;
                                     };
                                     if sessions::inflight_add(
@@ -4641,8 +6197,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     )
                                     .is_none()
                                     {
+                                        // The client has more unacked
+                                        // publishes than this broker
+                                        // tracks per session
+                                        // (`MAX_INFLIGHT_PER_SESSION`).
+                                        // 3.1.1 has no way to say so;
+                                        // the drop is at least visible.
                                         s.publishes_throttled =
                                             s.publishes_throttled.wrapping_add(1);
+                                        if s.publishes_throttled & 0x1F == 1 {
+                                            dev_log(sys, 2, b"[sess] inflight full".as_ptr(), 20);
+                                        }
                                         continue;
                                     }
                                 }
@@ -4650,6 +6215,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // Admission succeeded — draw down PID credit.
                                 s.pid_entry_credits = s.pid_entry_credits.saturating_sub(1);
                                 s.pid_byte_credits = s.pid_byte_credits.saturating_sub(body_cost);
+                                s.hb_pub = s.hb_pub.wrapping_add(1);
 
                                 let stream_hash = session_idx
                                     .map(|si| sessions::stream_hash(&s.sessions, si))
@@ -4804,20 +6370,67 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 } else {
                                     s.out_proposals
                                 };
-                                let emit_ok = try_emit(
+                                // A publish mutates topic state
+                                // (retained value, subscriber fan-out),
+                                // so it is placed on the topic shard —
+                                // which also keeps one topic's publishes
+                                // ordered on one partition.
+                                let shard = wire::shard_mqtt_topic(tenant, &body[4..4 + topic_len]);
+                                // Routed, not owned — see
+                                // `emit_keyed_unowned`. The shard says
+                                // WHERE the publish lands, not whether
+                                // this node may accept it; gating here
+                                // dropped every publish for a topic
+                                // owned by another PRG.
+                                let emit_ok = emit_keyed_unowned(
                                     sys,
                                     chan,
-                                    wire::MSG_CLIENT_PROPOSAL,
+                                    &s.view,
+                                    shard,
                                     &s.out_buf[..prop_total],
                                 );
                                 if emit_ok {
                                     s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                    s.hb_prop = s.hb_prop.wrapping_add(1);
+                                } else if prop_total <= s.prop_hold.len() {
+                                    // Refused: held whole, correlation and
+                                    // inflight intact, and the codec drain
+                                    // stops until it lands (see the top of
+                                    // the drain). Counted as a refusal so an
+                                    // undersized edge still shows.
+                                    s.proposals_refused = s.proposals_refused.wrapping_add(1);
+                                    s.proposals_held = s.proposals_held.wrapping_add(1);
+                                    if s.proposals_refused & 0x3F == 1 {
+                                        let mut line = [0u8; 48];
+                                        let mut pos = 0usize;
+                                        for &b in b"[sess] proposal held n=" {
+                                            line[pos] = b;
+                                            pos += 1;
+                                        }
+                                        pos += fmt_u32_raw(
+                                            line.as_mut_ptr().add(pos),
+                                            s.proposals_refused,
+                                        );
+                                        dev_log(sys, 2, line.as_ptr(), pos);
+                                    }
+                                    s.prop_hold[..prop_total]
+                                        .copy_from_slice(&s.out_buf[..prop_total]);
+                                    s.prop_hold_len = prop_total as u16;
+                                    s.prop_hold_chan = chan;
+                                    s.prop_hold_shard = shard;
+                                    break;
                                 } else {
-                                    // Proposal didn't reach raft (channel full /
-                                    // overload). For QoS 1+ roll back the
-                                    // correlation + inflight so the publisher
-                                    // times out and DUP-retries cleanly; keeping
-                                    // half-state would wedge the slot forever.
+                                    // Wider than the hold can carry: the
+                                    // proposal-size bound above makes this
+                                    // unreachable, but a drop is never
+                                    // silent.
+                                    s.proposals_refused = s.proposals_refused.wrapping_add(1);
+                                    dev_log(
+                                        sys,
+                                        2,
+                                        b"[sess] proposal dropped oversize".as_ptr(),
+                                        32,
+                                    );
                                     if qos > 0 {
                                         let _ = correlate::take(&mut s.correlate, cid);
                                         if let Some(si) = session_idx {
@@ -4831,10 +6444,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                             }
                                         }
                                     }
-                                    // Count the drop for ALL QoS levels,
-                                    // including QoS 0, so offered != accepted
-                                    // stays visible — the "no silent drops"
-                                    // invariant.
                                     s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
                                 }
                             }
@@ -4892,13 +6501,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         s.out_buf.as_mut_ptr().add(off + 11),
                                         topic_len,
                                     );
-                                    if try_emit(
+                                    // Applied by `find_by_stream` against
+                                    // session state, so it rides the session
+                                    // shard. The topic-side fan-out travels
+                                    // separately as MSG_TOPIC_SUBSCRIBE.
+                                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                    if try_emit_keyed(
                                         sys,
                                         s.out_proposals,
-                                        wire::MSG_CLIENT_PROPOSAL,
+                                        &s.view,
+                                        shard,
                                         &s.out_buf[..prop_total],
                                     ) {
                                         s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                        s.hb_prop = s.hb_prop.wrapping_add(1);
                                     }
                                 }
 
@@ -4957,13 +6573,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         s.out_buf.as_mut_ptr().add(off + 10),
                                         topic_len,
                                     );
-                                    if try_emit(
+                                    // Applied by `find_by_stream` against
+                                    // session state, so it rides the session
+                                    // shard. The topic-side fan-out travels
+                                    // separately as MSG_TOPIC_SUBSCRIBE.
+                                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                    if try_emit_keyed(
                                         sys,
                                         s.out_proposals,
-                                        wire::MSG_CLIENT_PROPOSAL,
+                                        &s.view,
+                                        shard,
                                         &s.out_buf[..prop_total],
                                     ) {
                                         s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                        s.hb_prop = s.hb_prop.wrapping_add(1);
                                     }
                                 }
 
@@ -5140,13 +6763,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     });
                                     s.out_buf[off + 10..off + 14]
                                         .copy_from_slice(&flow_epoch.to_le_bytes());
-                                    if try_emit(
+                                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                    if try_emit_keyed(
                                         sys,
                                         s.out_proposals_tagged,
-                                        wire::MSG_CLIENT_PROPOSAL,
+                                        &s.view,
+                                        shard,
                                         &s.out_buf[..prop_total],
                                     ) {
                                         s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                        s.hb_prop = s.hb_prop.wrapping_add(1);
                                         emit_ok = true;
                                     }
                                 }
@@ -5246,8 +6872,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             }
 
                             _ => {
+                                // Opaque passthrough: the body is an
+                                // unrecognised op with no routing key we
+                                // can name, so it takes the router's
+                                // legacy body-hash path and is counted
+                                // there (`proposals_legacy_hashed`).
                                 try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, body);
                                 s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                s.hb_prop = s.hb_prop.wrapping_add(1);
                             }
                         }
                     }
@@ -5265,7 +6897,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 0 => handle_kafka_produce(s, sys, now, plen as usize),
                                 1 => handle_kafka_fetch(s, sys, plen as usize),
                                 2 => handle_kafka_list_offsets(s, sys, plen as usize),
-                                8 => handle_kafka_offset_commit(s, sys, plen as usize),
+                                8 => handle_kafka_offset_commit(s, sys, now, plen as usize),
                                 9 => handle_kafka_offset_fetch(s, sys, plen as usize),
                                 11 => handle_kafka_join_group(s, sys, plen as usize),
                                 12 | 13 => {
@@ -5297,8 +6929,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
                     wire::MSG_SESSION_PROPOSAL => {
                         // Unknown protocol — forward to raft (legacy path).
+                        // No routing key is derivable from an unknown
+                        // protocol's body, so this keeps the router's
+                        // body-hash placement and is counted there.
                         try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, body);
                         s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                        s.hb_prop = s.hb_prop.wrapping_add(1);
                     }
 
                     _ => {}
@@ -5342,25 +6978,28 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     worked += 1;
                     wire::channel_read_msg(sys, s.in_committed, &mut s.in_buf)
                 };
-                if mt == wire::MSG_COMMITTED_ENTRY && plen >= 16 {
+                if mt == wire::MSG_COMMITTED_ENTRY && (plen as usize) >= wire::COMMITTED_ENTRY_HDR {
                     s.committed_entries_observed = s.committed_entries_observed.wrapping_add(1);
+                    s.hb_commit = s.hb_commit.wrapping_add(1);
                     let entry_end = plen as usize;
-                    // MSG_COMMITTED_ENTRY body: [term:u64][index:u64][entry_body].
-                    // Strip the 16-byte prefix and peel the Quantum
-                    // canonical envelope (the apply path forwards the
-                    // proposer's body verbatim — clustor's tagged-
-                    // proposal handler strips any leading correlation_id
-                    // upstream).
+                    // MSG_COMMITTED_ENTRY body:
+                    //   [partition_id:u16][term:u64][index:u64][entry_body].
+                    // Strip the prefix and peel the Quantum canonical
+                    // envelope (the apply path forwards the proposer's
+                    // body verbatim — clustor's tagged-proposal handler
+                    // strips any leading correlation_id upstream).
+                    let entry_partition = u16::from_le_bytes([s.in_buf[0], s.in_buf[1]]);
                     let entry_index = u64::from_le_bytes([
-                        s.in_buf[8],
-                        s.in_buf[9],
                         s.in_buf[10],
                         s.in_buf[11],
                         s.in_buf[12],
                         s.in_buf[13],
                         s.in_buf[14],
                         s.in_buf[15],
+                        s.in_buf[16],
+                        s.in_buf[17],
                     ]);
+                    let cur = apply_slot(entry_partition);
 
                     // Index sequencing (docs/architecture/apply_path.md §Apply-pipeline reset):
                     //   • entry_index <= apply_index  →  duplicate/replay; skip.
@@ -5375,19 +7014,82 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // index 1. That's intentional and harmless: state is
                     // already empty on a fresh boot, so the reset is a no-op
                     // beyond resyncing apply_index.
-                    if entry_index <= s.apply_index {
+                    if entry_index <= s.apply_index[cur] {
                         continue;
                     }
-                    if entry_index > s.apply_index + 1 && s.apply_index > 0 {
-                        apply_reset(s, sys, entry_index);
+                    if entry_index > s.apply_index[cur] + 1 && s.apply_index[cur] > 0 {
+                        // A jump in one partition's committed stream reads
+                        // as a snapshot install and resets EVERY apply-side
+                        // arena on this node, sessions included. Said at
+                        // warning level with the partition and both
+                        // indices: a jump the substrate did not intend
+                        // (a mis-framed entry, a dropped one) is otherwise
+                        // indistinguishable from a quiet restart.
+                        let mut line = [0u8; 72];
+                        let mut pos = 0usize;
+                        for &b in b"[sess] apply gap p=" {
+                            line[pos] = b;
+                            pos += 1;
+                        }
+                        pos += fmt_u32_raw(line.as_mut_ptr().add(pos), u32::from(entry_partition));
+                        for &b in b" from=" {
+                            line[pos] = b;
+                            pos += 1;
+                        }
+                        pos += fmt_u32_raw(
+                            line.as_mut_ptr().add(pos),
+                            s.apply_index[cur].min(u32::MAX as u64) as u32,
+                        );
+                        for &b in b" to=" {
+                            line[pos] = b;
+                            pos += 1;
+                        }
+                        pos += fmt_u32_raw(
+                            line.as_mut_ptr().add(pos),
+                            entry_index.min(u32::MAX as u64) as u32,
+                        );
+                        dev_log(sys, 2, line.as_ptr(), pos);
+                        apply_reset(s, sys, entry_partition, entry_index);
                     }
-                    if entry_end > 16 {
-                        if let Some(p) = wire::peel_qprop(&s.in_buf[16..entry_end]) {
-                            let body_start = 16 + p.op_body_offset;
+                    if entry_end > wire::COMMITTED_ENTRY_HDR {
+                        let peeled =
+                            wire::peel_qprop(&s.in_buf[wire::COMMITTED_ENTRY_HDR..entry_end]);
+                        if peeled.is_none() && s.out_cp >= 0 {
+                            // Not a Quantum operation: an epoch or
+                            // migration record, an admin or config
+                            // entry. The control plane reads those from
+                            // this module, not from a second consumer
+                            // on the committed stream (manifest,
+                            // `cp_out`). `outputs_ready_for_apply`
+                            // checked the edge for room before this
+                            // entry was taken; a refusal past that
+                            // check is counted and said.
+                            if try_emit(
+                                sys,
+                                s.out_cp,
+                                wire::MSG_COMMITTED_ENTRY,
+                                &s.in_buf[..entry_end],
+                            ) {
+                                s.cp_forwarded = s.cp_forwarded.wrapping_add(1);
+                            } else {
+                                s.cp_refused = s.cp_refused.wrapping_add(1);
+                                dev_log(sys, 2, b"[sess] cp forward refused".as_ptr(), 25);
+                            }
+                        }
+                        if let Some(p) = peeled {
+                            let body_start = wire::COMMITTED_ENTRY_HDR + p.op_body_offset;
+                            // The index of the entry being applied RIGHT
+                            // NOW. `apply_index` is the last COMPLETED
+                            // one and is only advanced below, so a
+                            // handler that needs to record where its
+                            // record lives in the raft log cannot read
+                            // it from there.
+                            s.applying_index = entry_index;
+                            s.applying_partition = entry_partition;
                             apply_committed_op(s, sys, &p, body_start, entry_end, now);
                         }
                     }
-                    s.apply_index = entry_index;
+                    s.apply_index[cur] = entry_index;
                 } else if plen > 0 {
                     s.applied = s.applied.wrapping_add(1);
                 }
@@ -5422,8 +7124,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let (cid, partition_id, wal_index) =
                     wire::decode_proposal_assigned(&s.in_buf[..wire::PROPOSAL_ASSIGNED_LEN]);
+                s.hb_assigned = s.hb_assigned.wrapping_add(1);
+                let issued = correlate::issued_ms(&s.correlate, cid);
                 if let Some((session_slot, packet_id, _op)) = correlate::take(&mut s.correlate, cid)
                 {
+                    if !s.trace_armed && s.proposals_emitted & 31 == 0 {
+                        if let Some(t) = issued {
+                            s.trace_armed = true;
+                            s.trace_slot = session_slot;
+                            s.trace_packet = packet_id;
+                            s.trace_issued_ms = t;
+                            s.trace_assign_ms =
+                                dev_millis(sys).wrapping_sub(t).min(u32::MAX as u64) as u32;
+                        }
+                    }
                     // MSG_ACK_REGISTER — shape in `wire::ACK_REGISTER_LEN`.
                     // Both OP_PUBLISH and OP_PUBREL register with the same
                     // payload shape; the publisher inflight's `phase` field
@@ -5449,28 +7163,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         {
                             sessions::inflight_set_wal_index(&mut s.sessions, ssize, ii, wal_index);
                         }
-                    } else if session_slot >= KAFKA_SLOT_BASE {
-                        // Durable-publish inflight. `session_slot` carries
-                        // the slot index AND its epoch; `packet_id` high
-                        // byte carries the partition index. Drop the
-                        // assignment if the slot's epoch no longer matches
-                        // — the slot was freed and reused (EPOCH TAGGING),
-                        // so stamping the new occupant would report a
-                        // foreign WAL index as its base_offset.
-                        let (ki, epoch) = store::kin_decode_slot(session_slot);
-                        let pidx = (packet_id >> 8) as usize;
-                        if ki < KAFKA_INFLIGHT
-                            && pidx < KIN_MAX_PARTS
-                            && store::inflight_valid(&s.store, ki, epoch)
-                        {
-                            store::inflight_set_part_offset(
-                                &mut s.store,
-                                ki,
-                                pidx,
-                                wal_index as i64,
-                            );
-                        }
                     }
+                    // NOTE: `wal_index` is NOT the produce's
+                    // `base_offset`. It counts raft entries, so stamping
+                    // it here would tell a producer an offset unrelated
+                    // to the one a consumer fetches — a fresh topic
+                    // would answer 2 where Kafka requires 0. The real
+                    // logical offset is assigned in
+                    // `apply_kafka_produce`, which stamps it there. If
+                    // apply never stamps — the batch was refused, or
+                    // this node did not originate the produce — the slot
+                    // keeps its initial -1, which is Kafka's "unknown"
+                    // and is honest.
 
                     // Try once; on failure park in the retry queue. Phase 5-pre
                     // drains it next tick. Dropping the register would mean
@@ -5483,6 +7187,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // broken reservation invariant, not a capacity
                     // decision: say so rather than account accepted work
                     // as dropped.
+                    s.hb_reg = s.hb_reg.wrapping_add(1);
                     if !try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &reg)
                         && !correlate::ack_stash(&mut s.correlate, reg)
                     {
@@ -5579,10 +7284,39 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         continue;
                     }
                     #[cfg(feature = "kafka")]
+                    if store::inflight_proto(&s.store, ki) == KIN_PROTO_KAFKA_OFFSET {
+                        // An OffsetCommit whose response was parked
+                        // until its proposals were durable. Fire the
+                        // stored body once every one has landed — the
+                        // client is told "committed" only now.
+                        if store::inflight_complete_part(&mut s.store, ki) {
+                            if let Some(e) = store::inflight_get(&s.store, ki) {
+                                let body = store::inflight_response(&s.store, ki);
+                                let n = body.len();
+                                if n > 0 && n <= s.out_buf.len() {
+                                    s.out_buf[..n].copy_from_slice(body);
+                                    emit_kafka_response_outbuf(
+                                        s,
+                                        sys,
+                                        e.conn_id,
+                                        8,
+                                        e.api_ver,
+                                        e.kafka_corr,
+                                        n,
+                                    );
+                                    s.acks_emitted = s.acks_emitted.wrapping_add(1);
+                                }
+                                store::inflight_free(&mut s.store, ki);
+                            }
+                        }
+                        continue;
+                    }
+                    #[cfg(feature = "kafka")]
                     {
                         // One partition of the request reached quorum
                         // durability. Respond once ALL have resolved.
-                        if store::inflight_complete_part(&mut s.store, ki)
+                        store::inflight_complete_part(&mut s.store, ki);
+                        if store::inflight_ready(&s.store, ki)
                             && emit_kafka_produce_response_multi(s, sys, ki)
                         {
                             s.kafka_produce_acked = s.kafka_produce_acked.wrapping_add(1);
@@ -5656,6 +7390,29 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             }
                         }
 
+                        if s.trace_armed
+                            && s.trace_slot as usize == session_slot
+                            && s.trace_packet == packet_id
+                        {
+                            s.trace_armed = false;
+                            let total = dev_millis(sys).wrapping_sub(s.trace_issued_ms);
+                            let mut line = [0u8; 64];
+                            let mut pos = 0usize;
+                            for &b in b"[sess] qos1 age assign_ms=" {
+                                line[pos] = b;
+                                pos += 1;
+                            }
+                            pos += fmt_u32_raw(line.as_mut_ptr().add(pos), s.trace_assign_ms);
+                            for &b in b" ack_ms=" {
+                                line[pos] = b;
+                                pos += 1;
+                            }
+                            pos += fmt_u32_raw(
+                                line.as_mut_ptr().add(pos),
+                                total.min(u32::MAX as u64) as u32,
+                            );
+                            dev_log(sys, 3, line.as_ptr(), pos);
+                        }
                         let body = packet_id.to_be_bytes();
                         if qos == 1 {
                             sessions::inflight_release(&mut s.sessions, session_slot, ii);
@@ -5753,13 +7510,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         });
                                 s.out_buf[off + 10..off + 14]
                                     .copy_from_slice(&flow_epoch.to_le_bytes());
-                                if try_emit(
+                                let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                if try_emit_keyed(
                                     sys,
                                     s.out_proposals_tagged,
-                                    wire::MSG_CLIENT_PROPOSAL,
+                                    &s.view,
+                                    shard,
                                     &s.out_buf[..prop_total],
                                 ) {
                                     s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                    s.hb_prop = s.hb_prop.wrapping_add(1);
                                 }
                             }
                             continue;
@@ -5793,16 +7553,36 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             session_slot as u32,
                         );
                         let off = wire::QPROP_TAGGED_HDR_LEN;
-                        let stash_ptr = correlate::stash_env(&s.correlate, stash_idx).as_ptr();
+                        let stash_env = correlate::stash_env(&s.correlate, stash_idx);
+                        let stash_ptr = stash_env.as_ptr();
                         let out_ptr = s.out_buf.as_mut_ptr();
                         core::ptr::copy_nonoverlapping(stash_ptr, out_ptr.add(off), env_len);
-                        if try_emit(
+                        // Re-derive the topic shard from the stashed op body
+                        // so the repropose lands on the SAME partition as
+                        // the original publish. The stash holds the
+                        // QOP_PUBLISH body verbatim: topic_len is a BE u16
+                        // at offset 16, the topic follows at 18.
+                        let stash_topic_len = if env_len >= 18 {
+                            u16::from_be_bytes([stash_env[16], stash_env[17]]) as usize
+                        } else {
+                            0
+                        };
+                        let shard = if stash_topic_len > 0 && 18 + stash_topic_len <= env_len {
+                            wire::shard_mqtt_topic(tenant, &stash_env[18..18 + stash_topic_len])
+                        } else {
+                            // Malformed stash: fall back to the session
+                            // shard rather than guessing a topic.
+                            wire::shard_mqtt_stream(tenant, 0)
+                        };
+                        if emit_keyed_unowned(
                             sys,
                             s.out_proposals_tagged,
-                            wire::MSG_CLIENT_PROPOSAL,
+                            &s.view,
+                            shard,
                             &s.out_buf[..prop_total],
                         ) {
                             s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                            s.hb_prop = s.hb_prop.wrapping_add(1);
                         }
                     }
                     _ => {}
@@ -6051,16 +7831,236 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         // The other inputs (in_cp, etc.) are still pure no-ops.
+        // `cp_in` carries the control plane's placement. It was drained
+        // and discarded, so this module had no idea which shards it
+        // owned — the gap W9 has to close before per-shard state can be
+        // handed over on a migration. Parsing is the shared core's, so
+        // this module and `topic_engine` cannot read one frame two ways.
         if s.in_cp >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_cp, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
                 }
-                let (_, _) = {
-                    worked += 1;
-                    wire::channel_read_msg(sys, s.in_cp, &mut s.in_buf)
+                worked += 1;
+                let (msg_type, plen) = wire::channel_read_msg(sys, s.in_cp, &mut s.in_buf);
+                // The shard map rides the SAME channel as the placement
+                // update because it answers the same question — who owns
+                // this shard — and splitting it onto its own edge would
+                // let the two arrive out of order, so a node could
+                // resolve ownership against a new prg_count and an old
+                // override set. One channel, one order.
+                if msg_type == wire::MSG_SHARD_MAP_UPDATE {
+                    match edge::apply_shard_map_update(
+                        &mut s.view.overrides,
+                        &s.in_buf[..plen as usize],
+                    ) {
+                        edge::PlacementUpdate::Applied => {
+                            s.shard_map_updates = s.shard_map_updates.wrapping_add(1);
+                        }
+                        edge::PlacementUpdate::Stale => {
+                            s.shard_map_stale = s.shard_map_stale.wrapping_add(1);
+                        }
+                        edge::PlacementUpdate::Malformed => {}
+                    }
+                    continue;
+                }
+                if msg_type != wire::MSG_PLACEMENT_UPDATE {
+                    continue;
+                }
+                match edge::apply_placement_update(&mut s.view.view, &s.in_buf[..plen as usize]) {
+                    edge::PlacementUpdate::Applied => {
+                        // One line the FIRST time this module learns a
+                        // placement, and never again: it is the only
+                        // external evidence that `control_plane.routing`
+                        // actually reaches this module, and a wiring gap
+                        // here is silent — the module simply keeps its
+                        // single-PRG default and believes it owns
+                        // everything. `multi_node.sh` asserts on it.
+                        // Bounded to one line so placement churn cannot
+                        // turn it into a log flood.
+                        if s.placement_updates == 0 {
+                            dev_log(sys, 3, b"[sp] placement".as_ptr(), 14);
+                        }
+                        s.placement_updates = s.placement_updates.wrapping_add(1);
+                        // Placement moved, so shards may have been
+                        // reassigned away from this node. Release the
+                        // sessions that went with them.
+                        //
+                        // `is_local`, NOT `owns_shard`: a fenced shard
+                        // is still ours and its state must survive,
+                        // because an aborted migration lifts the fence
+                        // and leaves ownership where it was. Only a
+                        // genuine reassignment releases.
+                        //
+                        // Swept on the update rather than continuously:
+                        // placement changes are rare, and a per-step
+                        // scan of the session table would cost the
+                        // steady state to serve an event that happens
+                        // during a migration.
+                        // Borrowed, not copied: `EdgeMap` owns the
+                        // override table and is deliberately not `Copy`.
+                        let view = &s.view;
+                        // The offline queue lives in `messaging` and is
+                        // keyed by slot index, so a released slot must
+                        // have its queue dropped or the next session
+                        // allocated that slot inherits it. Emitted from
+                        // inside the sweep rather than buffered: a fixed
+                        // buffer would silently drop the tail once more
+                        // sessions moved than it held, and "leaks only
+                        // under a large migration" is exactly the bug
+                        // that would never show up in a small test.
+                        // `out_messaging` is copied out first because
+                        // `s.sessions` is mutably borrowed for the sweep.
+                        let out_messaging = s.out_messaging;
+                        let out_codec = s.out_codec;
+                        let released = sessions::release_foreign(
+                            &mut s.sessions,
+                            |sh| view.is_local(sh),
+                            |si, conn| {
+                                try_emit(
+                                    sys,
+                                    out_messaging,
+                                    wire::MSG_OFFLINE_RELEASE,
+                                    &(si as u32).to_le_bytes(),
+                                );
+                                // Tell a still-connected client to go.
+                                // Its session now lives elsewhere; left
+                                // alone it would sit here receiving
+                                // nothing, never reaching the CONNECT
+                                // redirect. The codec spells the reason
+                                // per version and drops it for 3.1.1,
+                                // which has no server DISCONNECT.
+                                if let Some(conn_id) = conn {
+                                    emit_codec_response(
+                                        sys,
+                                        out_codec,
+                                        conn_id,
+                                        PROTO_MQTT,
+                                        PKT_DISCONNECT,
+                                        0,
+                                        &[wire::MQTT_REASON_MOVED],
+                                    );
+                                }
+                            },
+                        );
+                        s.sessions_released_foreign =
+                            s.sessions_released_foreign.wrapping_add(released);
+                        // `messaging` holds the retained store and the
+                        // offline queues, which are per-shard state too,
+                        // but it has no control-plane port. Rather than
+                        // add one and an edge to every graph, the
+                        // placement travels the op bus this module
+                        // already drives — and it travels as the
+                        // UNMODIFIED `MSG_PLACEMENT_UPDATE` frame, so
+                        // `messaging` parses it with the same core call
+                        // and there is still one wire format and one
+                        // shard->owner derivation.
+                        let pl = plen as usize;
+                        let mut fwd = [0u8; 16];
+                        if pl <= fwd.len() {
+                            fwd[..pl].copy_from_slice(&s.in_buf[..pl]);
+                            try_emit(sys, s.out_messaging, wire::MSG_PLACEMENT_UPDATE, &fwd[..pl]);
+                        }
+                    }
+                    // Stale and re-delivered updates are dropped. They
+                    // are counted where that count is actionable —
+                    // `topic_engine.routing_stale`, on the same frames
+                    // from the same sender — rather than kept here as a
+                    // second copy nothing reads.
+                    edge::PlacementUpdate::Stale => {}
+                    edge::PlacementUpdate::Malformed => {}
+                }
+            }
+        }
+
+        // ── Cold-read replies: a WAL entry that carries a Fetch's
+        //    offset, arriving on a later step than the request.
+        #[cfg(feature = "kafka")]
+        if s.in_wal_reply >= 0 {
+            for _ in 0..4 {
+                // Durability replies on a PARTITIONED channel, so this
+                // must read the 5-byte envelope. The plain reader takes
+                // the low byte of `partition_id` as the message type,
+                // which is why the reply appeared never to arrive.
+                let (_pid, msg_type, plen) =
+                    wire::channel_read_partitioned(sys, s.in_wal_reply, &mut s.in_buf);
+                if msg_type == 0 && plen == 0 {
+                    break;
+                }
+                if msg_type != wire::MSG_WAL_ENTRY_REPLY {
+                    continue;
+                }
+                let pl = plen as usize;
+                let Some((request_id, _term, _index, _prev)) =
+                    wire::decode_wal_entry_reply(&s.in_buf[..pl])
+                else {
+                    continue;
                 };
+                let Some(slot) = (0..COLD_FETCH_SLOTS)
+                    .find(|&i| s.cold[i].active == 1 && s.cold[i].request_id == request_id)
+                else {
+                    continue; // not ours, or already timed out
+                };
+
+                // An empty body is durability's NOT FOUND: the entry has
+                // aged out of the location ring. Answer the error the
+                // client would have had anyway.
+                let body = &s.in_buf[wire::WAL_ENTRY_REPLY_HDR..pl];
+                let mut records_off = 0usize;
+                let mut records_len = 0usize;
+                if !body.is_empty() {
+                    // The raft entry body is the client proposal:
+                    // [qprop header][origin:u8][partition:u16]
+                    // [topic_len:u16][topic][records].
+                    let h = wire::QPROP_HEADER_LEN;
+                    if body.len() > h + 5 {
+                        let tl = u16::from_le_bytes([body[h + 3], body[h + 4]]) as usize;
+                        let start = h + 5 + tl;
+                        if start <= body.len() {
+                            records_off = wire::WAL_ENTRY_REPLY_HDR + start;
+                            records_len = body.len() - start;
+                        }
+                    }
+                }
+
+                let pidx = s.cold[slot].part_idx as usize;
+                let hw = store::next_offset(&s.store, pidx) as i64;
+                let ls = store::log_start(&s.store, pidx) as i64;
+                let err = if records_len == 0 {
+                    s.cold_refused = s.cold_refused.wrapping_add(1);
+                    KERR_OFFSET_OUT_OF_RANGE
+                } else {
+                    s.cold_served = s.cold_served.wrapping_add(1);
+                    KERR_NONE
+                };
+                // `in_buf` holds the records and `emit_cold_fetch_response`
+                // writes `out_buf`, so the copy below cannot alias.
+                let mut recs = [0u8; KAFKA_MAX_RECORDS_BYTES];
+                let n = records_len.min(recs.len());
+                if n > 0 {
+                    recs[..n].copy_from_slice(&s.in_buf[records_off..records_off + n]);
+                }
+                emit_cold_fetch_response(s, sys, slot, err, hw, ls, &recs[..n]);
+            }
+        }
+
+        // Reclaim parked cold fetches that never got an answer. A WAL
+        // read is a disk read; a client that waited this long is better
+        // served an error it can act on than a slot held for ever.
+        #[cfg(feature = "kafka")]
+        {
+            let now_ms = dev_millis(sys);
+            for i in 0..COLD_FETCH_SLOTS {
+                if s.cold[i].active == 1
+                    && now_ms.wrapping_sub(s.cold[i].issued_ms) > COLD_FETCH_TIMEOUT_MS
+                {
+                    s.cold_refused = s.cold_refused.wrapping_add(1);
+                    let pidx = s.cold[i].part_idx as usize;
+                    let hw = store::next_offset(&s.store, pidx) as i64;
+                    let ls = store::log_start(&s.store, pidx) as i64;
+                    emit_cold_fetch_response(s, sys, i, KERR_OFFSET_OUT_OF_RANGE, hw, ls, &[]);
+                }
             }
         }
 
@@ -6078,6 +8078,96 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // apply-side. We also clear the local conn_id so further
         // packets on the orphaned socket don't re-route to a slot
         // whose disconnect is in flight.
+        // Replicate any group generation that advanced this tick. Run
+        // on the metrics tick rather than every step: generations move
+        // only on membership change, so a per-step scan would be pure
+        // overhead, and a sub-second lag before the record is proposed
+        // is bounded by the same window an unreplicated coordinator
+        // failover already has.
+        #[cfg(feature = "kafka")]
+        if now.wrapping_sub(s.last_metrics_ms) >= 1000 {
+            reconcile_group_generations(s, sys);
+            publish_retention_floor(s, sys);
+
+            // Time retention, swept on the 1 Hz tick rather than on
+            // append: retention is a wall-clock policy, so records
+            // expire while a partition is IDLE, and a sweep driven by
+            // appends would keep a silent topic's records for ever —
+            // exactly the topic whose retention an operator is most
+            // likely to be relying on.
+            //
+            // Budgeted per partition per tick. Expiring a whole
+            // partition in one step would be an unbounded walk inside a
+            // step every client is waiting on; at this budget a backlog
+            // drains steadily instead.
+            if s.kafka_retention_ms > 0 {
+                const EXPIRE_BUDGET: u32 = 16;
+                let retention = s.kafka_retention_ms as u64;
+                for pi in 0..KSTORE_PARTS {
+                    let n =
+                        store::expire_partition(&mut s.store, pi, now, retention, EXPIRE_BUDGET);
+                    s.kafka_retention_evictions = s.kafka_retention_evictions.wrapping_add(n);
+                }
+            }
+
+            // Key compaction, on the same tick and with the same
+            // per-partition budget discipline: the scan is bounded and a
+            // long droppable run drains over several ticks rather than
+            // inside one step.
+            if s.kafka_compact != 0 {
+                const COMPACT_BUDGET: u32 = 16;
+                for pi in 0..KSTORE_PARTS {
+                    store::compact_partition(&mut s.store, pi, COMPACT_BUDGET);
+                }
+            }
+        }
+
+        // One accounting line per second so the stage that swallows
+        // a publish names itself: what came in from the codec, what was
+        // admitted, proposed, assigned, registered for an ack, and
+        // applied — plus the refusals and holds along the way.
+        if now.wrapping_sub(s.last_hb_ms) >= 1000 {
+            s.last_hb_ms = now;
+            let mut line = [0u8; 224];
+            let mut pos = 0usize;
+            for (label, v) in [
+                (&b"[sess] hb codec="[..], s.hb_codec),
+                (&b" pub="[..], s.hb_pub),
+                (&b" prop="[..], s.hb_prop),
+                (&b" assigned="[..], s.hb_assigned),
+                (&b" reg="[..], s.hb_reg),
+                (&b" commit="[..], s.hb_commit),
+                (&b" refused="[..], s.proposals_refused),
+                (&b" throttled="[..], s.publishes_throttled),
+                (&b" gated="[..], s.codec_gated),
+                (&b" ostall="[..], s.apply_output_stalls),
+                (&b" conn="[..], s.connects),
+                (&b" redir="[..], s.connects_redirected),
+                (&b" disc="[..], s.disconnects),
+                (&b" evict="[..], s.conn_bindings_evicted),
+                (&b" foreign="[..], s.sessions_released_foreign),
+                (&b" noprior="[..], s.apply_connect_no_prior),
+                (&b" resets="[..], s.apply_resets),
+                (&b" cp="[..], s.cp_forwarded),
+                (&b" cpref="[..], s.cp_refused),
+                (&b" pheld="[..], s.proposals_held),
+                (&b" dedupref="[..], s.dedup_refused_delivered),
+            ] {
+                for &b in label {
+                    line[pos] = b;
+                    pos += 1;
+                }
+                pos += fmt_u32_raw(line.as_mut_ptr().add(pos), v);
+            }
+            dev_log(sys, 3, line.as_ptr(), pos);
+            s.hb_codec = 0;
+            s.hb_pub = 0;
+            s.hb_prop = 0;
+            s.hb_assigned = 0;
+            s.hb_reg = 0;
+            s.hb_commit = 0;
+        }
+
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 {
             // Publish inflights that never resolved (lost proposal,
             // leadership churn, codec_out saturation at ack time): reclaim
@@ -6157,13 +8247,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let off = wire::QPROP_UNTAGGED_HDR_LEN;
                     s.out_buf[off] = wire::QDISC_REASON_KEEPALIVE;
                     s.out_buf[off + 1..off + 9].copy_from_slice(&stream_hash.to_le_bytes());
-                    if try_emit(
+                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                    if try_emit_keyed(
                         sys,
                         s.out_proposals,
-                        wire::MSG_CLIENT_PROPOSAL,
+                        &s.view,
+                        shard,
                         &s.out_buf[..prop_total],
                     ) {
                         s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                        s.hb_prop = s.hb_prop.wrapping_add(1);
                     }
                 }
 
@@ -6245,7 +8338,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── Phase 6: metrics (wire envelope) ──
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 && s.out_metrics >= 0 {
             s.last_metrics_ms = now;
-            let mut m = [0u8; 52];
+            let mut m = [0u8; 60];
             m[0..4].copy_from_slice(&s.session_count.to_le_bytes());
             m[4..8].copy_from_slice(&s.connects.to_le_bytes());
             m[8..12].copy_from_slice(&s.disconnects.to_le_bytes());
@@ -6264,6 +8357,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             m[40..44].copy_from_slice(&s.apply_output_stalls.to_le_bytes());
             m[44..48].copy_from_slice(&s.acks_stale_epoch.to_le_bytes());
             m[48..52].copy_from_slice(&s.correlations_overdue.to_le_bytes());
+            // Idempotence outcomes. `duplicates` rising is the feature
+            // working — producer retries that would otherwise have been
+            // appended twice. `rejected` rising means a producer is
+            // losing batches to a sequence gap or a fenced epoch, which
+            // is never routine.
+            #[cfg(feature = "kafka")]
+            {
+                m[52..56].copy_from_slice(&s.kafka_idem_duplicates.to_le_bytes());
+                m[56..60].copy_from_slice(&s.kafka_idem_rejected.to_le_bytes());
+            }
             try_emit(sys, s.out_metrics, wire::MSG_METRICS, &m);
         }
 

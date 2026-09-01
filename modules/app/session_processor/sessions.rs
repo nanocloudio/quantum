@@ -118,6 +118,16 @@ pub struct Session {
     /// The effective limit in `try_deliver` is
     /// `min(prefetch_credit, receive_maximum)` when both are > 0.
     receive_maximum: u16,
+    /// 1 while `conn_id` names a live connection.
+    ///
+    /// `conn_id` alone cannot express "unbound": it is a `u8` and 0 is a
+    /// VALID connection id, so a slot cleared to 0 is indistinguishable
+    /// from one legitimately bound to connection 0 — and `find_by_conn`
+    /// would hand a new client on that recycled id the previous
+    /// client's session. A separate flag removes the ambiguity outright
+    /// rather than reserving a sentinel that a large enough connection
+    /// table would eventually collide with.
+    conn_bound: u8,
     /// Wall-clock millis when a deferred Will-message publish becomes
     /// due. Set on `apply_qop_disconnect` with `reason != CLEAN` when
     /// the stored Will has a non-zero `will_delay_ms`. Cleared by
@@ -160,6 +170,7 @@ impl Session {
             session_expiry_s: 0,
             disconnected_at_ms: 0,
             receive_maximum: 0,
+            conn_bound: 0,
             pending_will_fire_at_ms: 0,
         }
     }
@@ -276,10 +287,60 @@ pub fn clear_flow(s: &mut Sessions, si: usize) {
 /// the QOP_CONNECT commit the slot is transient, and follow-up packets
 /// from the same connection must still route to it for admission
 /// control.
+/// Unbind `conn_id` from every session slot EXCEPT `keep`. Returns how
+/// many stale bindings were evicted.
+///
+/// INVARIANT: at most one session may be bound to a given `conn_id`.
+/// `conn_id` is a transport-layer slot index and the transport RECYCLES
+/// it, so without this a client that closed abruptly — no DISCONNECT,
+/// which is the common case — leaves its session still claiming the id.
+/// `find_by_conn` returns the first match by slot index, so the NEXT
+/// client to land on that recycled id resolves to the previous client's
+/// session: its SUBSCRIBE is anchored there, and its publishes are
+/// attributed there. That is cross-client state corruption, not merely
+/// a stale lookup.
+///
+/// Unbinding does not destroy the session. A persisted one stays
+/// resurrectable by `(tenant, stream_hash)`, which is the identity a
+/// reconnect is supposed to use.
+pub fn unbind_other_conns(s: &mut Sessions, keep: usize, conn_id: u8) -> u32 {
+    let mut n = 0u32;
+    for i in 0..MAX_SESSIONS {
+        if i == keep {
+            continue;
+        }
+        if s.slots[i].conn_bound == 1
+            && s.slots[i].conn_id == conn_id
+            && (s.slots[i].active == 1 || s.slots[i].transient == 1)
+        {
+            unbind_conn(s, i);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Diagnostic: the state bits of the first slot carrying `conn_id`,
+/// whatever its flags — `1` active, `2` transient, `4` present, `8`
+/// conn_bound, `16` persisted — or `32` when no slot carries it. Says
+/// why `find_by_conn` came back empty.
+pub fn conn_flags(s: &Sessions, conn_id: u8) -> u32 {
+    for x in &s.slots {
+        if x.conn_id == conn_id && (x.conn_bound == 1 || x.active == 1 || x.transient == 1) {
+            return u32::from(x.active)
+                | u32::from(x.transient) << 1
+                | u32::from(x.present) << 2
+                | u32::from(x.conn_bound) << 3
+                | u32::from(x.persisted) << 4;
+        }
+    }
+    32
+}
+
 pub fn find_by_conn(s: &Sessions, conn_id: u8) -> Option<usize> {
     (0..MAX_SESSIONS).find(|&i| {
         let x = &s.slots[i];
-        (x.active == 1 || x.transient == 1) && x.conn_id == conn_id
+        (x.active == 1 || x.transient == 1) && x.conn_bound == 1 && x.conn_id == conn_id
     })
 }
 
@@ -489,6 +550,7 @@ pub fn rebind(
     }
     let x = &mut s.slots[si];
     x.conn_id = conn_id;
+    x.conn_bound = 1;
     x.protocol = protocol;
     x.clean_start = u8::from(clean_start);
     x.keep_alive_ms = keep_alive_ms;
@@ -506,6 +568,7 @@ pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u8
     x.stream_hash = p.stream_hash;
     x.protocol = p.protocol;
     x.conn_id = conn_id;
+    x.conn_bound = 1;
     x.transient = 1;
     x.clean_start = u8::from(p.clean_start);
     x.keep_alive_ms = p.keep_alive_ms;
@@ -581,6 +644,7 @@ pub fn set_receive_maximum(s: &mut Sessions, si: usize, n: u16) {
 pub fn set_conn(s: &mut Sessions, si: usize, conn_id: u8, protocol: u8) {
     if si < MAX_SESSIONS {
         s.slots[si].conn_id = conn_id;
+        s.slots[si].conn_bound = 1;
         s.slots[si].protocol = protocol;
     }
 }
@@ -617,6 +681,7 @@ pub fn close(s: &mut Sessions, si: usize, persisted: bool, now: u64) {
 pub fn unbind_conn(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si].conn_id = 0;
+        s.slots[si].conn_bound = 0;
     }
 }
 
@@ -645,6 +710,64 @@ pub fn clear(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si] = Session::zero();
     }
+}
+
+/// Release every session whose shard is no longer this node's, and
+/// report how many went. `is_local` decides: it is supplied by the
+/// caller so this module keeps no placement view of its own and there
+/// is still exactly one shard->owner derivation in the tree.
+///
+/// Called ONLY when placement actually reassigns a shard — never on a
+/// fence. A fenced shard is still ours: the migration can abort, and an
+/// abort leaves ownership exactly where it was, so dropping the state
+/// would destroy sessions the transfer was supposed to leave untouched.
+///
+/// Releasing matters because the alternative is worse than a leak: a
+/// node that keeps a session for a shard it no longer owns will keep
+/// answering `find_by_stream` for it, so a client reconnecting here is
+/// handed stale state while the new owner is already diverging from it.
+///
+/// Empty slots are skipped rather than cleared: `present == 0` already
+/// means "no session", and `Session::zero()` on an untouched slot would
+/// be a write for no reason across the whole table.
+/// `on_released` is invoked with each freed slot BEFORE it is zeroed,
+/// so the caller can tear down state held for that slot elsewhere — the
+/// offline queue in `messaging` above all, which is keyed by slot index
+/// and would otherwise be drained to whichever session is allocated the
+/// slot next.
+///
+/// It also receives the slot's live connection, if any, as
+/// `Some(conn_id)`. Releasing the SESSION is not enough: the client's
+/// socket stays open, and a client left connected to a node that no
+/// longer owns it receives nothing and has no reason to reconnect — so
+/// it never reaches the CONNECT redirect that would send it to the new
+/// owner. The caller needs the id to tell it to go.
+pub fn release_foreign(
+    s: &mut Sessions,
+    is_local: impl Fn(u32) -> bool,
+    mut on_released: impl FnMut(usize, Option<u8>),
+) -> u32 {
+    let mut released = 0u32;
+    for si in 0..MAX_SESSIONS {
+        if s.slots[si].present == 0 && s.slots[si].active == 0 && s.slots[si].transient == 0 {
+            continue;
+        }
+        let shard = super::wire::shard_mqtt_stream(s.slots[si].tenant, s.slots[si].stream_hash);
+        if is_local(shard) {
+            continue;
+        }
+        let bound = if s.slots[si].conn_bound == 1 {
+            Some(s.slots[si].conn_id)
+        } else {
+            None
+        };
+        on_released(si, bound);
+        s.slots[si] = Session::zero();
+        s.prefetch_credit[si] = 0;
+        s.sub_outstanding[si] = 0;
+        released = released.wrapping_add(1);
+    }
+    released
 }
 
 // ── Will messages ───────────────────────────────────────────────────
@@ -839,6 +962,42 @@ pub fn inflight_set_wal_index(s: &mut Sessions, si: usize, ii: usize, wal_index:
 }
 
 /// Find an in-flight QoS packet by id and direction.
+/// Release every SUBSCRIBER-side inflight slot on this session and
+/// reset its outstanding count. Returns how many were released.
+///
+/// Called when a session is resumed on a new connection. MQTT 3.1.1
+/// §4.4 says the server must RE-SEND unacknowledged QoS 1+ publishes on
+/// resume — but a subscriber-side slot records only `(packet_id, qos,
+/// phase)`; `correlation_id` is 0 for these by construction and no
+/// reference to the message body is kept, so the broker no longer knows
+/// what to send. Those messages are already unrecoverable.
+///
+/// Given that, holding the slots is strictly worse than dropping them:
+/// they keep counting toward `ReceiveMaximum`, so after enough resumed
+/// sessions the outstanding count reaches the cap and the subscriber
+/// can NEVER receive again — the messages stay lost AND the session is
+/// dead. Releasing them loses nothing further and keeps the session
+/// usable. The caller counts the release so the loss is visible rather
+/// than silent.
+///
+/// Real redelivery would need the delivered envelope (or a durable
+/// pointer to it) retained per inflight slot, which no slot carries.
+pub fn release_sub_inflight(s: &mut Sessions, si: usize, direction: u8) -> u32 {
+    if si >= MAX_SESSIONS {
+        return 0;
+    }
+    let mut n = 0u32;
+    for ii in 0..MAX_INFLIGHT_PER_SESSION {
+        let e = &mut s.slots[si].inflight[ii];
+        if e.active == 1 && e.direction == direction {
+            *e = Inflight::zero();
+            n += 1;
+        }
+    }
+    s.sub_outstanding[si] = 0;
+    n
+}
+
 pub fn inflight_find(s: &Sessions, si: usize, packet_id: u16, direction: u8) -> Option<usize> {
     if si >= MAX_SESSIONS {
         return None;

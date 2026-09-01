@@ -31,6 +31,9 @@ target/
 # Runtime state, created by the graphs and the integration scripts.
 /data/
 /wal/
+# Some graphs write their first WAL segment to the working directory
+# rather than into wal/; keep those out of the tree.
+*.WAL
 /raft/
 /certs/
 

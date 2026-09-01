@@ -20,7 +20,13 @@ use super::wire;
 /// (small-to-medium payloads). Larger envelopes are refused at enqueue
 /// time; the publisher's durability ack still fires, but the subscriber
 /// won't see that specific message after reconnect.
-const MAX_ENTRIES: usize = 128;
+/// Offline-queue entries held per node, across all sessions.
+///
+/// 128 total was a placeholder: one reconnecting subscriber with a
+/// backlog could consume the whole queue, so a second session's
+/// messages were refused while the first held every slot. At ~1 KiB
+/// per envelope, 4096 costs ~4 MiB.
+const MAX_ENTRIES: usize = 4096;
 const MAX_ENVELOPE: usize = 1024;
 
 /// Envelopes admitted per step. Matches the standalone drain bound.
@@ -105,6 +111,28 @@ pub fn on_reset(o: &mut Offline) {
 /// MSG_OFFLINE_ENQUEUE: `[session:u32 LE][env_len:u16 LE][env...]`, where
 /// `env` is the original MSG_TOPIC_DELIVER envelope assembled by
 /// topic_engine and replayed verbatim on drain.
+/// Drop every queued delivery for `session_slot`, and report how many
+/// went.
+///
+/// Called when the session owning that slot is released because its
+/// shard moved. This is a CORRECTNESS requirement, not housekeeping:
+/// slots are recycled, so a queue left behind on a released slot would
+/// be drained to whatever session is allocated that slot next — the
+/// same recycled-identity failure the `conn_id` binding guard exists to
+/// prevent, and with the same signature of one client receiving
+/// another's messages.
+pub fn release_slot(o: &mut Offline, session_slot: u32) -> u32 {
+    let mut released = 0u32;
+    for i in 0..MAX_ENTRIES {
+        if o.entries[i].active == 0 || o.entries[i].session_slot != session_slot {
+            continue;
+        }
+        o.entries[i] = QueueEntry::zero();
+        released = released.wrapping_add(1);
+    }
+    released
+}
+
 pub fn on_enqueue(o: &mut Offline, payload: &[u8], now: u64) {
     let plen = payload.len();
     if plen < 6 {

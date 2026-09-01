@@ -7,12 +7,17 @@ hardware_targets = ["bcm2712"]
 name = "op_in"
 direction = "input"
 content_type = "OctetStream"
+
+# Control-plane placement: `MSG_PLACEMENT_UPDATE` carrying the routing
+# epoch and, optionally, the partition count and this node's PRG.
+# Optional — an unwired engine keeps the single-PRG defaults.
+[[ports]]
+name = "routing_in"
+direction = "input"
+content_type = "OctetStream"
+
 [[ports]]
 name = "deliver_out"
-direction = "output"
-content_type = "OctetStream"
-[[ports]]
-name = "forward_out"
 direction = "output"
 content_type = "OctetStream"
 [[ports]]
@@ -26,6 +31,5 @@ metrics = [
     "bytes_out",
     "subscriptions",
     "publishes_routed",
-    "forwards_emitted",
     "wildcard_matches",
 ]

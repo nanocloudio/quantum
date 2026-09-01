@@ -4,12 +4,48 @@ How to grow (and shrink) the cluster's node count and Partition Raft
 Group (PRG) count, keeping three replicas and three voters per PRG
 throughout.
 
-**Status: design target, not wired.** The runbooks below depend on a
-real control plane issuing placements and routing epochs; today the
-control plane is synthetic
-([control_plane.md](../architecture/control_plane.md)), so no epoch
-migration can be driven. The runbooks are recorded here as the
-operating model the partitioning design
+**Status: the migration control surface is wired; the work each phase
+names is not.**
+
+Shard placement is key-based and every routing module resolves shards
+through the same map, so a migration has something real to move. The
+migration itself is driven through the admin surface — `POST
+/admin/migrate-begin`, then `/admin/migrate-phase-done` once per phase
+— and walks:
+
+```
+PLANNED → PROVISIONING → COPYING → CATCHING_UP → FENCED → ACTIVE → RETIRING → DONE
+```
+
+Three properties hold across that walk. Each phase record is committed
+through Raft before that phase's work may begin, so a controller that
+dies mid-migration rebuilds the migration from the log on restart and
+carries on from the phase last recorded. `/admin/migrate-abort` is
+refused once the migration has fenced — past that point the move is
+one-way, because both ends have already agreed to stop serving the old
+placement. And the FENCED phase raises a routing fence that listeners
+honour at both ends of the move, so the losing PRG stops accepting
+before the gaining one starts.
+
+What is missing is everything the phases are named after:
+
+1. **No per-phase work.** The state machine sequences the phases and
+   enforces their safety rules, but activating a slot, installing a
+   snapshot and streaming a WAL tail are not implemented — so
+   `migrate-phase-done` asserts the completion of work nothing
+   performed.
+2. **No online membership change.** `ADD_VOTER` and `REMOVE_VOTER`
+   answer `ADMIN_STATUS_UNSUPPORTED`. The joint-consensus state machine
+   applies config entries, but quorum tracking enforces only the *old*
+   majority rather than the union of old and new, and accepting a
+   membership change without union quorum risks losing committed
+   entries — so refusing is the safe answer. Learner creation and
+   catch-up are likewise design targets.
+3. **No automation.** Migration commands are accepted only by the Raft
+   leader, so there is exactly one controller, but an operator still
+   drives every phase by hand.
+
+The runbooks below are the operating model the partitioning design
 ([partitioning.md](../architecture/partitioning.md)) is built for.
 
 ## Model

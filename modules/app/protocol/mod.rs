@@ -80,6 +80,13 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 #[path = "../../common/wire.rs"]
 mod wire;
 
+/// What a Metadata response says about the cluster — which brokers
+/// exist and who leads a partition. Shared with the host test bed so
+/// the decision has one definition and can be tested without a broker.
+#[cfg(feature = "kafka")]
+#[path = "../../common/cores/kafka_metadata_core.rs"]
+mod kafka_metadata;
+
 mod router;
 
 #[cfg(feature = "amqp")]
@@ -110,14 +117,71 @@ define_params! {
         };
 
     // Partition count advertised per topic (clamped to 1..=16 so a full
-    // 8-topic Metadata response always fits the encode buffer). Offsets
-    // are WAL indexes, so partitions share one durability pipeline; >1
-    // only spreads client-side batching, it does not add server
-    // parallelism yet.
+    // 8-topic Metadata response always fits the encode buffer). Each
+    // `(topic, partition)` is its own routing key, its own log and its
+    // own offset sequence, so the count is real placement and not just
+    // client-side batching.
     3, partitions, u16, 1
         => |s, d, len| {
             #[cfg(feature = "kafka")]
             { s.kafka.partitions = p_u16(d, len, 0, 1).clamp(1, 16); }
+        };
+
+    // This node's id, mixed into the high bits of every producer id it
+    // issues. Producer ids are otherwise a per-node counter starting at
+    // 1, so two nodes hand out the SAME id — and idempotence state is
+    // keyed by `(producer_id, partition)`, so two unrelated producers
+    // would read each other's sequence numbers and be told their
+    // batches are duplicates or out of order. Distinct ids per node are
+    // the minimum for that keying to mean anything in a cluster.
+    4, node_id, u16, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            { s.kafka.node_id = p_u16(d, len, 0, 0); }
+        };
+
+    // Cluster shape for Metadata. Without these a client is told the
+    // cluster is ONE machine — this node — and cannot distribute load
+    // however well the substrate partitions underneath.
+    5, peer_count, u16, 1
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            { s.kafka.peer_count = p_u16(d, len, 0, 1) as u8; }
+        };
+    6, peer0_port, u16, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            { s.kafka.peer_ports[0] = p_u16(d, len, 0, 0); }
+        };
+    7, peer1_port, u16, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            { s.kafka.peer_ports[1] = p_u16(d, len, 0, 0); }
+        };
+    8, peer2_port, u16, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            { s.kafka.peer_ports[2] = p_u16(d, len, 0, 0); }
+        };
+
+    // Per-peer advertised host. Unset falls back to this node's address,
+    // which is right only for a co-located peer — across machines,
+    // advertising a wrong host sends the client somewhere that does not
+    // serve the partition.
+    9, peer0_host, str, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            kafka::set_peer_host(&mut s.kafka, 0, d, len);
+        };
+    10, peer1_host, str, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            kafka::set_peer_host(&mut s.kafka, 1, d, len);
+        };
+    11, peer2_host, str, 0
+        => |s, d, len| {
+            #[cfg(feature = "kafka")]
+            kafka::set_peer_host(&mut s.kafka, 2, d, len);
         };
 }
 
@@ -177,6 +241,64 @@ struct ModuleState {
     /// Module-owned read buffer. Each record is read once here and
     /// dispatched to the owning codec as a borrowed payload.
     buf: [u8; router::READ_BUF],
+    /// A session response its codec could not write (the frame edge
+    /// refused it), kept whole and offered again ahead of the next
+    /// drain. Length 0 = none. Responses are consumed from the channel
+    /// before a codec sees them, so this is what keeps a refusal from
+    /// becoming a lost PUBACK.
+    resp_held_len: u16,
+    resp_held: [u8; router::READ_BUF],
+    /// Per-second accounting for the `[proto] hb` line: raw records
+    /// taken off `raw_in` and responses taken off `responses_in` since
+    /// the line last went out.
+    hb_raw: u32,
+    hb_resp: u32,
+    last_hb_ms: u64,
+}
+
+/// Write `v` in decimal at `out[pos..]`; returns the new position.
+fn fmt_u32(out: &mut [u8], mut pos: usize, mut v: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let mut n = 0usize;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while n > 0 && pos < out.len() {
+        n -= 1;
+        out[pos] = digits[n];
+        pos += 1;
+    }
+    pos
+}
+
+/// Hand the response in `s.buf[..n]` to the codec its proto tag names.
+/// `false` means the codec could not write its frame and the response
+/// must be offered again unchanged.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+unsafe fn dispatch_response(s: &mut ModuleState, sys: &SyscallTable, n: usize) -> bool {
+    match s.buf[1] {
+        #[cfg(feature = "mqtt")]
+        SESSION_PROTO_MQTT => mqtt::on_response(&mut s.mqtt, sys, &s.buf[..n]),
+        #[cfg(feature = "kafka")]
+        SESSION_PROTO_KAFKA => {
+            kafka::on_response(&mut s.kafka, sys, &s.buf[..n]);
+            true
+        }
+        #[cfg(feature = "amqp")]
+        SESSION_PROTO_AMQP => {
+            amqp::on_response(&mut s.amqp, sys, &s.buf[..n]);
+            true
+        }
+        _ => true,
+    }
 }
 
 #[no_mangle]
@@ -240,6 +362,16 @@ pub unsafe extern "C" fn module_new(
         s.out_frames = out_frames;
         s.out_metrics = dev_channel_port(sys, 1, 2);
         s.in_responses = dev_channel_port(sys, 0, 1);
+        s.resp_held_len = 0;
+        s.hb_raw = 0;
+        s.hb_resp = 0;
+        s.last_hb_ms = 0;
+        // Input 2: raft leader hints, so Metadata can name the real
+        // leader instead of always naming this node.
+        #[cfg(feature = "kafka")]
+        {
+            s.kafka.in_leader_state = dev_channel_port(sys, 0, 2);
+        }
 
         router::init(&mut s.router);
 
@@ -325,7 +457,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // ── 1-2: classify each record, hand it to the owning codec ───
         if s.in_raw >= 0 {
-            for _ in 0..RX_BUDGET {
+            // Leader hints first, so a Metadata answer built this step
+            // names the leader as of this step rather than the last.
+            #[cfg(feature = "kafka")]
+            kafka::drain_leader_state(&mut s.kafka, sys);
+
+            // A packet the proposal edge refused goes first; no raw
+            // bytes are taken while it is held (see `mqtt::flush_held`).
+            #[cfg(feature = "mqtt")]
+            let rx_open = mqtt::flush_held(&mut s.mqtt, sys);
+            #[cfg(not(feature = "mqtt"))]
+            let rx_open = true;
+            let rx_budget = if rx_open { RX_BUDGET } else { 0 };
+            for _ in 0..rx_budget {
                 let poll = (sys.channel_poll)(s.in_raw, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -336,12 +480,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     continue;
                 }
                 worked += 1;
+                s.hb_raw = s.hb_raw.wrapping_add(1);
                 let conn_id = s.buf[0];
                 let proto = router::route(&mut s.router, conn_id, mtype, &s.buf[1..n]);
 
                 match proto {
                     #[cfg(feature = "mqtt")]
-                    PROTO_MQTT => mqtt::on_frame(&mut s.mqtt, sys, mtype, &s.buf[..n]),
+                    PROTO_MQTT => {
+                        if mqtt::on_frame(&mut s.mqtt, sys, mtype, &s.buf[..n]) {
+                            break;
+                        }
+                    }
                     #[cfg(feature = "kafka")]
                     PROTO_KAFKA => kafka::on_frame(&mut s.kafka, sys, mtype, &s.buf[..n]),
                     #[cfg(feature = "amqp")]
@@ -360,7 +509,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // instead: read once, dispatch on the session proto tag at
         // payload[1].
         if s.in_responses >= 0 {
-            for _ in 0..RESP_BUDGET {
+            // The held response goes first, and nothing else is drained
+            // until its edge takes it.
+            let mut resp_open = true;
+            let held = s.resp_held_len as usize;
+            if held > 0 {
+                s.buf[..held].copy_from_slice(&s.resp_held[..held]);
+                if dispatch_response(s, sys, held) {
+                    s.resp_held_len = 0;
+                } else {
+                    resp_open = false;
+                }
+            }
+            let resp_budget = if resp_open { RESP_BUDGET } else { 0 };
+            for _ in 0..resp_budget {
                 let poll = (sys.channel_poll)(s.in_responses, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -371,16 +533,44 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     continue;
                 }
                 worked += 1;
-                match s.buf[1] {
-                    #[cfg(feature = "mqtt")]
-                    SESSION_PROTO_MQTT => mqtt::on_response(&mut s.mqtt, sys, &s.buf[..n]),
-                    #[cfg(feature = "kafka")]
-                    SESSION_PROTO_KAFKA => kafka::on_response(&mut s.kafka, sys, &s.buf[..n]),
-                    #[cfg(feature = "amqp")]
-                    SESSION_PROTO_AMQP => amqp::on_response(&mut s.amqp, sys, &s.buf[..n]),
-                    _ => {}
+                s.hb_resp = s.hb_resp.wrapping_add(1);
+                if !dispatch_response(s, sys, n) {
+                    s.resp_held[..n].copy_from_slice(&s.buf[..n]);
+                    s.resp_held_len = n as u16;
+                    break;
                 }
             }
+        }
+
+        // One accounting line per second: records in, packets decoded
+        // and written to the session, packets held, responses in,
+        // frames out, frames refused. Cumulative where the counter is
+        // cumulative (`dec`, `held`, `enc`, `refused`).
+        if now.wrapping_sub(s.last_hb_ms) >= 1000 {
+            s.last_hb_ms = now;
+            #[cfg(feature = "mqtt")]
+            let (dec, held, enc, refused) = mqtt::hb_counters(&s.mqtt);
+            #[cfg(not(feature = "mqtt"))]
+            let (dec, held, enc, refused) = (0u32, 0u32, 0u32, 0u32);
+            let mut line = [0u8; 120];
+            let mut pos = 0usize;
+            for (label, v) in [
+                (&b"[proto] hb raw="[..], s.hb_raw),
+                (&b" dec="[..], dec),
+                (&b" held="[..], held),
+                (&b" resp="[..], s.hb_resp),
+                (&b" enc="[..], enc),
+                (&b" refused="[..], refused),
+            ] {
+                for &b in label {
+                    line[pos] = b;
+                    pos += 1;
+                }
+                pos = fmt_u32(&mut line, pos, v);
+            }
+            dev_log(sys, 3, line.as_ptr(), pos);
+            s.hb_raw = 0;
+            s.hb_resp = 0;
         }
 
         // ── 4: component-tagged telemetry ────────────────────────────

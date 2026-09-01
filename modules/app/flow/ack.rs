@@ -15,21 +15,24 @@
 
 use super::abi::SyscallTable;
 use super::wire;
+use super::{dev_log, dev_millis, fmt_u32_raw};
 
 const MAX_INFLIGHT: usize = 2048;
 
-/// Maximum number of partitions we can track durability for. Matches
-/// `partition_router::MAX_LOCAL_PARTITIONS` for now; if the router grows
-/// beyond that (e.g. via tree composition or multi-tenant raft), bump
-/// this in lockstep.
-const MAX_PARTITIONS: usize = 16;
+/// Maximum number of raft partitions we track a durable mark for.
+/// Matches the engine's `K_MAX` (64) and `session_processor`'s
+/// `MAX_APPLY_PARTITIONS`: a partition above this never gets a durable
+/// mark, so every QoS 1 write routed to it waits for the redelivery
+/// scan instead of its ack — measured at K=64 as an 8 s p50 the moment
+/// load spread past sixteen topics.
+const MAX_PARTITIONS: usize = 64;
 
 /// Registrations admitted per step. Matches the standalone drain bound.
 pub const REGISTER_BUDGET: u8 = 16;
-/// Durability proofs admitted per step. The standalone module drained
-/// these in an unbounded loop; proofs are monotone high-water marks, so
-/// deferring the tail to the next step loses nothing and gives the
-/// composite a bounded step (standards fluxor-modules.md §8 rule 5).
+/// Durability proofs admitted per step. Proofs are monotone high-water
+/// marks, so deferring the tail to the next step loses nothing and
+/// keeps the composite step bounded (standards fluxor-modules.md §8
+/// rule 5).
 pub const DURABILITY_BUDGET: u8 = 64;
 
 #[repr(C)]
@@ -247,6 +250,22 @@ pub unsafe fn step_acks(a: &mut Ack, sys: &SyscallTable) {
                     if wrote == want {
                         a.entries[i].active = 0;
                         a.acks_emitted = a.acks_emitted.wrapping_add(1);
+                        // One in 32: register-to-ack age, the wait for the
+                        // durable mark to pass the entry's index.
+                        if a.acks_emitted & 31 == 0 {
+                            let age = dev_millis(sys).wrapping_sub(a.entries[i].sent_ms);
+                            let mut line = [0u8; 48];
+                            let mut pos = 0usize;
+                            for &b in b"[flow] ack age ms=" {
+                                line[pos] = b;
+                                pos += 1;
+                            }
+                            pos += fmt_u32_raw(
+                                line.as_mut_ptr().add(pos),
+                                age.min(u32::MAX as u64) as u32,
+                            );
+                            dev_log(sys, 3, line.as_ptr(), pos);
+                        }
                     } else {
                         a.emit_retries = a.emit_retries.wrapping_add(1);
                     }

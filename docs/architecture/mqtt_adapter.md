@@ -59,9 +59,10 @@ Exactly-once is scoped to that contract: the broker accepts each
 message once and completes each transaction once. It says nothing
 about side effects a subscriber performs on delivery.
 
-Cross-PRG publishes carry a `forward_seq` idempotence key (see
-[partitioning.md](partitioning.md)) so replay after failover fences
-duplicates.
+A publish whose topic another PRG owns needs no idempotence key of its
+own: there is no forwarding hop to duplicate. Every node applies the
+publish from the shared log and only the node holding the subscriber's
+session delivers it (see [partitioning.md](partitioning.md)).
 
 ## Shared subscriptions
 

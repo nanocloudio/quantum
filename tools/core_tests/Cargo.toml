@@ -1,0 +1,26 @@
+[package]
+name = "core_tests"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.81"
+publish = false
+
+# Host test bed for `modules/common/cores/*`.
+#
+# The cores are written to be `include!`d by both the PIC modules and a
+# host crate — `kafka_core.rs`'s own header says so. `fluxor ci`
+# fmt/clippies `modules/**` but runs no test over it, so this crate is
+# where the cores' invariants are actually exercised.
+#
+# It is a library with tests and no binary: nothing links it into a
+# module, so it cannot drift into being a second implementation.
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

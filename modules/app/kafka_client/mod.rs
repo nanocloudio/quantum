@@ -57,6 +57,15 @@ const NET_MSG_CLOSED: u8 = 0x03;
 const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
 
+/// True when a `net_proto` frame's leading `[conn_id: u16 LE]` names
+/// `want`. Stated once because every inbound frame carries it, and a
+/// conn-id read of the wrong WIDTH matches nothing while looking
+/// entirely reasonable at the call site.
+#[inline]
+unsafe fn conn_matches(payload: *const u8, plen: usize, want: u16) -> bool {
+    plen >= 2 && u16::from_le_bytes([*payload, *payload.add(1)]) == want
+}
+
 const NET_BUF: usize = 2048;
 const REQ_BUF: usize = 1024;
 const ACC_BUF: usize = 8192;
@@ -84,7 +93,11 @@ struct KafkaState {
     heartbeat_ms: u32,
 
     phase: KPhase,
-    conn_id: u8,
+    /// `net_proto` conn ids are `u16 LE` on every frame. Held as a
+    /// `u8`, the `MSG_CONNECTED` tag check read the HIGH BYTE of the
+    /// conn id instead of the requester tag, never matched, and the
+    /// socket opened without a single byte ever being sent.
+    conn_id: u16,
     tag: u8,
     started_ms: u64,
     last_hb_ms: u64,
@@ -393,13 +406,13 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
         }
         KAct::Fail => {
             if s.conn_id != 0 {
-                let close = [s.conn_id];
+                let close = s.conn_id.to_le_bytes();
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    1,
+                    2,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );
@@ -549,19 +562,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
                 match msg {
+                    // `[conn_id: u16 LE][requester_tag: u8]`
                     NET_MSG_CONNECTED if s.phase == KPhase::Connecting => {
-                        if plen >= 2 && *payload.add(1) == s.tag {
-                            s.conn_id = *payload;
+                        if plen >= 3 && *payload.add(2) == s.tag {
+                            s.conn_id = u16::from_le_bytes([*payload, *payload.add(1)]);
                             feed(s, sys, KEv::Connected, now);
                         }
                     }
+                    // `[conn_id: u16 LE][data…]`
                     NET_MSG_DATA if s.phase != KPhase::Disconnected => {
-                        if plen > 1 && *payload == s.conn_id {
-                            let data_len = plen - 1;
+                        if plen > 2 && conn_matches(payload, plen, s.conn_id) {
+                            let data_len = plen - 2;
                             let space = ACC_BUF - s.acc_len as usize;
                             let take = if data_len < space { data_len } else { space };
                             core::ptr::copy_nonoverlapping(
-                                payload.add(1),
+                                payload.add(2),
                                 s.acc.as_mut_ptr().add(s.acc_len as usize),
                                 take,
                             );
@@ -586,18 +601,22 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             }
                         }
                     }
+                    // `[conn_id: u16 LE]`
                     NET_MSG_CLOSED if s.phase != KPhase::Disconnected => {
-                        if plen >= 1 && *payload == s.conn_id {
+                        if conn_matches(payload, plen, s.conn_id) {
                             feed(s, sys, KEv::PeerClosed, now);
                         }
                     }
                     NET_MSG_ERROR => {
+                        // `[conn_id: u16 LE][errno: i8][requester_tag: u8?]`
+                        // — a connect-phase failure has a meaningless
+                        // conn_id, so the tag is the only way to know it
+                        // is ours.
                         let ours = (s.phase == KPhase::Connecting
-                            && plen >= 3
-                            && *payload.add(2) == s.tag)
+                            && plen >= 4
+                            && *payload.add(3) == s.tag)
                             || (s.phase != KPhase::Disconnected
-                                && plen >= 1
-                                && *payload == s.conn_id);
+                                && conn_matches(payload, plen, s.conn_id));
                         if ours {
                             feed(s, sys, KEv::NetError, now);
                         }
@@ -609,7 +628,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 4. Send pump.
         if s.conn_id != 0 && s.req_sent < s.req_len {
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 1;
+            // -2 for the `[conn_id: u16 LE]` prefix on CMD_SEND.
+            let max_chunk = NET_BUF - NET_FRAME_HDR - 2;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {
@@ -621,14 +641,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 } else {
                     max_chunk
                 };
-                let total_payload = chunk + 1;
+                let total_payload = chunk + 2;
                 s.nbuf[0] = NET_CMD_SEND;
                 s.nbuf[1] = (total_payload & 0xff) as u8;
                 s.nbuf[2] = (total_payload >> 8) as u8;
-                s.nbuf[3] = s.conn_id;
+                let cid = s.conn_id.to_le_bytes();
+                s.nbuf[3] = cid[0];
+                s.nbuf[4] = cid[1];
                 core::ptr::copy_nonoverlapping(
                     s.req.as_ptr().add(s.req_sent as usize),
-                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 1),
+                    s.nbuf.as_mut_ptr().add(NET_FRAME_HDR + 2),
                     chunk,
                 );
                 (sys.channel_write)(s.net_out, s.nbuf.as_ptr(), NET_FRAME_HDR + total_payload);
@@ -651,13 +673,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // 6. Drain: leave the group cleanly once idle.
         if s.draining == 1 && matches!(s.phase, KPhase::Disconnected | KPhase::Stable) {
             if s.conn_id != 0 {
-                let close = [s.conn_id];
+                let close = s.conn_id.to_le_bytes();
                 net_write_frame(
                     sys,
                     s.net_out,
                     NET_CMD_CLOSE,
                     close.as_ptr(),
-                    1,
+                    2,
                     s.nbuf.as_mut_ptr(),
                     NET_BUF,
                 );

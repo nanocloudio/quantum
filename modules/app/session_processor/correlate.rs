@@ -273,6 +273,14 @@ pub fn allocate(
     None
 }
 
+/// Issue time of a pending correlation, for age accounting before it
+/// is taken.
+pub fn issued_ms(s: &Correlate, cid: u64) -> Option<u64> {
+    (0..MAX_PENDING_CORRELATIONS)
+        .find(|&i| s.pending[i].active == 1 && s.pending[i].correlation_id == cid)
+        .map(|i| s.pending[i].ts_ms)
+}
+
 /// Resolve and free a correlation. Returns `(session_slot, packet_id,
 /// op)` if it was still outstanding.
 pub fn take(s: &mut Correlate, cid: u64) -> Option<(u32, u16, u8)> {
