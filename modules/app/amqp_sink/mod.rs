@@ -132,7 +132,7 @@ struct SinkState {
     broker_port: u16,
     heartbeat_s: u16,
     topic_len: u8,
-    conn_id: u8,
+    conn_id: u16,
     conn_present: u8,
 
     phase: Phase,
@@ -351,7 +351,7 @@ unsafe fn flush_tx(s: &mut SinkState) -> bool {
     }
     let sys = &*s.syscalls;
     let remaining = (s.tx_len - s.tx_sent) as usize;
-    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 1;
+    let max_data = NET_BUF_SIZE - NET_FRAME_HDR - 2;
     let to_send = if remaining < max_data {
         remaining
     } else {
@@ -362,14 +362,16 @@ unsafe fn flush_tx(s: &mut SinkState) -> bool {
     }
     let scratch = s.net_buf.as_mut_ptr();
     let payload_ptr = scratch.add(NET_FRAME_HDR);
-    *payload_ptr = s.conn_id;
+    let cid = s.conn_id.to_le_bytes();
+    *payload_ptr = cid[0];
+    *payload_ptr.add(1) = cid[1];
     let src = s.tx_buf.as_ptr().add(s.tx_sent as usize);
     let mut i = 0;
     while i < to_send {
-        *payload_ptr.add(1 + i) = *src.add(i);
+        *payload_ptr.add(2 + i) = *src.add(i);
         i += 1;
     }
-    let payload_len = 1 + to_send;
+    let payload_len = 2 + to_send;
     let len_le = (payload_len as u16).to_le_bytes();
     *scratch = NET_CMD_SEND;
     *scratch.add(1) = len_le[0];
@@ -611,8 +613,8 @@ unsafe fn handle_rx(s: &mut SinkState) {
     let (msg_type, payload_len, full) =
         net_read_frame_aligned(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
-        && payload_len >= 1
-        && *nbuf.add(NET_FRAME_HDR) != s.conn_id
+        && payload_len >= 2
+        && u16::from_le_bytes([*nbuf.add(NET_FRAME_HDR), *nbuf.add(NET_FRAME_HDR + 1)]) != s.conn_id
     {
         return;
     }
@@ -621,13 +623,13 @@ unsafe fn handle_rx(s: &mut SinkState) {
         enter_reconnect(s);
         return;
     }
-    if msg_type == NET_MSG_DATA && payload_len > 1 {
+    if msg_type == NET_MSG_DATA && payload_len > 2 {
         if full > payload_len {
             log_err(s, b"[amqpsink] truncated segment");
             enter_reconnect(s);
             return;
         }
-        let data_len = payload_len - 1;
+        let data_len = payload_len - 2;
         process_frames(s);
         let space = RX_BUF_SIZE - s.rx_have as usize;
         if data_len > space {
@@ -635,7 +637,7 @@ unsafe fn handle_rx(s: &mut SinkState) {
             enter_reconnect(s);
             return;
         }
-        let src = nbuf.add(NET_FRAME_HDR + 1);
+        let src = nbuf.add(NET_FRAME_HDR + 2);
         let dst = s.rx_buf.as_mut_ptr().add(s.rx_have as usize);
         let mut i = 0;
         while i < data_len {
@@ -672,14 +674,14 @@ unsafe fn enter_reconnect(s: &mut SinkState) {
     emit_link_down(s);
     if s.conn_present != 0 && s.net_out_chan >= 0 {
         let sys = &*s.syscalls;
-        let mut payload = [0u8; 1];
-        payload[0] = s.conn_id;
+        let mut payload = [0u8; 2];
+        payload[..2].copy_from_slice(&s.conn_id.to_le_bytes());
         net_write_frame(
             sys,
             s.net_out_chan,
             NET_CMD_CLOSE,
             payload.as_ptr(),
-            1,
+            2,
             s.net_buf.as_mut_ptr(),
             NET_BUF_SIZE,
         );
@@ -826,14 +828,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let nbuf = s.net_buf.as_mut_ptr();
                         let (msg_type, payload_len) =
                             net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= 1 {
-                            let tag = if payload_len >= 2 {
-                                *nbuf.add(NET_FRAME_HDR + 1)
+                        if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
+                            let tag = if payload_len >= 3 {
+                                *nbuf.add(NET_FRAME_HDR + 2)
                             } else {
                                 0
                             };
-                            if payload_len < 2 || tag == dev_requester_tag(sys) {
-                                s.conn_id = *nbuf.add(NET_FRAME_HDR);
+                            if payload_len < 3 || tag == dev_requester_tag(sys) {
+                                s.conn_id = u16::from_le_bytes([
+                                    *nbuf.add(NET_FRAME_HDR),
+                                    *nbuf.add(NET_FRAME_HDR + 1),
+                                ]);
                                 s.conn_present = 1;
                                 s.phase = Phase::Header;
                                 continue;

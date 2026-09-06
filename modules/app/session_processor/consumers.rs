@@ -41,8 +41,7 @@ struct KGroupMember {
     /// member is released so a crashed consumer (the common case — clients
     /// default to not sending LeaveGroup on close) can't accumulate as a
     /// ghost until the 8-slot table exhausts and bricks the group.
-    conn_id: u8,
-    _pad: u8,
+    conn_id: u16,
     meta_len: u16,
     assign_len: u16,
     id: [u8; KG_NAME],
@@ -56,7 +55,6 @@ impl KGroupMember {
             active: 0,
             id_len: 0,
             conn_id: 0,
-            _pad: 0,
             meta_len: 0,
             assign_len: 0,
             id: [0; KG_NAME],
@@ -130,8 +128,8 @@ impl KOffset {
 #[derive(Clone, Copy)]
 struct AmqpConsumer {
     active: u8,
-    conn_id: u8,
     no_ack: u8,
+    conn_id: u16,
     tag_len: u8,
     queue_len: u8,
     _pad: u8,
@@ -419,7 +417,7 @@ pub fn next_member_id(s: &mut Consumers, gi: usize, dst: &mut [u8]) -> usize {
 /// Admit a member. Returns its index, or None when the member table is
 /// full. A member that is already present is returned as-is; a new one
 /// bumps the generation, because membership changed.
-pub fn member_join(s: &mut Consumers, gi: usize, id: &[u8], conn_id: u8) -> Option<usize> {
+pub fn member_join(s: &mut Consumers, gi: usize, id: &[u8], conn_id: u16) -> Option<usize> {
     if gi >= KGROUPS || id.is_empty() || id.len() > KG_NAME {
         return None;
     }
@@ -553,7 +551,7 @@ pub const OFFSET_SLOTS: usize = KOFFSETS;
 /// and how to address the frame.
 #[derive(Clone, Copy)]
 pub struct ConsumerView {
-    pub conn_id: u8,
+    pub conn_id: u16,
     pub channel: u16,
     pub no_ack: bool,
     pub cursor: u64,
@@ -610,7 +608,7 @@ pub fn consumer_tag_into(s: &Consumers, ci: usize, dst: &mut [u8]) -> usize {
 /// Find a free slot, or the existing registration for this
 /// (conn, channel) — AMQP allows one consumer per channel here, so a
 /// re-Consume replaces rather than duplicates.
-pub fn consumer_slot(s: &Consumers, conn_id: u8, channel: u16) -> Option<usize> {
+pub fn consumer_slot(s: &Consumers, conn_id: u16, channel: u16) -> Option<usize> {
     for i in 0..ACONSUMERS {
         if s.amqp[i].active == 1 && s.amqp[i].conn_id == conn_id && s.amqp[i].channel == channel {
             return Some(i);
@@ -629,7 +627,7 @@ pub fn consumer_slot(s: &Consumers, conn_id: u8, channel: u16) -> Option<usize> 
 pub fn consumer_register(
     s: &mut Consumers,
     ci: usize,
-    conn_id: u8,
+    conn_id: u16,
     channel: u16,
     no_ack: bool,
     prefetch: u16,
@@ -677,7 +675,7 @@ pub fn consumer_delivered(s: &mut Consumers, ci: usize, offset: u64) {
 }
 
 /// Find the consumer owning (conn, channel), if any.
-pub fn consumer_on_channel(s: &Consumers, conn_id: u8, channel: u16) -> Option<usize> {
+pub fn consumer_on_channel(s: &Consumers, conn_id: u16, channel: u16) -> Option<usize> {
     (0..ACONSUMERS).find(|&i| {
         s.amqp[i].active == 1 && s.amqp[i].conn_id == conn_id && s.amqp[i].channel == channel
     })
@@ -685,7 +683,7 @@ pub fn consumer_on_channel(s: &Consumers, conn_id: u8, channel: u16) -> Option<u
 
 /// Find the consumer on (conn, channel) whose tag matches, as
 /// Basic.Cancel addresses it.
-pub fn consumer_by_tag(s: &Consumers, conn_id: u8, channel: u16, tag: &[u8]) -> Option<usize> {
+pub fn consumer_by_tag(s: &Consumers, conn_id: u16, channel: u16, tag: &[u8]) -> Option<usize> {
     (0..ACONSUMERS).find(|&i| {
         let c = &s.amqp[i];
         c.active == 1
@@ -739,7 +737,7 @@ pub fn consumer_ack(s: &mut Consumers, ci: usize, dt: u64, multiple: bool) -> u6
 /// Release every group member and AMQP consumer belonging to `conn_id`.
 /// Clients commonly close without LeaveGroup, so this is the path that
 /// actually reclaims most members.
-pub fn release_conn(s: &mut Consumers, conn_id: u8) -> u32 {
+pub fn release_conn(s: &mut Consumers, conn_id: u16) -> u32 {
     let mut released = 0;
     for gi in 0..KGROUPS {
         if s.groups[gi].active != 1 {

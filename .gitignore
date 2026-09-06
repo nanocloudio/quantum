@@ -42,3 +42,6 @@ modules/module.ld
 # fluxor.lock is committed (standards/dependencies.md §5). The lockfile
 # captures (name, version, sha256) for every resolved transitive dep
 # so canonical-mode builds are reproducible across machines.
+
+# Module build scratch dropped at the repo root by the module linker.
+/libmod.rlib

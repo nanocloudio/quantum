@@ -201,10 +201,11 @@ const RX_BUDGET: usize = 64;
 /// Records drained from `responses_in` per step.
 const RESP_BUDGET: usize = 64;
 
-/// Session-side protocol discriminator at `payload[1]` of a
-/// MSG_SESSION_RESPONSE. Distinct from the router's PROTO_* vocabulary:
-/// these are the values session_processor stamps (see its
-/// `emit_kafka_response` / `emit_amqp_response`).
+/// Session-side protocol discriminator at `payload[2]` of a
+/// MSG_SESSION_RESPONSE, right after the `u16 LE` conn id. Distinct
+/// from the router's PROTO_* vocabulary: these are the values
+/// session_processor stamps (see its `emit_kafka_response` /
+/// `emit_amqp_response`).
 const SESSION_PROTO_MQTT: u8 = 0;
 const SESSION_PROTO_KAFKA: u8 = 1;
 const SESSION_PROTO_AMQP: u8 = 2;
@@ -284,7 +285,7 @@ fn fmt_u32(out: &mut [u8], mut pos: usize, mut v: u32) -> usize {
 ///
 /// `sys` must point at a live kernel syscall table.
 unsafe fn dispatch_response(s: &mut ModuleState, sys: &SyscallTable, n: usize) -> bool {
-    match s.buf[1] {
+    match s.buf[2] {
         #[cfg(feature = "mqtt")]
         SESSION_PROTO_MQTT => mqtt::on_response(&mut s.mqtt, sys, &s.buf[..n]),
         #[cfg(feature = "kafka")]
@@ -476,13 +477,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let (mtype, plen) = wire::channel_read_msg(sys, s.in_raw, &mut s.buf);
                 let n = plen as usize;
-                if n < 1 || n > s.buf.len() {
+                if n < 2 || n > s.buf.len() {
                     continue;
                 }
                 worked += 1;
                 s.hb_raw = s.hb_raw.wrapping_add(1);
-                let conn_id = s.buf[0];
-                let proto = router::route(&mut s.router, conn_id, mtype, &s.buf[1..n]);
+                let conn_id = u16::from_le_bytes([s.buf[0], s.buf[1]]);
+                let proto = router::route(&mut s.router, conn_id, mtype, &s.buf[2..n]);
 
                 match proto {
                     #[cfg(feature = "mqtt")]
@@ -507,7 +508,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // Every codec shares this one handle, so a per-codec drain would
         // CONSUME the other codecs' records. The demux lives here
         // instead: read once, dispatch on the session proto tag at
-        // payload[1].
+        // payload[2].
         if s.in_responses >= 0 {
             // The held response goes first, and nothing else is drained
             // until its edge takes it.
@@ -529,7 +530,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let (mtype, plen) = wire::channel_read_msg(sys, s.in_responses, &mut s.buf);
                 let n = plen as usize;
-                if mtype != wire::MSG_SESSION_RESPONSE || n < 2 || n > s.buf.len() {
+                if mtype != wire::MSG_SESSION_RESPONSE || n < 3 || n > s.buf.len() {
                     continue;
                 }
                 worked += 1;

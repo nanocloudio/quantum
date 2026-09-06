@@ -4,8 +4,8 @@
 //! and are demuxed by MSG_* type byte, so the module stays inside the
 //! 16-port-per-direction Fluxor wire limit.
 //!
-//! Ingress envelope (codec → session): `[conn_id:u8][mtype:u8][proto][pkt_type][flags][fields]`.
-//! Egress envelope (session → codec):  `[conn_id:u8][mtype:u8][proto][pkt_type][flags][body]`.
+//! Ingress envelope (codec → session): `[conn_id:u16 LE][proto][pkt_type][flags][fields]`.
+//! Egress envelope (session → codec):  `[conn_id:u16 LE][proto][pkt_type][flags][body]`.
 //!
 //! Per-session state tracks conn_id so responses go back to the correct
 //! client connection. Session → conn_id is set on CONNECT and cleared on
@@ -24,7 +24,7 @@
 //!   in[7]  assigned_in    — MSG_PROPOSAL_ASSIGNED (correlation → wal index)
 //!   in[8]  wal_reply      — WAL records for a cold Kafka Fetch
 //!   out[0] proposals      — to consensus (fluxor wire envelope)
-//!   out[1] codec_out      — [conn_id][mtype][envelope] responses to codecs
+//!   out[1] codec_out      — [conn_id:u16 LE][proto][pkt_type][flags][body] responses to codecs
 //!   out[2] topic_out      — publish + subscribe + unsubscribe (wire envelope)
 //!   out[3] messaging_out  — dedup/offline/retained/group/txn ops (wire envelope)
 //!   out[4] forward_out    — inflight register + lag signal to `flow`
@@ -159,7 +159,7 @@ mod types;
 
 use types::*;
 
-const MAX_SESSIONS: usize = 1024;
+const MAX_SESSIONS: usize = 16384;
 
 /// Apply cursors, one per hosted raft partition. Must be at least
 /// clustor's `consensus` `K_MAX` (64); a partition id at or above this
@@ -179,6 +179,65 @@ const ADMISSION_GATE_BYTES: i32 = 2048;
 /// prefix, etc.) fits without hitting the `channel_read_msg` discard
 /// path.
 const BUF_SIZE: usize = 8192;
+/// Codec envelope header, both directions:
+/// `[conn_id:u16 LE][proto:u8][pkt_type:u8][flags:u8]`; the body follows.
+const CODEC_ENV_HDR: usize = 5;
+/// Kafka codec envelope header, both directions:
+/// `[conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE][corr:i32 LE]`.
+const KAFKA_ENV_HDR: usize = 11;
+/// AMQP codec envelope header, both directions:
+/// `[conn_id:u16 LE][proto=2][op:u8][channel:u16 LE]`.
+const AMQP_ENV_HDR: usize = 6;
+/// AMQP ingress fixed prefix: the envelope header plus the
+/// `delivery_tag:u64 LE` every op carries (0 where it has no meaning).
+const AMQP_ENV_PREFIX: usize = AMQP_ENV_HDR + 8;
+
+/// Read the connection id off a codec envelope.
+#[inline]
+fn env_conn_id(buf: &[u8]) -> u16 {
+    u16::from_le_bytes([buf[0], buf[1]])
+}
+
+/// Read `(conn_id, api_ver, corr)` off a Kafka codec envelope. `buf`
+/// must hold at least `KAFKA_ENV_HDR` bytes.
+#[cfg(feature = "kafka")]
+#[inline]
+fn kafka_env_header(buf: &[u8]) -> (u16, i16, i32) {
+    (
+        env_conn_id(buf),
+        i16::from_le_bytes([buf[5], buf[6]]),
+        i32::from_le_bytes([buf[7], buf[8], buf[9], buf[10]]),
+    )
+}
+
+/// Read `(conn_id, channel)` off an AMQP codec envelope. `buf` must
+/// hold at least `AMQP_ENV_HDR` bytes.
+#[cfg(feature = "amqp")]
+#[inline]
+fn amqp_env_header(buf: &[u8]) -> (u16, u16) {
+    (env_conn_id(buf), u16::from_le_bytes([buf[4], buf[5]]))
+}
+
+/// Read the `delivery_tag:u64 LE` that follows the AMQP envelope
+/// header. `buf` must hold at least `AMQP_ENV_PREFIX` bytes.
+#[cfg(feature = "amqp")]
+#[inline]
+fn amqp_env_delivery_tag(buf: &[u8]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[AMQP_ENV_HDR..AMQP_ENV_PREFIX]);
+    u64::from_le_bytes(b)
+}
+
+/// Write the Kafka codec envelope header into `out[..KAFKA_ENV_HDR]`.
+#[cfg(feature = "kafka")]
+#[inline]
+fn write_kafka_env_header(out: &mut [u8], conn_id: u16, api_key: i16, api_ver: i16, corr: i32) {
+    out[0..2].copy_from_slice(&conn_id.to_le_bytes());
+    out[2] = 1; // PROTO_KAFKA envelope discriminator
+    out[3..5].copy_from_slice(&api_key.to_le_bytes());
+    out[5..7].copy_from_slice(&api_ver.to_le_bytes());
+    out[7..11].copy_from_slice(&corr.to_le_bytes());
+}
 const MAX_PENDING_CORRELATIONS: usize = 1024;
 
 /// Stash slots for QoS 1+ topic-publish envelopes that are commit-gated.
@@ -343,7 +402,7 @@ const OP_KPRODUCE: u8 = 2;
 // WAL index as a base_offset. See docs/architecture/flow_control.md.
 
 /// Reserved session_slot namespace for durable-publish inflights. Bit 30
-/// set, far above MAX_SESSIONS (1024) so the two spaces can never collide.
+/// set, far above MAX_SESSIONS (16384) so the two spaces can never collide.
 const KAFKA_SLOT_BASE: u32 = 0x4000_0000;
 const KAFKA_INFLIGHT: usize = 256;
 /// Slot index occupies the low 8 bits (KAFKA_INFLIGHT ≤ 256).
@@ -927,8 +986,8 @@ pub unsafe extern "C" fn module_new(
 
 /// Emit a `MSG_SESSION_RESPONSE` to out_codec via wire-envelope framing.
 ///
-/// Channel payload (post-envelope-strip) is `[conn_id][proto][pkt_type]
-/// [flags][body]`. Envelope framing is required because the codec read
+/// Channel payload (post-envelope-strip) is `[conn_id:u16 LE][proto]
+/// [pkt_type][flags][body]`. Envelope framing is required because the codec read
 /// loop drains the channel multiple messages per tick — without per-
 /// message length prefixes, back-to-back writes coalesce on the byte
 /// FIFO and the consumer mis-parses everything after the first.
@@ -937,7 +996,7 @@ pub unsafe extern "C" fn module_new(
 unsafe fn emit_codec_response(
     sys: &SyscallTable,
     chan: i32,
-    conn_id: u8,
+    conn_id: u16,
     proto: u8,
     pkt_type: u8,
     flags: u8,
@@ -946,16 +1005,16 @@ unsafe fn emit_codec_response(
     if chan < 0 {
         return false;
     }
-    let total = 1 + 3 + body.len();
+    let total = CODEC_ENV_HDR + body.len();
     if total > BUF_SIZE {
         return false;
     }
     let mut out = [0u8; BUF_SIZE];
-    out[0] = conn_id;
-    out[1] = proto;
-    out[2] = pkt_type;
-    out[3] = flags;
-    out[4..4 + body.len()].copy_from_slice(body);
+    out[0..2].copy_from_slice(&conn_id.to_le_bytes());
+    out[2] = proto;
+    out[3] = pkt_type;
+    out[4] = flags;
+    out[CODEC_ENV_HDR..total].copy_from_slice(body);
     let w = wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]);
     w > 0
 }
@@ -964,14 +1023,14 @@ unsafe fn emit_codec_response(
 /// Emit a Kafka `MSG_SESSION_RESPONSE` to out_codec. Kafka responses use
 /// a wider header than the MQTT `[conn][proto][pkt][flags]` form so the
 /// codec can reframe by correlation id without any session state:
-///   `[conn_id:u8][proto=1][api_key:i16 LE][api_ver:i16 LE]
+///   `[conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE]
 ///    [corr_id:i32 LE][body...]`
 ///
 /// # Safety
 unsafe fn emit_kafka_response(
     sys: &SyscallTable,
     chan: i32,
-    conn_id: u8,
+    conn_id: u16,
     api_key: i16,
     api_ver: i16,
     kafka_corr: i32,
@@ -980,7 +1039,7 @@ unsafe fn emit_kafka_response(
     if chan < 0 {
         return false;
     }
-    let total = 10 + body.len();
+    let total = KAFKA_ENV_HDR + body.len();
     if total > BUF_SIZE {
         return false;
     }
@@ -988,12 +1047,8 @@ unsafe fn emit_kafka_response(
     if total > out.len() {
         return false;
     }
-    out[0] = conn_id;
-    out[1] = 1; // PROTO_KAFKA envelope discriminator
-    out[2..4].copy_from_slice(&api_key.to_le_bytes());
-    out[4..6].copy_from_slice(&api_ver.to_le_bytes());
-    out[6..10].copy_from_slice(&kafka_corr.to_le_bytes());
-    out[10..total].copy_from_slice(body);
+    write_kafka_env_header(&mut out, conn_id, api_key, api_ver, kafka_corr);
+    out[KAFKA_ENV_HDR..total].copy_from_slice(body);
     let w = wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]);
     w > 0
 }
@@ -1024,7 +1079,7 @@ struct KafkaProduceAck<'a> {
 unsafe fn emit_kafka_produce_response(
     sys: &SyscallTable,
     chan: i32,
-    conn_id: u8,
+    conn_id: u16,
     ack: KafkaProduceAck<'_>,
 ) -> bool {
     let KafkaProduceAck {
@@ -1072,7 +1127,7 @@ unsafe fn emit_kafka_produce_response(
 #[cfg(feature = "kafka")]
 /// Handle a Kafka Produce request forwarded by `protocol::kafka`. Payload in
 /// `s.in_buf[..plen]`:
-///   `[conn_id][proto=1][api_key:i16 LE][api_ver:i16 LE][corr:i32 LE]
+///   `[conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE][corr:i32 LE]
 ///    [request body after client_id]`
 ///
 /// One topic per request, up to KIN_MAX_PARTS partitions (each becomes
@@ -1086,11 +1141,9 @@ unsafe fn emit_kafka_produce_response(
 ///
 /// # Safety
 unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64, plen: usize) {
-    let conn_id = s.in_buf[0];
-    let api_ver = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let kafka_corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, api_ver, kafka_corr) = kafka_env_header(&s.in_buf);
     let req_end = plen;
-    let mut off = 10usize;
+    let mut off = KAFKA_ENV_HDR;
     let mut parse_ok = true;
     macro_rules! need {
         ($n:expr) => {
@@ -1810,23 +1863,23 @@ fn apply_amqp_publish(s: &mut ModuleState, body: &[u8], now_ms: u64) {
 unsafe fn emit_kafka_response_outbuf(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn_id: u8,
+    conn_id: u16,
     api_key: i16,
     api_ver: i16,
     kafka_corr: i32,
     body_len: usize,
 ) -> bool {
-    let total = 10 + body_len;
+    let total = KAFKA_ENV_HDR + body_len;
     if total > BUF_SIZE {
         return false;
     }
-    // Shift the body up to make room for the 10-byte header (memmove).
-    core::ptr::copy(s.out_buf.as_ptr(), s.out_buf.as_mut_ptr().add(10), body_len);
-    s.out_buf[0] = conn_id;
-    s.out_buf[1] = 1; // PROTO_KAFKA envelope discriminator
-    s.out_buf[2..4].copy_from_slice(&api_key.to_le_bytes());
-    s.out_buf[4..6].copy_from_slice(&api_ver.to_le_bytes());
-    s.out_buf[6..10].copy_from_slice(&kafka_corr.to_le_bytes());
+    // Shift the body up to make room for the header (memmove).
+    core::ptr::copy(
+        s.out_buf.as_ptr(),
+        s.out_buf.as_mut_ptr().add(KAFKA_ENV_HDR),
+        body_len,
+    );
+    write_kafka_env_header(&mut s.out_buf, conn_id, api_key, api_ver, kafka_corr);
     let w = wire::channel_write_msg(
         sys,
         s.out_codec,
@@ -1861,7 +1914,7 @@ unsafe fn emit_kafka_response_outbuf(
 unsafe fn try_park_cold_fetch(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn_id: u8,
+    conn_id: u16,
     api_ver: i16,
     corr: i32,
     topic: &[u8],
@@ -2007,15 +2060,13 @@ const KFETCH_MAX_PARTS: usize = 16;
 /// Caller must hold an exclusive `&mut ModuleState` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    let conn_id = s.in_buf[0];
-    let api_ver = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let kafka_corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, api_ver, kafka_corr) = kafka_env_header(&s.in_buf);
     let end = plen;
     s.kafka_fetch_rx = s.kafka_fetch_rx.wrapping_add(1);
 
     // replica_id(4) max_wait(4) min_bytes(4) [v3+: max_bytes(4)]
     // [v4+: isolation(1)] topics(4) ...
-    let mut off = 10 + 12;
+    let mut off = KAFKA_ENV_HDR + 12;
     if api_ver >= 3 {
         off += 4;
     }
@@ -2240,13 +2291,11 @@ unsafe fn handle_kafka_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usiz
 ///
 /// # Safety
 unsafe fn handle_kafka_list_offsets(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    let conn_id = s.in_buf[0];
-    let api_ver = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let kafka_corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, api_ver, kafka_corr) = kafka_env_header(&s.in_buf);
     let end = plen;
     // replica_id(4) [v2+: isolation(1)] topics(4) [name partitions(4)
     //   [partition(4) timestamp(8) [v0: max_num_offsets(4)]]]
-    let mut off = 10 + 4;
+    let mut off = KAFKA_ENV_HDR + 4;
     if api_ver >= 2 {
         off += 1;
     }
@@ -2370,13 +2419,13 @@ unsafe fn handle_kafka_list_offsets(s: &mut ModuleState, sys: &SyscallTable, ple
 
 #[cfg(feature = "amqp")]
 /// Emit an AMQP MSG_SESSION_RESPONSE. Payload:
-///   [conn_id][proto=2][op][channel:u16 LE][rest...]
+///   [conn_id:u16 LE][proto=2][op][channel:u16 LE][rest...]
 ///
 /// # Safety
 unsafe fn emit_amqp_response(
     sys: &SyscallTable,
     chan: i32,
-    conn_id: u8,
+    conn_id: u16,
     op: u8,
     channel: u16,
     rest: &[u8],
@@ -2384,44 +2433,36 @@ unsafe fn emit_amqp_response(
     if chan < 0 {
         return false;
     }
-    let total = 5 + rest.len();
+    let total = AMQP_ENV_HDR + rest.len();
     let mut out = [0u8; 2200];
     if total > out.len() {
         return false;
     }
-    out[0] = conn_id;
-    out[1] = 2; // PROTO_AMQP envelope discriminator
-    out[2] = op;
-    out[3..5].copy_from_slice(&channel.to_le_bytes());
-    out[5..total].copy_from_slice(rest);
+    out[0..2].copy_from_slice(&conn_id.to_le_bytes());
+    out[2] = 2; // PROTO_AMQP envelope discriminator
+    out[3] = op;
+    out[4..6].copy_from_slice(&channel.to_le_bytes());
+    out[AMQP_ENV_HDR..total].copy_from_slice(rest);
     wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]) > 0
 }
 
 #[cfg(feature = "amqp")]
 /// AMQP publish (op 1) from `protocol::amqp`:
-///   [conn][2][1][channel:u16 LE][delivery_tag:u64 LE][rk_len:u16 LE][rk][body]
+///   [conn:u16 LE][2][1][channel:u16 LE][delivery_tag:u64 LE][rk_len:u16 LE][rk][body]
 /// delivery_tag != 0 → confirm mode: tagged proposal, Basic.Ack gated on
 /// quorum durability. delivery_tag == 0 → untagged fire-and-forget
 /// (still durably logged; no confirm to route).
 ///
 /// # Safety
 unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64, plen: usize) {
-    if plen < 15 {
+    const RK: usize = AMQP_ENV_PREFIX + 2;
+    if plen < RK {
         return;
     }
-    let conn_id = s.in_buf[0];
-    let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
-    let delivery_tag = u64::from_le_bytes([
-        s.in_buf[5],
-        s.in_buf[6],
-        s.in_buf[7],
-        s.in_buf[8],
-        s.in_buf[9],
-        s.in_buf[10],
-        s.in_buf[11],
-        s.in_buf[12],
-    ]);
-    let rl = u16::from_le_bytes([s.in_buf[13], s.in_buf[14]]) as usize;
+    let (conn_id, channel) = amqp_env_header(&s.in_buf);
+    let delivery_tag = amqp_env_delivery_tag(&s.in_buf);
+    let rl =
+        u16::from_le_bytes([s.in_buf[AMQP_ENV_PREFIX], s.in_buf[AMQP_ENV_PREFIX + 1]]) as usize;
     s.amqp_publish_rx = s.amqp_publish_rx.wrapping_add(1);
 
     // Nack a confirm-mode publish (or silently drop a non-confirm one).
@@ -2441,12 +2482,12 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
     // An empty or oversdized routing key can't be stored (the queue log
     // is keyed by routing key). Reject with a Nack instead of a silent
     // black-hole so a confirm-mode publisher unblocks.
-    if rl == 0 || rl > KAFKA_MAX_TOPIC || 15 + rl > plen {
+    if rl == 0 || rl > KAFKA_MAX_TOPIC || RK + rl > plen {
         s.amqp_publish_errors = s.amqp_publish_errors.wrapping_add(1);
         nack(s, sys);
         return;
     }
-    let body_len = plen - 15 - rl;
+    let body_len = plen - RK - rl;
 
     let op_body_len = 2 + rl + body_len;
     if op_body_len + 2 > KAFKA_MAX_RECORDS_BYTES + 4 {
@@ -2464,7 +2505,7 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
     // will never come. A publisher NOT in confirm mode gets nothing,
     // which is inherent to the protocol rather than a choice here.
     {
-        let shard = wire::shard_amqp_queue(0, &s.in_buf[15..15 + rl]);
+        let shard = wire::shard_amqp_queue(0, &s.in_buf[RK..RK + rl]);
         if !s.view.owns_shard(shard) {
             s.amqp_publish_errors = s.amqp_publish_errors.wrapping_add(1);
             nack(s, sys);
@@ -2477,12 +2518,12 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
         wire::encode_qprop_header(&mut s.out_buf[..hdr], wire::QOP_AMQP_PUBLISH, 0, 0);
         s.out_buf[hdr..hdr + 2].copy_from_slice(&(rl as u16).to_le_bytes());
         core::ptr::copy_nonoverlapping(
-            s.in_buf.as_ptr().add(15),
+            s.in_buf.as_ptr().add(RK),
             s.out_buf.as_mut_ptr().add(hdr + 2),
             rl + body_len,
         );
         // AMQP routing key names the queue, which owns the messages.
-        let shard = wire::shard_amqp_queue(0, &s.in_buf[15..15 + rl]);
+        let shard = wire::shard_amqp_queue(0, &s.in_buf[RK..RK + rl]);
         if try_emit_keyed(
             sys,
             s.out_proposals,
@@ -2515,11 +2556,11 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
     let ob = wire::QPROP_TAGGED_HDR_LEN;
     s.out_buf[ob..ob + 2].copy_from_slice(&(rl as u16).to_le_bytes());
     core::ptr::copy_nonoverlapping(
-        s.in_buf.as_ptr().add(15),
+        s.in_buf.as_ptr().add(RK),
         s.out_buf.as_mut_ptr().add(ob + 2),
         rl + body_len,
     );
-    let shard = wire::shard_amqp_queue(0, &s.in_buf[15..15 + rl]);
+    let shard = wire::shard_amqp_queue(0, &s.in_buf[RK..RK + rl]);
     if !try_emit_keyed(
         sys,
         s.out_proposals_tagged,
@@ -2555,23 +2596,24 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
 
 #[cfg(feature = "amqp")]
 /// AMQP Basic.Get (op 2):
-///   [conn][2][2][channel:u16 LE][dt:u64=0][q_len:u16 LE][queue]
+///   [conn:u16 LE][2][2][channel:u16 LE][dt:u64=0][q_len:u16 LE][queue]
 /// Pops the next raw entry at or past the queue's get_cursor.
 /// Single-consumer, auto-ack semantics (v1).
 ///
 /// # Safety
 unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < 15 {
+    const Q: usize = AMQP_ENV_PREFIX + 2;
+    if plen < Q {
         return;
     }
-    let conn_id = s.in_buf[0];
-    let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
-    let ql = u16::from_le_bytes([s.in_buf[13], s.in_buf[14]]) as usize;
-    if ql == 0 || ql > KAFKA_MAX_TOPIC || 15 + ql > plen {
+    let (conn_id, channel) = amqp_env_header(&s.in_buf);
+    let ql =
+        u16::from_le_bytes([s.in_buf[AMQP_ENV_PREFIX], s.in_buf[AMQP_ENV_PREFIX + 1]]) as usize;
+    if ql == 0 || ql > KAFKA_MAX_TOPIC || Q + ql > plen {
         return;
     }
     let mut queue = [0u8; KAFKA_MAX_TOPIC];
-    queue[..ql].copy_from_slice(&s.in_buf[15..15 + ql]);
+    queue[..ql].copy_from_slice(&s.in_buf[Q..Q + ql]);
     s.amqp_get_rx = s.amqp_get_rx.wrapping_add(1);
 
     // Empty result still carries the full [result][offset][remaining]
@@ -2646,13 +2688,11 @@ fn kstr(buf: &[u8], off: usize, end: usize) -> Option<(usize, usize, usize)> {
 ///
 /// # Safety
 unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    let conn_id = s.in_buf[0];
-    let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, v, corr) = kafka_env_header(&s.in_buf);
     let end = plen;
     s.kafka_group_ops = s.kafka_group_ops.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, KAFKA_ENV_HDR, end) else {
         return;
     };
     if off + 4 > end {
@@ -2817,7 +2857,7 @@ unsafe fn handle_kafka_join_group(s: &mut ModuleState, sys: &SyscallTable, plen:
 unsafe fn emit_kafka_group_error(
     s: &mut ModuleState,
     sys: &SyscallTable,
-    conn_id: u8,
+    conn_id: u16,
     api_key: i16,
     v: i16,
     corr: i32,
@@ -2853,13 +2893,11 @@ unsafe fn emit_kafka_group_error(
 ///
 /// # Safety
 unsafe fn handle_kafka_sync_group(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    let conn_id = s.in_buf[0];
-    let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, v, corr) = kafka_env_header(&s.in_buf);
     let end = plen;
     s.kafka_group_ops = s.kafka_group_ops.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, KAFKA_ENV_HDR, end) else {
         return;
     };
     if off + 4 > end {
@@ -2970,13 +3008,11 @@ unsafe fn handle_kafka_heartbeat_leave(
     plen: usize,
     api_key: i16,
 ) {
-    let conn_id = s.in_buf[0];
-    let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, v, corr) = kafka_env_header(&s.in_buf);
     let end = plen;
     s.kafka_group_ops = s.kafka_group_ops.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, KAFKA_ENV_HDR, end) else {
         return;
     };
     let mut generation = 0i32;
@@ -3041,13 +3077,11 @@ unsafe fn handle_kafka_offset_commit(
     now: u64,
     plen: usize,
 ) {
-    let conn_id = s.in_buf[0];
-    let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, v, corr) = kafka_env_header(&s.in_buf);
     let end = plen;
     s.kafka_offset_commits = s.kafka_offset_commits.wrapping_add(1);
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, KAFKA_ENV_HDR, end) else {
         return;
     };
     let mut group = [0u8; KG_NAME];
@@ -3285,12 +3319,10 @@ unsafe fn handle_kafka_offset_commit(
 ///
 /// # Safety
 unsafe fn handle_kafka_offset_fetch(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    let conn_id = s.in_buf[0];
-    let v = i16::from_le_bytes([s.in_buf[4], s.in_buf[5]]);
-    let corr = i32::from_le_bytes([s.in_buf[6], s.in_buf[7], s.in_buf[8], s.in_buf[9]]);
+    let (conn_id, v, corr) = kafka_env_header(&s.in_buf);
     let end = plen;
 
-    let Some((mut off, gs, gl)) = kstr(&s.in_buf, 10, end) else {
+    let Some((mut off, gs, gl)) = kstr(&s.in_buf, KAFKA_ENV_HDR, end) else {
         return;
     };
     let mut group = [0u8; KG_NAME];
@@ -3377,7 +3409,7 @@ unsafe fn handle_kafka_offset_fetch(s: &mut ModuleState, sys: &SyscallTable, ple
 /// drops matching entries. MQTT sessions are intentionally NOT touched —
 /// their teardown (will firing, session-expiry) runs on the apply-side
 /// keep-alive path so the durable semantics are preserved.
-fn handle_conn_disconnect(s: &mut ModuleState, conn_id: u8) {
+fn handle_conn_disconnect(s: &mut ModuleState, conn_id: u16) {
     // Releases both this conn's AMQP push consumers and its Kafka group
     // memberships. The former stops the delivery pump emitting
     // Basic.Deliver to a conn_id a different client may now own
@@ -3392,28 +3424,31 @@ fn handle_conn_disconnect(s: &mut ModuleState, conn_id: u8) {
 
 #[cfg(feature = "amqp")]
 /// op=3 consume-start from `protocol::amqp`:
-///   [13-byte prefix][flags:u8 (bit0 no_ack)][prefetch:u16 LE]
+///   [AMQP_ENV_PREFIX bytes][flags:u8 (bit0 no_ack)][prefetch:u16 LE]
 ///   [tag_len:u16 LE][tag][q_len:u16 LE][queue]
 ///
 /// # Safety
 unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
-    if plen < 18 {
+    const FLAGS: usize = AMQP_ENV_PREFIX;
+    const PREFETCH: usize = FLAGS + 1;
+    const TAG_LEN: usize = PREFETCH + 2;
+    const TAG: usize = TAG_LEN + 2;
+    if plen < TAG {
         return;
     }
-    let conn_id = s.in_buf[0];
-    let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
-    let flags = s.in_buf[13];
-    let prefetch = u16::from_le_bytes([s.in_buf[14], s.in_buf[15]]);
-    let tl = u16::from_le_bytes([s.in_buf[16], s.in_buf[17]]) as usize;
-    if tl == 0 || tl > AMQP_TAG_MAX || 18 + tl + 2 > plen {
+    let (conn_id, channel) = amqp_env_header(&s.in_buf);
+    let flags = s.in_buf[FLAGS];
+    let prefetch = u16::from_le_bytes([s.in_buf[PREFETCH], s.in_buf[PREFETCH + 1]]);
+    let tl = u16::from_le_bytes([s.in_buf[TAG_LEN], s.in_buf[TAG_LEN + 1]]) as usize;
+    if tl == 0 || tl > AMQP_TAG_MAX || TAG + tl + 2 > plen {
         return;
     }
-    let toff = 18;
-    let ql = u16::from_le_bytes([s.in_buf[18 + tl], s.in_buf[19 + tl]]) as usize;
-    if ql == 0 || ql > KAFKA_MAX_TOPIC || 20 + tl + ql > plen {
+    let toff = TAG;
+    let ql = u16::from_le_bytes([s.in_buf[TAG + tl], s.in_buf[TAG + tl + 1]]) as usize;
+    if ql == 0 || ql > KAFKA_MAX_TOPIC || TAG + 2 + tl + ql > plen {
         return;
     }
-    let qoff = 20 + tl;
+    let qoff = TAG + 2 + tl;
 
     // Replaces any existing consumer on this (conn, channel) — AMQP
     // allows one per channel here, so a re-Consume replaces rather than
@@ -3450,28 +3485,29 @@ unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usi
 }
 
 #[cfg(feature = "amqp")]
-/// op=4 consume-cancel: [13-byte prefix][tag_len:u16 LE][tag]
+/// op=4 consume-cancel: [AMQP_ENV_PREFIX bytes][tag_len:u16 LE][tag]
 ///
 /// # Safety
 unsafe fn handle_amqp_cancel(s: &mut ModuleState, plen: usize) {
-    if plen < 15 {
+    const TAG: usize = AMQP_ENV_PREFIX + 2;
+    if plen < TAG {
         return;
     }
-    let conn_id = s.in_buf[0];
-    let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
-    let tl = u16::from_le_bytes([s.in_buf[13], s.in_buf[14]]) as usize;
-    if tl == 0 || tl > AMQP_TAG_MAX || 15 + tl > plen {
+    let (conn_id, channel) = amqp_env_header(&s.in_buf);
+    let tl =
+        u16::from_le_bytes([s.in_buf[AMQP_ENV_PREFIX], s.in_buf[AMQP_ENV_PREFIX + 1]]) as usize;
+    if tl == 0 || tl > AMQP_TAG_MAX || TAG + tl > plen {
         return;
     }
     let mut tag = [0u8; AMQP_TAG_MAX];
-    tag[..tl].copy_from_slice(&s.in_buf[15..15 + tl]);
+    tag[..tl].copy_from_slice(&s.in_buf[TAG..TAG + tl]);
     if let Some(ci) = consumers::consumer_by_tag(&s.consumers, conn_id, channel, &tag[..tl]) {
         consumers::consumer_release(&mut s.consumers, ci);
     }
 }
 
 #[cfg(feature = "amqp")]
-/// op=5 client ack/nack: [13-byte prefix, dt = delivery-tag][flags:u8]
+/// op=5 client ack/nack: [AMQP_ENV_PREFIX bytes, dt = delivery-tag][flags:u8]
 /// flags bit0 = multiple. Releases prefetch credit tag-accurately.
 ///
 /// Outstanding delivery tags for a consumer are the contiguous range
@@ -3490,22 +3526,12 @@ unsafe fn handle_amqp_cancel(s: &mut ModuleState, plen: usize) {
 ///
 /// # Safety
 unsafe fn handle_amqp_client_ack(s: &mut ModuleState, plen: usize) {
-    if plen < 14 {
+    if plen < AMQP_ENV_PREFIX + 1 {
         return;
     }
-    let conn_id = s.in_buf[0];
-    let channel = u16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
-    let dt = u64::from_le_bytes([
-        s.in_buf[5],
-        s.in_buf[6],
-        s.in_buf[7],
-        s.in_buf[8],
-        s.in_buf[9],
-        s.in_buf[10],
-        s.in_buf[11],
-        s.in_buf[12],
-    ]);
-    let multiple = s.in_buf[13] & 1 != 0;
+    let (conn_id, channel) = amqp_env_header(&s.in_buf);
+    let dt = amqp_env_delivery_tag(&s.in_buf);
+    let multiple = s.in_buf[AMQP_ENV_PREFIX] & 1 != 0;
     s.amqp_consumer_acks = s.amqp_consumer_acks.wrapping_add(1);
     if let Some(ci) = consumers::consumer_on_channel(&s.consumers, conn_id, channel) {
         consumers::consumer_ack(&mut s.consumers, ci, dt, multiple);
@@ -3655,7 +3681,7 @@ const COLD_FETCH_SLOTS: usize = 4;
 #[derive(Clone, Copy)]
 struct ColdFetch {
     active: u8,
-    conn_id: u8,
+    conn_id: u16,
     topic_len: u8,
     /// Store slot, so the reply can report the CURRENT high watermark
     /// and log start. Reporting 0 would tell a consumer that has just
@@ -4472,7 +4498,7 @@ unsafe fn apply_qop_connect(
         Some(i)
     } else {
         s.apply_connect_no_prior = s.apply_connect_no_prior.wrapping_add(1);
-        sessions::allocate(&s.sessions)
+        sessions::allocate(&mut s.sessions)
     };
     let Some(i) = session_idx else {
         return;
@@ -5536,7 +5562,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── Phase 2: process codec proposals (envelope-framed) ──
         //
         // Wire format on codec_in: wire envelope `[mtype:u8][len:u16 LE][payload]`
-        // where `payload = [conn_id:u8][proto:u8][pkt_type:u8][flags:u8][body]`.
+        // where `payload = [conn_id:u16 LE][proto:u8][pkt_type:u8][flags:u8][body]`.
         // Codecs (mqtt, amqp, kafka) write via `channel_write_msg`; the
         // envelope length prefix is what lets the consumer demarcate each
         // message when several writers fan in or one writer bursts multiple
@@ -5596,27 +5622,27 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     wire::channel_read_msg(sys, s.in_codec, &mut s.in_buf)
                 };
 
-                // Transport connection-closed notice (payload `[conn_id]`,
+                // Transport connection-closed notice (payload `[conn_id:u16 LE]`,
                 // forwarded by any codec on socket close). Distinct from
                 // MSG_SESSION_DISCONNECT, which is the MQTT DISCONNECT
                 // *packet* and must reach the MQTT handler below. Release
                 // conn-keyed state for the non-MQTT protocols; MQTT
                 // sessions keep their apply-side keep-alive / will-fire
                 // lifecycle.
-                if mt == wire::MSG_CONN_CLOSED && plen >= 1 {
-                    handle_conn_disconnect(s, s.in_buf[0]);
+                if mt == wire::MSG_CONN_CLOSED && plen >= 2 {
+                    handle_conn_disconnect(s, env_conn_id(&s.in_buf));
                     continue;
                 }
-                if plen < 4 {
+                if (plen as usize) < CODEC_ENV_HDR {
                     continue;
                 } // conn + proto + pkt + flags
 
-                let conn_id = s.in_buf[0];
-                let proto = s.in_buf[1];
-                let pkt_type = s.in_buf[2];
-                let flags = s.in_buf[3];
-                let body_ptr = s.in_buf.as_ptr().add(4);
-                let body_len = plen as usize - 4;
+                let conn_id = env_conn_id(&s.in_buf);
+                let proto = s.in_buf[2];
+                let pkt_type = s.in_buf[3];
+                let flags = s.in_buf[4];
+                let body_ptr = s.in_buf.as_ptr().add(CODEC_ENV_HDR);
+                let body_len = plen as usize - CODEC_ENV_HDR;
                 let body = core::slice::from_raw_parts(body_ptr, body_len);
 
                 // Keep-alive bookkeeping: every codec packet from this
@@ -5662,7 +5688,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // Empty client_id (allowed under clean_start) — derive a
                             // unique stream_hash from the conn_id so two anonymous
                             // clients don't collapse to the same session.
-                            wire::fnv1a_64(&[conn_id])
+                            wire::fnv1a_64(&conn_id.to_le_bytes())
                         };
 
                         // MQTT keep_alive (seconds) is parsed by `protocol::mqtt`
@@ -5775,7 +5801,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // transient→active and bumps session_epoch.
                             sessions::mark_transient(&mut s.sessions, i);
                             Some(i)
-                        } else if let Some(i) = sessions::allocate(&s.sessions) {
+                        } else if let Some(i) = sessions::allocate(&mut s.sessions) {
                             // `active` flips at QOP_CONNECT apply; until
                             // then the slot is transient.
                             sessions::open_transient(
@@ -6887,12 +6913,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     #[cfg(feature = "kafka")]
                     wire::MSG_SESSION_PROPOSAL if proto == PROTO_KAFKA => {
                         // Kafka envelope (see `protocol::kafka`):
-                        //   [conn_id][proto=1][api_key:i16 LE][api_ver:i16 LE]
+                        //   [conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE]
                         //   [corr:i32 LE][request body after client_id]
                         // ApiVersions/Metadata are answered inline by the
                         // codec; the durable/data-path APIs land here.
-                        if plen as usize >= 10 {
-                            let api_key = i16::from_le_bytes([s.in_buf[2], s.in_buf[3]]);
+                        if plen as usize >= KAFKA_ENV_HDR {
+                            let api_key = i16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
                             match api_key {
                                 0 => handle_kafka_produce(s, sys, now, plen as usize),
                                 1 => handle_kafka_fetch(s, sys, plen as usize),
@@ -6912,11 +6938,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     #[cfg(feature = "amqp")]
                     wire::MSG_SESSION_PROPOSAL if proto == PROTO_AMQP => {
                         // AMQP envelope (see `protocol::amqp`):
-                        //   [conn_id][proto=2][op:u8][channel:u16 LE][rest]
+                        //   [conn_id:u16 LE][proto=2][op:u8][channel:u16 LE][rest]
                         // op 1 = assembled Basic.Publish (confirm-gated when
                         // delivery_tag != 0), op 2 = Basic.Get.
-                        if plen as usize >= 5 {
-                            match s.in_buf[2] {
+                        if plen as usize >= AMQP_ENV_HDR {
+                            match s.in_buf[3] {
                                 1 => handle_amqp_publish(s, sys, now, plen as usize),
                                 2 => handle_amqp_get(s, sys, plen as usize),
                                 3 => handle_amqp_consume(s, sys, plen as usize),

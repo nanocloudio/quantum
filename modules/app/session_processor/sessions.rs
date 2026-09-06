@@ -7,8 +7,21 @@
 //!
 //! ## Per-step bound
 //!
-//! Every entry point is O(MAX_SESSIONS) or O(MAX_INFLIGHT_PER_SESSION)
-//! over fixed tables and returns without blocking.
+//! The table is indexed, so the per-packet entry points — `find_by_conn`,
+//! `find_by_stream`, `allocate`, `unbind_other_conns`, `conn_flags` and
+//! every per-slot mutator — are O(1) expected over fixed tables and
+//! return without blocking. Two intrusive chained hash indexes hang off
+//! the slot array: one keyed by `(tenant, stream_hash)` over slots with
+//! `present == 1 || transient == 1`, one keyed by `conn_id` over slots
+//! with `conn_bound == 1`. Chains are `slot + 1` links with 0 as the end
+//! marker; bucket counts are powers of two at twice `MAX_SESSIONS`. A
+//! free stack backs allocation. `reindex` is the single maintenance
+//! point: every mutator that can change a key or a membership flag ends
+//! by calling it, and it reconciles the slot's chain memberships and
+//! free-stack presence against the recorded copy of its keys.
+//!
+//! Only `init` and `release_foreign` walk the whole table; the
+//! per-second sweeps in the parent module do their own linear walk.
 
 use super::{
     SessionEpoch, StreamHash, TenantId, MAX_INFLIGHT_PER_SESSION, MAX_SESSIONS, MAX_WILL_PAYLOAD,
@@ -59,7 +72,7 @@ pub struct Session {
     stream_hash: StreamHash,
     session_epoch: SessionEpoch,
     protocol: u8,
-    conn_id: u8,
+    conn_id: u16,
     /// 1 once the durable session record exists on this node, set by
     /// every node when `QOP_CONNECT` applies. `active` is narrower: it
     /// means a client socket is attached HERE, which a follower never
@@ -120,7 +133,7 @@ pub struct Session {
     receive_maximum: u16,
     /// 1 while `conn_id` names a live connection.
     ///
-    /// `conn_id` alone cannot express "unbound": it is a `u8` and 0 is a
+    /// `conn_id` alone cannot express "unbound": it is a `u16` and 0 is a
     /// VALID connection id, so a slot cleared to 0 is indistinguishable
     /// from one legitimately bound to connection 0 — and `find_by_conn`
     /// would hand a new client on that recycled id the previous
@@ -205,6 +218,18 @@ impl Session {
     }
 }
 
+/// Bucket counts for the two chained hash indexes: powers of two at
+/// twice the slot count, so a full table averages half a slot per
+/// bucket and the bucket mask is a single AND.
+const STREAM_BUCKETS: usize = MAX_SESSIONS * 2;
+const CONN_BUCKETS: usize = MAX_SESSIONS * 2;
+const _: () = assert!(STREAM_BUCKETS.is_power_of_two() && CONN_BUCKETS.is_power_of_two());
+const _: () = assert!(MAX_SESSIONS < u16::MAX as usize);
+
+/// Chain link encoding: `slot + 1`, with `NIL` (0) as the end marker,
+/// so a zero-initialised head array reads as "every bucket empty".
+const NIL: u16 = 0;
+
 /// Component state. Owned exclusively by this subtree.
 #[repr(C)]
 pub struct Sessions {
@@ -215,6 +240,42 @@ pub struct Sessions {
     /// both are cleared on exactly the same transitions.
     prefetch_credit: [u32; MAX_SESSIONS],
     sub_outstanding: [u32; MAX_SESSIONS],
+
+    // ── Stream index: (tenant, stream_hash) → slot ──
+    //
+    // Membership: `present == 1 || transient == 1`. The chain holds
+    // every slot `find_by_stream` may answer with; the lookup still
+    // applies the full predicate, so a bucket collision costs a compare
+    // and never a wrong answer.
+    stream_head: [u16; STREAM_BUCKETS],
+    stream_next: [u16; MAX_SESSIONS],
+    /// The key each slot is linked under, so `reindex` can tell a key
+    /// change from a no-op and unlink from the bucket the slot is
+    /// actually in rather than the one its current key names.
+    idx_stream_tenant: [TenantId; MAX_SESSIONS],
+    idx_stream_hash: [StreamHash; MAX_SESSIONS],
+    idx_in_stream: [u8; MAX_SESSIONS],
+
+    // ── Connection index: conn_id → slot ──
+    //
+    // Membership: `conn_bound == 1`. `find_by_conn` narrows further to
+    // active-or-transient; a parked (persisted) slot keeps its binding
+    // and stays in the chain until `unbind_conn` drops it.
+    conn_head: [u16; CONN_BUCKETS],
+    conn_next: [u16; MAX_SESSIONS],
+    idx_conn: [u16; MAX_SESSIONS],
+    idx_in_conn: [u8; MAX_SESSIONS],
+
+    // ── Free stack ──
+    //
+    // A slot is free when `present == 0 && transient == 0`. `in_free`
+    // says whether the slot has an entry on the stack; the entry is
+    // left in place when the slot is occupied and discarded as stale
+    // when popped, so a slot never holds more than one entry and the
+    // stack never exceeds `MAX_SESSIONS`.
+    free_stack: [u16; MAX_SESSIONS],
+    free_len: u32,
+    in_free: [u8; MAX_SESSIONS],
 }
 
 pub fn init(s: &mut Sessions) {
@@ -224,6 +285,128 @@ pub fn init(s: &mut Sessions) {
     for i in 0..MAX_SESSIONS {
         s.prefetch_credit[i] = 0;
         s.sub_outstanding[i] = 0;
+    }
+    rebuild_index(s);
+}
+
+// ── Index maintenance ───────────────────────────────────────────────
+
+#[inline]
+fn stream_bucket(tenant: TenantId, stream_hash: StreamHash) -> usize {
+    // `stream_hash` is FNV-1a output, so its low bits are already well
+    // mixed; folding the high half in and stirring the tenant keeps two
+    // tenants sharing a client id apart.
+    let mut k = stream_hash ^ (u64::from(tenant)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    k ^= k >> 32;
+    k ^= k >> 17;
+    (k as usize) & (STREAM_BUCKETS - 1)
+}
+
+#[inline]
+fn conn_bucket(conn_id: u16) -> usize {
+    usize::from(conn_id) & (CONN_BUCKETS - 1)
+}
+
+/// Unlink `si` from the chain rooted at `head[bucket]`. A chain is
+/// singly linked, so the predecessor is found by walking from the head;
+/// chains average under one entry, so this is O(1) expected.
+fn chain_unlink(head: &mut [u16], next: &mut [u16; MAX_SESSIONS], bucket: usize, si: usize) {
+    let target = (si + 1) as u16;
+    let mut cur = head[bucket];
+    if cur == target {
+        head[bucket] = next[si];
+        next[si] = NIL;
+        return;
+    }
+    while cur != NIL {
+        let ci = usize::from(cur - 1);
+        if next[ci] == target {
+            next[ci] = next[si];
+            next[si] = NIL;
+            return;
+        }
+        cur = next[ci];
+    }
+}
+
+#[inline]
+fn chain_link(head: &mut [u16], next: &mut [u16; MAX_SESSIONS], bucket: usize, si: usize) {
+    next[si] = head[bucket];
+    head[bucket] = (si + 1) as u16;
+}
+
+/// Reconcile slot `si`'s index memberships with its current fields.
+///
+/// The one maintenance point: every function that writes `tenant`,
+/// `stream_hash`, `present`, `transient`, `conn_id`, `conn_bound` or
+/// `active` ends by calling this. It compares the slot's keys and flags
+/// against the copy recorded at its most recent link, unlinks
+/// from a chain whose key or membership no longer holds, links into
+/// the chain the current fields name, and pushes the slot onto the
+/// free stack when it has become free and holds no stack entry.
+fn reindex(s: &mut Sessions, si: usize) {
+    if si >= MAX_SESSIONS {
+        return;
+    }
+    let x = &s.slots[si];
+    let tenant = x.tenant;
+    let stream_hash = x.stream_hash;
+    let conn_id = x.conn_id;
+    let want_stream = x.present == 1 || x.transient == 1;
+    let want_conn = x.conn_bound == 1;
+
+    if s.idx_in_stream[si] == 1
+        && (!want_stream
+            || s.idx_stream_tenant[si] != tenant
+            || s.idx_stream_hash[si] != stream_hash)
+    {
+        let b = stream_bucket(s.idx_stream_tenant[si], s.idx_stream_hash[si]);
+        chain_unlink(&mut s.stream_head, &mut s.stream_next, b, si);
+        s.idx_in_stream[si] = 0;
+    }
+    if want_stream && s.idx_in_stream[si] == 0 {
+        let b = stream_bucket(tenant, stream_hash);
+        chain_link(&mut s.stream_head, &mut s.stream_next, b, si);
+        s.idx_stream_tenant[si] = tenant;
+        s.idx_stream_hash[si] = stream_hash;
+        s.idx_in_stream[si] = 1;
+    }
+
+    if s.idx_in_conn[si] == 1 && (!want_conn || s.idx_conn[si] != conn_id) {
+        let b = conn_bucket(s.idx_conn[si]);
+        chain_unlink(&mut s.conn_head, &mut s.conn_next, b, si);
+        s.idx_in_conn[si] = 0;
+    }
+    if want_conn && s.idx_in_conn[si] == 0 {
+        let b = conn_bucket(conn_id);
+        chain_link(&mut s.conn_head, &mut s.conn_next, b, si);
+        s.idx_conn[si] = conn_id;
+        s.idx_in_conn[si] = 1;
+    }
+
+    if !want_stream && s.in_free[si] == 0 && (s.free_len as usize) < MAX_SESSIONS {
+        s.free_stack[s.free_len as usize] = si as u16;
+        s.free_len += 1;
+        s.in_free[si] = 1;
+    }
+}
+
+/// Rebuild both indexes and the free stack from the slot array. Slots
+/// are pushed highest-first so `allocate` hands out the lowest index
+/// first on a fresh table.
+fn rebuild_index(s: &mut Sessions) {
+    s.stream_head = [NIL; STREAM_BUCKETS];
+    s.conn_head = [NIL; CONN_BUCKETS];
+    s.free_len = 0;
+    for i in 0..MAX_SESSIONS {
+        s.stream_next[i] = NIL;
+        s.conn_next[i] = NIL;
+        s.idx_in_stream[i] = 0;
+        s.idx_in_conn[i] = 0;
+        s.in_free[i] = 0;
+    }
+    for i in (0..MAX_SESSIONS).rev() {
+        reindex(s, i);
     }
 }
 
@@ -281,12 +464,6 @@ pub fn clear_flow(s: &mut Sessions, si: usize) {
     }
 }
 
-/// Find the session bound to `conn_id`.
-///
-/// Matches `active` OR `transient` slots: between CONNECT receipt and
-/// the QOP_CONNECT commit the slot is transient, and follow-up packets
-/// from the same connection must still route to it for admission
-/// control.
 /// Unbind `conn_id` from every session slot EXCEPT `keep`. Returns how
 /// many stale bindings were evicted.
 ///
@@ -294,7 +471,7 @@ pub fn clear_flow(s: &mut Sessions, si: usize) {
 /// `conn_id` is a transport-layer slot index and the transport RECYCLES
 /// it, so without this a client that closed abruptly — no DISCONNECT,
 /// which is the common case — leaves its session still claiming the id.
-/// `find_by_conn` returns the first match by slot index, so the NEXT
+/// `find_by_conn` returns whichever match heads the chain, so the NEXT
 /// client to land on that recycled id resolves to the previous client's
 /// session: its SUBSCRIBE is anchored there, and its publishes are
 /// attributed there. That is cross-client state corruption, not merely
@@ -303,29 +480,48 @@ pub fn clear_flow(s: &mut Sessions, si: usize) {
 /// Unbinding does not destroy the session. A persisted one stays
 /// resurrectable by `(tenant, stream_hash)`, which is the identity a
 /// reconnect is supposed to use.
-pub fn unbind_other_conns(s: &mut Sessions, keep: usize, conn_id: u8) -> u32 {
+pub fn unbind_other_conns(s: &mut Sessions, keep: usize, conn_id: u16) -> u32 {
     let mut n = 0u32;
-    for i in 0..MAX_SESSIONS {
-        if i == keep {
-            continue;
+    // Each unbind unlinks the slot from the chain being walked, so the
+    // walk restarts from the head after every eviction. Bounded: every
+    // pass removes one member or ends.
+    loop {
+        let mut cur = s.conn_head[conn_bucket(conn_id)];
+        let mut victim = None;
+        while cur != NIL {
+            let i = usize::from(cur - 1);
+            let x = &s.slots[i];
+            if i != keep
+                && x.conn_bound == 1
+                && x.conn_id == conn_id
+                && (x.active == 1 || x.transient == 1)
+            {
+                victim = Some(i);
+                break;
+            }
+            cur = s.conn_next[i];
         }
-        if s.slots[i].conn_bound == 1
-            && s.slots[i].conn_id == conn_id
-            && (s.slots[i].active == 1 || s.slots[i].transient == 1)
-        {
-            unbind_conn(s, i);
-            n += 1;
-        }
+        let Some(i) = victim else {
+            return n;
+        };
+        unbind_conn(s, i);
+        n += 1;
     }
-    n
 }
 
-/// Diagnostic: the state bits of the first slot carrying `conn_id`,
-/// whatever its flags — `1` active, `2` transient, `4` present, `8`
+/// Diagnostic: the state bits of the first slot in `conn_id`'s chain
+/// carrying it — `1` active, `2` transient, `4` present, `8`
 /// conn_bound, `16` persisted — or `32` when no slot carries it. Says
 /// why `find_by_conn` came back empty.
-pub fn conn_flags(s: &Sessions, conn_id: u8) -> u32 {
-    for x in &s.slots {
+///
+/// Reads the connection index, so it sees the slots `find_by_conn`
+/// could have matched: those with `conn_bound == 1`. A slot whose
+/// binding `unbind_conn` dropped has `conn_id == 0` and is
+/// out of every chain, so nothing is hidden by the index.
+pub fn conn_flags(s: &Sessions, conn_id: u16) -> u32 {
+    let mut cur = s.conn_head[conn_bucket(conn_id)];
+    while cur != NIL {
+        let x = &s.slots[usize::from(cur - 1)];
         if x.conn_id == conn_id && (x.conn_bound == 1 || x.active == 1 || x.transient == 1) {
             return u32::from(x.active)
                 | u32::from(x.transient) << 1
@@ -333,15 +529,28 @@ pub fn conn_flags(s: &Sessions, conn_id: u8) -> u32 {
                 | u32::from(x.conn_bound) << 3
                 | u32::from(x.persisted) << 4;
         }
+        cur = s.conn_next[usize::from(cur - 1)];
     }
     32
 }
 
-pub fn find_by_conn(s: &Sessions, conn_id: u8) -> Option<usize> {
-    (0..MAX_SESSIONS).find(|&i| {
+/// Find the session bound to `conn_id`.
+///
+/// Matches `active` OR `transient` slots: between CONNECT receipt and
+/// the QOP_CONNECT commit the slot is transient, and follow-up packets
+/// from the same connection must still route to it for admission
+/// control.
+pub fn find_by_conn(s: &Sessions, conn_id: u16) -> Option<usize> {
+    let mut cur = s.conn_head[conn_bucket(conn_id)];
+    while cur != NIL {
+        let i = usize::from(cur - 1);
         let x = &s.slots[i];
-        (x.active == 1 || x.transient == 1) && x.conn_bound == 1 && x.conn_id == conn_id
-    })
+        if (x.active == 1 || x.transient == 1) && x.conn_bound == 1 && x.conn_id == conn_id {
+            return Some(i);
+        }
+        cur = s.conn_next[i];
+    }
+    None
 }
 
 /// Find any session matching `(tenant, stream_hash)`, including
@@ -351,18 +560,42 @@ pub fn find_by_conn(s: &Sessions, conn_id: u8) -> Option<usize> {
 /// QOP_CONNECT to reconcile a transient record with its durable
 /// counterpart.
 pub fn find_by_stream(s: &Sessions, tenant: TenantId, stream_hash: StreamHash) -> Option<usize> {
-    (0..MAX_SESSIONS).find(|&i| {
+    let mut cur = s.stream_head[stream_bucket(tenant, stream_hash)];
+    while cur != NIL {
+        let i = usize::from(cur - 1);
         let x = &s.slots[i];
-        (x.present == 1 || x.transient == 1) && x.tenant == tenant && x.stream_hash == stream_hash
-    })
+        if (x.present == 1 || x.transient == 1)
+            && x.tenant == tenant
+            && x.stream_hash == stream_hash
+        {
+            return Some(i);
+        }
+        cur = s.stream_next[i];
+    }
+    None
 }
 
-/// Allocate a free slot — skips active, persisted and transient sessions.
-pub fn allocate(s: &Sessions) -> Option<usize> {
-    (0..MAX_SESSIONS).find(|&i| {
+/// Allocate a free slot — skips active, persisted and transient
+/// sessions. Pops the free stack, discarding entries whose slot has
+/// been occupied since their push; None when the table is full.
+///
+/// The popped slot leaves the stack without being marked occupied, so
+/// the caller is expected to occupy it (`open_transient` or
+/// `commit_connect`) before the next `allocate`; both call sites do.
+pub fn allocate(s: &mut Sessions) -> Option<usize> {
+    while s.free_len > 0 {
+        s.free_len -= 1;
+        let i = usize::from(s.free_stack[s.free_len as usize]);
+        if i >= MAX_SESSIONS {
+            continue;
+        }
+        s.in_free[i] = 0;
         let x = &s.slots[i];
-        x.present == 0 && x.transient == 0
-    })
+        if x.present == 0 && x.transient == 0 {
+            return Some(i);
+        }
+    }
+    None
 }
 
 pub fn is_active(s: &Sessions, si: usize) -> bool {
@@ -379,7 +612,7 @@ pub struct SessionView {
     pub stream_hash: StreamHash,
     pub session_epoch: SessionEpoch,
     pub protocol: u8,
-    pub conn_id: u8,
+    pub conn_id: u16,
     pub active: bool,
     pub persisted: bool,
     pub transient: bool,
@@ -425,7 +658,7 @@ pub fn is_transient(s: &Sessions, si: usize) -> bool {
     si < MAX_SESSIONS && s.slots[si].transient == 1
 }
 
-pub fn conn_id(s: &Sessions, si: usize) -> u8 {
+pub fn conn_id(s: &Sessions, si: usize) -> u16 {
     if si < MAX_SESSIONS {
         s.slots[si].conn_id
     } else {
@@ -540,7 +773,7 @@ pub fn reset_delivery_state(s: &mut Sessions, si: usize) {
 pub fn rebind(
     s: &mut Sessions,
     si: usize,
-    conn_id: u8,
+    conn_id: u16,
     protocol: u8,
     clean_start: bool,
     keep_alive_ms: u32,
@@ -554,11 +787,12 @@ pub fn rebind(
     x.protocol = protocol;
     x.clean_start = u8::from(clean_start);
     x.keep_alive_ms = keep_alive_ms;
+    reindex(s, si);
 }
 
 /// Occupy a free slot for a CONNECT that has no prior session. `active`
 /// flips at QOP_CONNECT apply; until then the slot is transient.
-pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u8, now: u64) {
+pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u16, now: u64) {
     if si >= MAX_SESSIONS {
         return;
     }
@@ -574,6 +808,7 @@ pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u8
     x.keep_alive_ms = p.keep_alive_ms;
     x.last_activity_ms = now;
     x.next_msg_id = 1;
+    reindex(s, si);
 }
 
 /// Identity and negotiated parameters carried by CONNECT.
@@ -602,6 +837,7 @@ pub fn commit_connect(s: &mut Sessions, si: usize, p: ConnectParams) {
     x.keep_alive_ms = p.keep_alive_ms;
     x.present = 1;
     x.persisted = 0;
+    reindex(s, si);
 }
 
 /// Leader path: the propose-side admitted this session, apply now makes
@@ -610,6 +846,7 @@ pub fn mark_active(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si].active = 1;
         s.slots[si].transient = 0;
+        reindex(s, si);
     }
 }
 
@@ -618,6 +855,7 @@ pub fn mark_active(s: &mut Sessions, si: usize) {
 pub fn mark_persisted(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si].persisted = 1;
+        reindex(s, si);
     }
 }
 
@@ -641,17 +879,19 @@ pub fn set_receive_maximum(s: &mut Sessions, si: usize, n: u16) {
     }
 }
 
-pub fn set_conn(s: &mut Sessions, si: usize, conn_id: u8, protocol: u8) {
+pub fn set_conn(s: &mut Sessions, si: usize, conn_id: u16, protocol: u8) {
     if si < MAX_SESSIONS {
         s.slots[si].conn_id = conn_id;
         s.slots[si].conn_bound = 1;
         s.slots[si].protocol = protocol;
+        reindex(s, si);
     }
 }
 
 pub fn mark_transient(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si].transient = 1;
+        reindex(s, si);
     }
 }
 
@@ -674,6 +914,7 @@ pub fn close(s: &mut Sessions, si: usize, persisted: bool, now: u64) {
         x.persisted = 0;
         x.present = 0;
     }
+    reindex(s, si);
 }
 
 /// Unbind the connection without ending the session — the slot keeps
@@ -682,6 +923,7 @@ pub fn unbind_conn(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si].conn_id = 0;
         s.slots[si].conn_bound = 0;
+        reindex(s, si);
     }
 }
 
@@ -702,6 +944,7 @@ pub fn clean_start(s: &Sessions, si: usize) -> bool {
 pub fn reclaim(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si] = Session::zero();
+        reindex(s, si);
     }
 }
 
@@ -709,6 +952,7 @@ pub fn reclaim(s: &mut Sessions, si: usize) {
 pub fn clear(s: &mut Sessions, si: usize) {
     if si < MAX_SESSIONS {
         s.slots[si] = Session::zero();
+        reindex(s, si);
     }
 }
 
@@ -745,7 +989,7 @@ pub fn clear(s: &mut Sessions, si: usize) {
 pub fn release_foreign(
     s: &mut Sessions,
     is_local: impl Fn(u32) -> bool,
-    mut on_released: impl FnMut(usize, Option<u8>),
+    mut on_released: impl FnMut(usize, Option<u16>),
 ) -> u32 {
     let mut released = 0u32;
     for si in 0..MAX_SESSIONS {
@@ -765,6 +1009,7 @@ pub fn release_foreign(
         s.slots[si] = Session::zero();
         s.prefetch_credit[si] = 0;
         s.sub_outstanding[si] = 0;
+        reindex(s, si);
         released = released.wrapping_add(1);
     }
     released

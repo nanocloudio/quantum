@@ -63,7 +63,7 @@ pub fn reset_parts(s: &mut Store) {
 /// `channel`/`delivery_tag` and is always single-partition.
 #[derive(Clone, Copy)]
 pub struct InflightOpen {
-    pub conn_id: u8,
+    pub conn_id: u16,
     pub proto: u8,
     pub topic_len: u8,
     pub n_parts: u8,
@@ -464,7 +464,7 @@ pub fn kin_decode_slot(ss: u32) -> (usize, u32) {
 #[derive(Clone, Copy)]
 pub struct KafkaInflight {
     pub active: u8,
-    pub conn_id: u8,
+    pub conn_id: u16,
     pub topic_len: u8,
     /// KIN_PROTO_* — this table is shared by every protocol whose
     /// publish ack is durability-gated through the ack component.

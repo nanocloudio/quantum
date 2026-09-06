@@ -127,6 +127,10 @@ struct KafkaState {
     heartbeats: u32,
     rebalances: u32,
     errors: u32,
+    /// Throttle for the kernel-ring telemetry emit (`dev_millis` of the last
+    /// round). Instrument ids follow the manifest `[observability].metrics`
+    /// order; `membership_stable` is the phase gauge (1 = Stable member).
+    last_ring_tlm_ms: u64,
 }
 
 define_params! {
@@ -243,6 +247,7 @@ pub unsafe extern "C" fn module_new(
         s.session_timeout_ms = 30_000;
         s.heartbeat_ms = 3_000;
         s.phase = KPhase::Disconnected;
+        s.last_ring_tlm_ms = 0;
         s.conn_id = 0;
         s.tag = dev_requester_tag(sys);
         s.started_ms = 0;
@@ -511,6 +516,29 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut KafkaState);
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
+
+        // Kernel-ring telemetry: the declared instruments, every 5 s, only
+        // while a consumer is subscribed. Consumer-group LAG (per partition /
+        // group) is NOT here and is not fabricated: it needs committed
+        // offsets and high watermarks, i.e. the fetch/OffsetFetch protocol
+        // this connector documents as its follow-on. Until then, membership
+        // health is the honest observable.
+        if dev_telemetry_enabled(sys) && now.wrapping_sub(s.last_ring_tlm_ms) >= 5000 {
+            s.last_ring_tlm_ms = now;
+            let me = dev_self_index(sys);
+            if me >= 0 {
+                let midx = me as u16;
+                let t = dev_micros(sys);
+                let c = abi::contracts::telemetry::METRIC_COUNTER;
+                let u = abi::contracts::telemetry::METRIC_UPDOWN;
+                dev_telemetry_metric(sys, -1, midx, t, c, 0, s.joins as u64);
+                dev_telemetry_metric(sys, -1, midx, t, c, 1, s.heartbeats as u64);
+                dev_telemetry_metric(sys, -1, midx, t, c, 2, s.rebalances as u64);
+                dev_telemetry_metric(sys, -1, midx, t, c, 3, s.errors as u64);
+                let stable = if s.phase == KPhase::Stable { 1 } else { 0 };
+                dev_telemetry_metric(sys, -1, midx, t, u, 4, stable);
+            }
+        }
 
         // 1. A consumer joins its group (or a producer connects) on boot —
         //    nothing else is required to start.

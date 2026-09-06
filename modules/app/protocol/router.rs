@@ -16,8 +16,12 @@ use super::wire;
 /// `peer_router`'s `MAX_CONNS` and the per-protocol connection tables
 /// this router feeds, or it becomes the silent ceiling on concurrent
 /// clients. `ConnState` holds only a 16-byte sniff buffer, so the
-/// table is cheap.
-const MAX_CONNS: usize = 512;
+/// table is cheap. Bounded above by `u16::MAX` because `slot_by_conn`
+/// stores `slot + 1` as a `u16`.
+const MAX_CONNS: usize = 16384;
+/// Every value a [`wire::ConnId`] can take, so `slot_by_conn` needs no
+/// bounds check on the id itself.
+const CONN_ID_SPACE: usize = 1 << 16;
 /// Sized to the wire-channel per-message cap
 /// (`fluxor-abi::CHANNEL_BUFFER_SIZE`), because this ONE buffer serves
 /// both directions and the two have different largest messages.
@@ -45,7 +49,7 @@ pub const PROTO_UNSUPPORTED: u8 = 0xFF;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ConnState {
-    conn_id: u8,
+    conn_id: wire::ConnId,
     protocol: u8,
     sniff_buf_len: u8,
     sniff_buf: [u8; 16],
@@ -67,6 +71,10 @@ impl ConnState {
 #[repr(C)]
 pub struct Router {
     conns: [ConnState; MAX_CONNS],
+    /// Direct index from conn id to its `conns` slot: `0` = no slot,
+    /// otherwise `slot + 1`. Maintained on create and close so a
+    /// record's lookup is one load rather than a scan of `MAX_CONNS`.
+    slot_by_conn: [u16; CONN_ID_SPACE],
 
     // Params / stats
     default_protocol: u8,
@@ -75,36 +83,55 @@ pub struct Router {
     classified_kafka: u32,
     classified_amqp: u32,
     unclassified: u32,
+    /// Times `find_or_create` found no free slot and evicted slot 0.
+    /// Steady state 0; anything else means `MAX_CONNS` is the ceiling.
+    table_full: u32,
 }
 
 impl Router {
-    fn find_or_create(&mut self, conn_id: u8) -> usize {
-        for i in 0..MAX_CONNS {
-            if self.conns[i].active == 1 && self.conns[i].conn_id == conn_id {
-                return i;
-            }
-        }
-        for i in 0..MAX_CONNS {
-            if self.conns[i].active == 0 {
-                self.conns[i] = ConnState {
-                    conn_id,
-                    protocol: PROTO_UNKNOWN,
-                    sniff_buf_len: 0,
-                    sniff_buf: [0; 16],
-                    active: 1,
-                };
-                return i;
-            }
-        }
-        // Table full: reuse slot 0 (LRU would be nicer)
-        self.conns[0] = ConnState {
+    fn claim(&mut self, i: usize, conn_id: wire::ConnId) {
+        self.conns[i] = ConnState {
             conn_id,
             protocol: PROTO_UNKNOWN,
             sniff_buf_len: 0,
             sniff_buf: [0; 16],
             active: 1,
         };
+        self.slot_by_conn[conn_id as usize] = (i as u16) + 1;
+    }
+
+    fn find_or_create(&mut self, conn_id: wire::ConnId) -> usize {
+        let hit = self.slot_by_conn[conn_id as usize];
+        if hit != 0 {
+            return (hit - 1) as usize;
+        }
+        for i in 0..MAX_CONNS {
+            if self.conns[i].active == 0 {
+                self.claim(i, conn_id);
+                return i;
+            }
+        }
+        // Table full: evict slot 0 (LRU would be nicer) and count it.
+        self.table_full = self.table_full.wrapping_add(1);
+        let evicted = self.conns[0].conn_id as usize;
+        if self.slot_by_conn[evicted] == 1 {
+            self.slot_by_conn[evicted] = 0;
+        }
+        self.claim(0, conn_id);
         0
+    }
+
+    /// Release `conn_id`'s slot, returning the protocol it was pinned to.
+    fn release(&mut self, conn_id: wire::ConnId) -> u8 {
+        let hit = self.slot_by_conn[conn_id as usize];
+        if hit == 0 {
+            return PROTO_UNKNOWN;
+        }
+        let i = (hit - 1) as usize;
+        let proto = self.conns[i].protocol;
+        self.conns[i] = ConnState::zero();
+        self.slot_by_conn[conn_id as usize] = 0;
+        proto
     }
 }
 
@@ -161,6 +188,8 @@ pub fn init(s: &mut Router) {
     for i in 0..MAX_CONNS {
         s.conns[i] = ConnState::zero();
     }
+    s.slot_by_conn = [0; CONN_ID_SPACE];
+    s.table_full = 0;
 }
 
 /// Classify one client record and name the protocol that owns it.
@@ -170,16 +199,9 @@ pub fn init(s: &mut Router) {
 /// to that codec; a record whose connection is not yet classifiable
 /// returns [`PROTO_UNKNOWN`] and is dropped by the caller — the sniff
 /// bytes are retained until a verdict is reachable.
-pub fn route(s: &mut Router, conn_id: u8, mtype: u8, data: &[u8]) -> u8 {
+pub fn route(s: &mut Router, conn_id: wire::ConnId, mtype: u8, data: &[u8]) -> u8 {
     if mtype == wire::MSG_CONN_CLOSED {
-        for i in 0..MAX_CONNS {
-            if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
-                let proto = s.conns[i].protocol;
-                s.conns[i] = ConnState::zero();
-                return proto;
-            }
-        }
-        return PROTO_UNKNOWN;
+        return s.release(conn_id);
     }
     if data.is_empty() {
         return PROTO_UNKNOWN;
@@ -233,5 +255,6 @@ pub fn metrics(s: &Router, m: &mut [u8; 24]) -> usize {
     m[4..8].copy_from_slice(&s.classified_kafka.to_le_bytes());
     m[8..12].copy_from_slice(&s.classified_amqp.to_le_bytes());
     m[12..16].copy_from_slice(&s.unclassified.to_le_bytes());
-    16
+    m[16..20].copy_from_slice(&s.table_full.to_le_bytes());
+    20
 }

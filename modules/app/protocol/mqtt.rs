@@ -34,21 +34,44 @@ const PKT_DISCONNECT: u8 = 14;
 // the C-1 frame budget is envelope + MAX_VALUE_LEN.
 const MAX_PACKET: usize = 8192;
 /// Envelope-sized buffer for response messages from session_processor:
-/// `[conn_id][mtype][proto][pkt_type][flags][body]` where body may be a
+/// `[conn_id:u16 LE][proto][pkt_type][flags][body]` where body may be a
 /// full MAX_PACKET-sized MQTT publish. Also sized to hold the encoded
 /// MQTT frame (`[type][varint up to 4 B][body]`) for the largest body
 /// without truncating during encode.
 const RESP_BUF: usize = MAX_PACKET + 16;
 /// Concurrent MQTT connections per node.
 ///
-/// Each `ConnCtx` reserves an 8 KiB reassembly buffer plus its alias
-/// tables for the connection's whole life, so this is roughly
-/// `MAX_CONNS * 8.5 KiB` resident (256 -> ~2.2 MiB). See `kafka.rs`'s
-/// `KCONNS` for why these stay static arrays rather than moving to the
+/// Each `ConnCtx` is 528 bytes resident (a `REASS_INLINE` reassembly
+/// buffer plus counters and pool handles), so the table is
+/// `MAX_CONNS * 528 B` = 8.25 MiB. Anything larger a connection needs
+/// is lent from a shared pool only while it is in use: a `MAX_PACKET`
+/// reassembly page (`BIG_POOL` = 128 pages, 1 MiB) while a packet
+/// longer than the inline buffer is partial, and a topic-alias table
+/// (`ALIAS_POOL` = 256 tables, 536 KiB) from the first alias an MQTT 5
+/// connection binds in either direction. See `kafka.rs`'s `KCONNS`
+/// for why these stay static arrays rather than moving to the
 /// per-module heap.
-const MAX_CONNS: usize = 256;
+const MAX_CONNS: usize = 16384;
+/// Every value a [`wire::ConnId`] can take, so `slot_by_conn` needs no
+/// bounds check on the id itself.
+const CONN_ID_SPACE: usize = 1 << 16;
+/// Bytes of conn-id prefix on every client record and session envelope.
+const CID: usize = 2;
 const MAX_TOPIC_ALIASES_PER_CONN: usize = 16;
 const ALIAS_TOPIC_MAX: usize = 128;
+/// Reassembly bytes resident in every `ConnCtx`. Covers every control
+/// packet and the common small PUBLISH; a partial packet that outgrows
+/// it moves the connection onto a pooled `MAX_PACKET` page.
+const REASS_INLINE: usize = 512;
+/// Pooled `MAX_PACKET` reassembly pages. A page is held only while a
+/// connection has a partial packet longer than `REASS_INLINE`, so this
+/// bounds the number of large packets in flight mid-reassembly, not
+/// the number of connections.
+const BIG_POOL: usize = 128;
+/// Pooled topic-alias tables, shared by the inbound and outbound
+/// directions. A connection borrows one per direction on the first
+/// alias it binds and keeps it until close.
+const ALIAS_POOL: usize = 256;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -70,21 +93,32 @@ impl TopicAlias {
     }
 }
 
+/// One topic-alias table: the unit the alias pool lends out.
+type AliasTable = [TopicAlias; MAX_TOPIC_ALIASES_PER_CONN];
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ConnCtx {
-    conn_id: u8,
-    protocol_version: u8,
-    /// Inbound (publisher → broker) alias table — established when an
-    /// MQTT 5 PUBLISH from this conn carries a `TopicAlias` property.
-    aliases: [TopicAlias; MAX_TOPIC_ALIASES_PER_CONN],
-    /// Outbound (broker → subscriber) alias table. Populated when this
-    /// conn is a subscriber and we deliver an MQTT 5 PUBLISH on a new
-    /// topic for the first time. Subsequent deliveries on the same
-    /// topic encode an empty topic + the cached `TopicAlias` property
-    /// per MQTT 5 §3.3.2.3.4 — a downstream-bandwidth win on hot
-    /// topics.
-    sub_aliases: [TopicAlias; MAX_TOPIC_ALIASES_PER_CONN],
+    /// Reassembly bytes while no pooled page is held (`big == 0`):
+    /// partial MQTT packet bytes that arrived split across TCP reads,
+    /// or trailing bytes after a coalesced read consumed one packet
+    /// but part of the next. `reass_len` counts the bytes in whichever
+    /// buffer is current.
+    reass_inline: [u8; REASS_INLINE],
+    conn_id: wire::ConnId,
+    /// `1 + index` of the `alias_pool` table holding this conn's
+    /// inbound (publisher → broker) aliases — bound when an MQTT 5
+    /// PUBLISH from this conn carries a `TopicAlias` property. 0 =
+    /// none borrowed.
+    alias_in: u16,
+    /// `1 + index` of the `alias_pool` table holding this conn's
+    /// outbound (broker → subscriber) aliases; 0 = none borrowed.
+    /// Populated when this conn is a subscriber and we deliver an
+    /// MQTT 5 PUBLISH on a new topic for the first time. Subsequent
+    /// deliveries on the same topic encode an empty topic + the
+    /// cached `TopicAlias` property per MQTT 5 §3.3.2.3.4 — a
+    /// downstream-bandwidth win on hot topics.
+    alias_out: u16,
     /// `TopicAliasMaximum` (CONNECT property 0x22) — the upper bound
     /// on alias values the server is permitted to send to this client.
     /// `0` (the spec default when the client omits the property) means
@@ -94,27 +128,28 @@ struct ConnCtx {
     /// Used as the next alias id to assign; we don't reuse retired
     /// slots in this first ship.
     sub_alias_next: u16,
-    active: u8,
-    /// Number of bytes currently held in the reassembly buffer (partial
-    /// MQTT packet bytes that arrived split across TCP reads, or
-    /// trailing bytes after a coalesced read consumed one packet but
-    /// part of the next).
+    /// Number of bytes currently held in the reassembly buffer.
     reass_len: u16,
-    reass_buf: [u8; MAX_PACKET],
+    /// `1 + index` of the `big_pool` page this conn reassembles into;
+    /// 0 = the inline buffer.
+    big: u16,
+    protocol_version: u8,
+    active: u8,
 }
 
 impl ConnCtx {
     const fn zero() -> Self {
         Self {
+            reass_inline: [0u8; REASS_INLINE],
             conn_id: 0,
-            protocol_version: 0,
-            aliases: [TopicAlias::zero(); MAX_TOPIC_ALIASES_PER_CONN],
-            sub_aliases: [TopicAlias::zero(); MAX_TOPIC_ALIASES_PER_CONN],
+            alias_in: 0,
+            alias_out: 0,
             sub_topic_alias_max: 0,
             sub_alias_next: 0,
-            active: 0,
             reass_len: 0,
-            reass_buf: [0u8; MAX_PACKET],
+            big: 0,
+            protocol_version: 0,
+            active: 0,
         }
     }
 }
@@ -141,9 +176,35 @@ pub struct Mqtt {
     /// Frames `out_frames` refused where nothing retries them
     /// (PINGRESP, a close request, a server DISCONNECT). Steady state 0.
     frames_refused: u32,
+    /// Records dropped because a partial packet outgrew `REASS_INLINE`
+    /// while every `big_pool` page was held. Steady state 0.
+    reass_pool_full: u32,
+    /// Alias bindings refused because every `alias_pool` table was
+    /// held: an inbound one drops the PUBLISH, an outbound one
+    /// delivers with the full topic. Steady state 0.
+    alias_pool_full: u32,
 
     conns: [ConnCtx; MAX_CONNS],
-    in_buf: [u8; MAX_PACKET],
+    /// Direct index from conn id to its `conns` slot: `0` = no slot,
+    /// otherwise `slot + 1`. Maintained on create and close.
+    slot_by_conn: [u16; CONN_ID_SPACE],
+    /// `MAX_PACKET` reassembly pages lent to connections whose partial
+    /// packet outgrows the inline buffer. `big_owner[i]` is `1 + conn
+    /// slot` while page `i` is held, 0 while free; `big_free` is a
+    /// stack of the free page indices, `big_free_len` deep.
+    big_pool: [[u8; MAX_PACKET]; BIG_POOL],
+    big_owner: [u16; BIG_POOL],
+    big_free: [u16; BIG_POOL],
+    big_free_len: u16,
+    /// Topic-alias tables lent to connections on their first binding
+    /// in a direction. Same owner / free-stack shape as `big_pool`.
+    alias_pool: [AliasTable; ALIAS_POOL],
+    alias_owner: [u16; ALIAS_POOL],
+    alias_free: [u16; ALIAS_POOL],
+    alias_free_len: u16,
+    /// Staging for one client record or one complete packet:
+    /// `[conn_id:u16 LE][bytes]`, where bytes may be a full MAX_PACKET.
+    in_buf: [u8; CID + MAX_PACKET],
     envelope: [u8; MAX_PACKET],
     /// Response read + frame encode buffer. Sized larger than MAX_PACKET
     /// to fit the session envelope header (5 B) and the MQTT frame
@@ -154,11 +215,10 @@ pub struct Mqtt {
 }
 
 impl Mqtt {
-    fn find_or_create_conn(&mut self, conn_id: u8) -> usize {
-        for i in 0..MAX_CONNS {
-            if self.conns[i].active == 1 && self.conns[i].conn_id == conn_id {
-                return i;
-            }
+    fn find_or_create_conn(&mut self, conn_id: wire::ConnId) -> usize {
+        let hit = self.slot_by_conn[conn_id as usize];
+        if hit != 0 {
+            return (hit - 1) as usize;
         }
         for i in 0..MAX_CONNS {
             if self.conns[i].active == 0 {
@@ -167,12 +227,211 @@ impl Mqtt {
                     active: 1,
                     ..ConnCtx::zero()
                 };
+                self.slot_by_conn[conn_id as usize] = (i as u16) + 1;
                 return i;
             }
         }
+        // Table full: slot 0 is shared, and the index is left clear so
+        // the next record for this conn tries again for a free slot.
         0
     }
+
+    /// Release `conn_id`'s slot, if it has one, returning any pooled
+    /// page and alias tables it holds.
+    fn release_conn(&mut self, conn_id: wire::ConnId) {
+        let hit = self.slot_by_conn[conn_id as usize];
+        if hit != 0 {
+            let ci = (hit - 1) as usize;
+            self.reass_release_page(ci);
+            self.alias_release(ci);
+            self.conns[ci] = ConnCtx::zero();
+            self.slot_by_conn[conn_id as usize] = 0;
+        }
+    }
+
+    // ── Reassembly buffer: inline bytes or a pooled page ──────────────
+
+    /// Base pointer and capacity of connection `ci`'s current
+    /// reassembly buffer: the inline bytes, or the pooled page while
+    /// one is held.
+    fn reass_ptr(&mut self, ci: usize) -> (*mut u8, usize) {
+        let big = self.conns[ci].big;
+        if big == 0 {
+            (self.conns[ci].reass_inline.as_mut_ptr(), REASS_INLINE)
+        } else {
+            (self.big_pool[(big - 1) as usize].as_mut_ptr(), MAX_PACKET)
+        }
+    }
+
+    /// The bytes held in connection `ci`'s reassembly buffer.
+    fn reass_bytes(&self, ci: usize) -> &[u8] {
+        let len = self.conns[ci].reass_len as usize;
+        let big = self.conns[ci].big;
+        if big == 0 {
+            &self.conns[ci].reass_inline[..len]
+        } else {
+            &self.big_pool[(big - 1) as usize][..len]
+        }
+    }
+
+    /// Make room for `need` bytes in connection `ci`'s reassembly
+    /// buffer, moving it onto a pooled page (inline bytes copied
+    /// across) when the inline buffer is too small. `false` when
+    /// `need` exceeds `MAX_PACKET` or every page is held; the caller
+    /// then drops the stream as it does an oversize packet.
+    fn reass_reserve(&mut self, ci: usize, need: usize) -> bool {
+        if need > MAX_PACKET {
+            return false;
+        }
+        if need <= REASS_INLINE || self.conns[ci].big != 0 {
+            return true;
+        }
+        if self.big_free_len == 0 {
+            self.reass_pool_full = self.reass_pool_full.wrapping_add(1);
+            return false;
+        }
+        self.big_free_len -= 1;
+        let page = self.big_free[self.big_free_len as usize] as usize;
+        self.big_owner[page] = (ci as u16) + 1;
+        let len = self.conns[ci].reass_len as usize;
+        self.big_pool[page][..len].copy_from_slice(&self.conns[ci].reass_inline[..len]);
+        self.conns[ci].big = (page as u16) + 1;
+        true
+    }
+
+    /// Return connection `ci`'s pooled page, if it holds one. Any bytes
+    /// on the page are abandoned, so callers drain or reset first.
+    fn reass_release_page(&mut self, ci: usize) {
+        let big = self.conns[ci].big;
+        if big == 0 {
+            return;
+        }
+        let page = (big - 1) as usize;
+        self.conns[ci].big = 0;
+        // The owner record is the guard against pushing one page onto
+        // the free stack twice: only the recorded holder returns it.
+        if self.big_owner[page] != (ci as u16) + 1 {
+            return;
+        }
+        self.big_owner[page] = 0;
+        self.big_free[self.big_free_len as usize] = page as u16;
+        self.big_free_len += 1;
+    }
+
+    /// Return the pooled page once a drain has emptied the buffer, so
+    /// a page is held only while a packet is partial.
+    fn reass_release_if_empty(&mut self, ci: usize) {
+        if self.conns[ci].reass_len == 0 {
+            self.reass_release_page(ci);
+        }
+    }
+
+    /// Discard connection `ci`'s partial bytes and release its page:
+    /// the oversize / malformed-stream reset.
+    fn reass_reset(&mut self, ci: usize) {
+        self.conns[ci].reass_len = 0;
+        self.reass_release_page(ci);
+    }
+
+    // ── Topic-alias tables: pooled per direction ──────────────────────
+
+    /// Take a free alias table for connection `ci`, returning its
+    /// `1 + index` handle, or 0 (counted in `alias_pool_full`) when
+    /// every table is held.
+    fn alias_borrow(&mut self, ci: usize) -> u16 {
+        if self.alias_free_len == 0 {
+            self.alias_pool_full = self.alias_pool_full.wrapping_add(1);
+            return 0;
+        }
+        self.alias_free_len -= 1;
+        let t = self.alias_free[self.alias_free_len as usize] as usize;
+        self.alias_owner[t] = (ci as u16) + 1;
+        self.alias_pool[t] = [TopicAlias::zero(); MAX_TOPIC_ALIASES_PER_CONN];
+        (t as u16) + 1
+    }
+
+    /// Return one of connection `ci`'s table handles (`1 + index`, 0 =
+    /// nothing) to the pool. Only the recorded holder may return a
+    /// table, so a stale handle cannot push it onto the free stack
+    /// twice.
+    fn alias_return(&mut self, ci: usize, handle: u16) {
+        if handle == 0 {
+            return;
+        }
+        let t = (handle - 1) as usize;
+        if self.alias_owner[t] != (ci as u16) + 1 {
+            return;
+        }
+        self.alias_owner[t] = 0;
+        self.alias_free[self.alias_free_len as usize] = t as u16;
+        self.alias_free_len += 1;
+    }
+
+    /// Return both of connection `ci`'s alias tables.
+    fn alias_release(&mut self, ci: usize) {
+        let (a_in, a_out) = (self.conns[ci].alias_in, self.conns[ci].alias_out);
+        self.conns[ci].alias_in = 0;
+        self.conns[ci].alias_out = 0;
+        self.alias_return(ci, a_in);
+        self.alias_return(ci, a_out);
+    }
+
+    /// Connection `ci`'s inbound alias table, borrowing one on first
+    /// use. `None` when the pool is exhausted.
+    fn alias_in_table(&mut self, ci: usize) -> Option<&mut AliasTable> {
+        if self.conns[ci].alias_in == 0 {
+            self.conns[ci].alias_in = self.alias_borrow(ci);
+        }
+        let h = self.conns[ci].alias_in;
+        if h == 0 {
+            None
+        } else {
+            Some(&mut self.alias_pool[(h - 1) as usize])
+        }
+    }
+
+    /// Connection `ci`'s inbound alias table for lookup only; `None`
+    /// when it has never bound an alias.
+    fn alias_in_lookup(&self, ci: usize) -> Option<&AliasTable> {
+        let h = self.conns[ci].alias_in;
+        if h == 0 {
+            None
+        } else {
+            Some(&self.alias_pool[(h - 1) as usize])
+        }
+    }
+
+    /// Index into `alias_pool` of connection `ci`'s outbound table.
+    /// Borrows one only when a delivery is about to assign an alias
+    /// (`sub_alias_next < sub_topic_alias_max`); `None` when there is
+    /// no table and none is needed, or the pool is exhausted — the
+    /// delivery then goes out with its full topic.
+    fn alias_out_index(&mut self, ci: usize) -> Option<usize> {
+        let c = &self.conns[ci];
+        if c.alias_out == 0 && c.sub_alias_next < c.sub_topic_alias_max {
+            self.conns[ci].alias_out = self.alias_borrow(ci);
+        }
+        let h = self.conns[ci].alias_out;
+        if h == 0 {
+            None
+        } else {
+            Some((h - 1) as usize)
+        }
+    }
 }
+
+/// Every pool page and table is lent by `1 + conn slot`, and every
+/// conn slot is addressed by `u16`, so both fit their handles.
+const _: () = assert!(MAX_CONNS < u16::MAX as usize);
+const _: () = assert!(BIG_POOL < u16::MAX as usize);
+const _: () = assert!(ALIAS_POOL < u16::MAX as usize);
+/// The codec's whole state stays under 12 MiB: ~10.4 MiB as built
+/// (conns 8,650,752 + big_pool 1,048,576 + alias_pool 548,864 +
+/// slot_by_conn 131,072 + the four staging buffers and counters). The
+/// connection table is the only term that scales with `MAX_CONNS`, so
+/// the bound makes the next doubling an explicit decision against the
+/// state arena.
+const _: () = assert!(core::mem::size_of::<Mqtt>() < 12 * 1024 * 1024);
 
 // ── MQTT varint and UTF-8 string helpers ─────────────────────────────────
 
@@ -565,27 +824,43 @@ pub fn init(s: &mut Mqtt) {
     for i in 0..MAX_CONNS {
         s.conns[i] = ConnCtx::zero();
     }
+    s.slot_by_conn = [0; CONN_ID_SPACE];
+    for i in 0..BIG_POOL {
+        s.big_owner[i] = 0;
+        s.big_free[i] = i as u16;
+    }
+    s.big_free_len = BIG_POOL as u16;
+    for i in 0..ALIAS_POOL {
+        s.alias_owner[i] = 0;
+        s.alias_free[i] = i as u16;
+    }
+    s.alias_free_len = ALIAS_POOL as u16;
 }
 
-/// Emit a `[conn_id][bytes]` payload as a `MSG_CLIENT_FRAME`
+/// Emit a `[conn_id:u16 LE][bytes]` payload as a `MSG_CLIENT_FRAME`
 /// envelope-framed message to protocol. Framing matters because
 /// `protocol` is a fan-in merge over the codec writers (mqtt/amqp/
 /// kafka) and back-to-back raw writes coalesce on the merge
 /// module's byte FIFO, mangling the next frame's `conn_id`. Same
 /// pattern as the `codec_in` fan-in.
 /// # Safety
-unsafe fn write_conn_frame(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -> bool {
+unsafe fn write_conn_frame(
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: wire::ConnId,
+    bytes: &[u8],
+) -> bool {
     if chan < 0 {
         return false;
     }
-    const FRAME_BUF: usize = MAX_PACKET + 1;
-    let total = 1 + bytes.len();
+    const FRAME_BUF: usize = CID + MAX_PACKET;
+    let total = CID + bytes.len();
     if total > FRAME_BUF {
         return false;
     }
     let mut out = [0u8; FRAME_BUF];
-    out[0] = conn_id;
-    out[1..total].copy_from_slice(bytes);
+    out[..CID].copy_from_slice(&conn_id.to_le_bytes());
+    out[CID..total].copy_from_slice(bytes);
     let w = wire::channel_write_msg(sys, chan, wire::MSG_CLIENT_FRAME, &out[..total]);
     w > 0
 }
@@ -921,12 +1196,12 @@ fn strip_user_props_for_v311(out: &mut [u8], flags: u8, body: &[u8]) -> usize {
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-/// Handle one client record: `[conn_id][tcp chunk]` framed as
+/// Handle one client record: `[conn_id:u16 LE][tcp chunk]` framed as
 /// MSG_CLIENT_FRAME, or MSG_CONN_CLOSED carrying just the conn id.
 ///
 /// TCP delivers byte streams, not packets — a single MQTT frame may
 /// arrive across several records, or several frames in one. The
-/// per-connection `reass_buf` tracks both cases: every record appends,
+/// per-connection reassembly buffer tracks both cases: every record appends,
 /// and an inner loop pops every complete packet, leaving trailing
 /// partial bytes parked for the next call.
 ///
@@ -938,61 +1213,61 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
     unsafe {
         // the router component frames each client record as a MSG_CLIENT_FRAME
         // envelope so records from different conn_ids don't coalesce on the
-        // byte FIFO. Read one envelope per iteration; payload is `[conn_id]
-        // [tcp chunk]`.
+        // byte FIFO. Read one envelope per iteration; payload is
+        // `[conn_id:u16 LE][tcp chunk]`.
         // Stage the record into the conn reassembly path exactly as the
         // channel read did: `in_buf` holds `[conn_id][tcp chunk]`.
-        let n = payload.len() as i32;
-        if n as usize > s.in_buf.len() {
+        let n = payload.len();
+        if n > s.in_buf.len() {
             return false;
         }
-        s.in_buf[..payload.len()].copy_from_slice(payload);
-        if n < 1 {
+        s.in_buf[..n].copy_from_slice(payload);
+        if n < CID {
             return false;
         }
 
-        let conn_id = s.in_buf[0];
+        let conn_id = u16::from_le_bytes([s.in_buf[0], s.in_buf[1]]);
 
         // Connection closed: clear this conn's reassembly slot so a
         // reused conn_id can't inherit a stale partial packet. MQTT
         // session teardown (will firing, session expiry) stays on the
         // apply-side keep-alive path — this only resets codec framing.
         if mtype == wire::MSG_CONN_CLOSED {
-            for i in 0..MAX_CONNS {
-                if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
-                    s.conns[i] = ConnCtx::zero();
-                    break;
-                }
-            }
-            return false;
-        }
-        if n < 2 {
+            s.release_conn(conn_id);
             return false;
         }
 
-        let chunk_len = (n as usize) - 1;
+        let chunk_len = n - CID;
         if chunk_len == 0 {
             return false;
         }
         let ci = s.find_or_create_conn(conn_id);
 
-        // Append this chunk to the conn's reassembly buffer; bail if it
-        // would overflow — a 4 KiB packet bound is the largest we
-        // claim to honour (the mqtt component::MAX_PACKET).
+        // Append this chunk to the conn's reassembly buffer, borrowing
+        // a pooled page when it outgrows the inline bytes. Bail on
+        // overflow — MAX_PACKET is the largest packet we claim to
+        // honour — or when no page is free (`reass_pool_full`); either
+        // way the partial bytes are discarded rather than left
+        // misaligned for the next record.
         let cur = s.conns[ci].reass_len as usize;
         if cur + chunk_len > MAX_PACKET {
             s.parse_errors += 1;
-            s.conns[ci].reass_len = 0;
+            s.reass_reset(ci);
             return false;
         }
-        core::ptr::copy_nonoverlapping(
-            s.in_buf.as_ptr().add(1),
-            s.conns[ci].reass_buf.as_mut_ptr().add(cur),
-            chunk_len,
-        );
+        if !s.reass_reserve(ci, cur + chunk_len) {
+            s.parse_errors += 1;
+            s.reass_reset(ci);
+            if s.reass_pool_full & 0x1F == 1 {
+                dev_log(sys, 2, b"[mqtt] reass pool full".as_ptr(), 22);
+            }
+            return false;
+        }
+        let (reass, _) = s.reass_ptr(ci);
+        core::ptr::copy_nonoverlapping(s.in_buf.as_ptr().add(CID), reass.add(cur), chunk_len);
         s.conns[ci].reass_len = (cur + chunk_len) as u16;
 
-        // Inner loop: drain every complete packet from reass_buf. The
+        // Inner loop: drain every complete packet from the buffer. The
         // packet bytes are staged into `in_buf` so the existing
         // decode body can address them through `pkt_start` /
         // `pkt_bytes` unchanged.
@@ -1030,56 +1305,54 @@ pub unsafe fn flush_held(s: &mut Mqtt, sys: &SyscallTable) -> bool {
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -> bool {
+unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire::ConnId) -> bool {
     unsafe {
         loop {
+            // A pooled page goes back once the buffer is empty. This
+            // sits at the loop head rather than at the shift below so
+            // a refused proposal can put its packet back on the page
+            // it came from without borrowing again.
+            s.reass_release_if_empty(ci);
             let avail = s.conns[ci].reass_len as usize;
             if avail < 2 {
                 break;
             }
             let probe_end = (1 + 4).min(avail);
-            let (rem_len_probe, vlen_probe) = decode_varint(&s.conns[ci].reass_buf[1..probe_end]);
+            let (rem_len_probe, vlen_probe) = decode_varint(&s.reass_bytes(ci)[1..probe_end]);
             if vlen_probe == 0 {
                 // Either malformed (varint > 4 bytes) or incomplete.
                 if avail >= 5 {
                     s.parse_errors += 1;
-                    s.conns[ci].reass_len = 0;
+                    s.reass_reset(ci);
                 }
                 break;
             }
             let pkt_size = 1 + vlen_probe + rem_len_probe as usize;
             if pkt_size > MAX_PACKET {
                 s.parse_errors += 1;
-                s.conns[ci].reass_len = 0;
+                s.reass_reset(ci);
                 break;
             }
             if pkt_size > avail {
                 break;
             }
 
-            // Stage one full packet at in_buf[1..1+pkt_size] with
-            // conn_id at in_buf[0].
-            s.in_buf[0] = conn_id;
-            core::ptr::copy_nonoverlapping(
-                s.conns[ci].reass_buf.as_ptr(),
-                s.in_buf.as_mut_ptr().add(1),
-                pkt_size,
-            );
+            // Stage one full packet at in_buf[CID..CID+pkt_size] with
+            // the conn_id (u16 LE) at in_buf[..CID].
+            s.in_buf[..CID].copy_from_slice(&conn_id.to_le_bytes());
+            let (reass, _) = s.reass_ptr(ci);
+            core::ptr::copy_nonoverlapping(reass, s.in_buf.as_mut_ptr().add(CID), pkt_size);
 
             // Shift trailing bytes (possible next packet) down so
             // the buffer is ready for the next iteration even if
             // decode `continue`s on error.
             let remaining = avail - pkt_size;
             if remaining > 0 {
-                core::ptr::copy(
-                    s.conns[ci].reass_buf.as_ptr().add(pkt_size),
-                    s.conns[ci].reass_buf.as_mut_ptr(),
-                    remaining,
-                );
+                core::ptr::copy(reass.add(pkt_size), reass, remaining);
             }
             s.conns[ci].reass_len = remaining as u16;
 
-            let pkt_start = 1usize;
+            let pkt_start = CID;
             let pkt_bytes = pkt_size;
 
             // Parse MQTT fixed header (same as legacy single-packet path).
@@ -1133,9 +1406,10 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -
                         0
                     };
                     s.conns[ci].sub_alias_next = 0;
-                    for a in s.conns[ci].sub_aliases.iter_mut() {
-                        *a = TopicAlias::zero();
-                    }
+                    // A fresh CONNECT starts from no bindings in either
+                    // direction; the tables go back to the pool and are
+                    // borrowed again on first use.
+                    s.alias_release(ci);
 
                     // Envelope: [proto_ver][clean_start][keep_alive BE][session_expiry LE]
                     //           [recv_max LE][cid_len BE][cid][un_len BE][un]
@@ -1250,23 +1524,33 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -
                     // Topic alias resolution (MQTT 5)
                     let topic_slice: &[u8] = if mprops.topic_alias != 0 {
                         if !topic_field.is_empty() {
-                            // New binding: cache the mapping
+                            // New binding: cache the mapping. With
+                            // every pooled table held the binding
+                            // cannot be honoured, and a later
+                            // alias-only PUBLISH would resolve to
+                            // nothing, so the packet is a protocol
+                            // error here (`alias_pool_full`).
+                            let Some(table) = s.alias_in_table(ci) else {
+                                s.parse_errors += 1;
+                                if s.alias_pool_full & 0x1F == 1 {
+                                    dev_log(sys, 2, b"[mqtt] alias pool full".as_ptr(), 22);
+                                }
+                                continue;
+                            };
                             let mut placed = false;
-                            for ai in 0..MAX_TOPIC_ALIASES_PER_CONN {
-                                if s.conns[ci].aliases[ai].active == 0 {
-                                    s.conns[ci].aliases[ai].alias = mprops.topic_alias;
+                            for a in table.iter_mut() {
+                                if a.active == 0 {
+                                    a.alias = mprops.topic_alias;
                                     let tl = topic_field.len().min(ALIAS_TOPIC_MAX);
-                                    s.conns[ci].aliases[ai].topic_len = tl as u16;
-                                    s.conns[ci].aliases[ai].topic[..tl]
-                                        .copy_from_slice(&topic_field[..tl]);
-                                    s.conns[ci].aliases[ai].active = 1;
+                                    a.topic_len = tl as u16;
+                                    a.topic[..tl].copy_from_slice(&topic_field[..tl]);
+                                    a.active = 1;
                                     placed = true;
                                     break;
-                                } else if s.conns[ci].aliases[ai].alias == mprops.topic_alias {
+                                } else if a.alias == mprops.topic_alias {
                                     let tl = topic_field.len().min(ALIAS_TOPIC_MAX);
-                                    s.conns[ci].aliases[ai].topic_len = tl as u16;
-                                    s.conns[ci].aliases[ai].topic[..tl]
-                                        .copy_from_slice(&topic_field[..tl]);
+                                    a.topic_len = tl as u16;
+                                    a.topic[..tl].copy_from_slice(&topic_field[..tl]);
                                     placed = true;
                                     break;
                                 }
@@ -1276,16 +1560,18 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -
                         } else {
                             // Lookup
                             let mut resolved: &[u8] = &[];
-                            for ai in 0..MAX_TOPIC_ALIASES_PER_CONN {
-                                if s.conns[ci].aliases[ai].active == 1
-                                    && s.conns[ci].aliases[ai].alias == mprops.topic_alias
-                                {
-                                    let tl = s.conns[ci].aliases[ai].topic_len as usize;
-                                    let tp = s.conns[ci].aliases[ai].topic.as_ptr();
-                                    resolved = core::slice::from_raw_parts(tp, tl);
-                                    s.topic_alias_hits = s.topic_alias_hits.wrapping_add(1);
-                                    break;
+                            if let Some(table) = s.alias_in_lookup(ci) {
+                                for a in table.iter() {
+                                    if a.active == 1 && a.alias == mprops.topic_alias {
+                                        let tl = a.topic_len as usize;
+                                        let tp = a.topic.as_ptr();
+                                        resolved = core::slice::from_raw_parts(tp, tl);
+                                        break;
+                                    }
                                 }
+                            }
+                            if !resolved.is_empty() {
+                                s.topic_alias_hits = s.topic_alias_hits.wrapping_add(1);
                             }
                             resolved
                         }
@@ -1437,18 +1723,20 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -
                 // Refused. A dropped PUBLISH is one the client never
                 // hears back about, so the packet goes back to the
                 // front of the reassembly buffer — `in_buf` still holds
-                // it verbatim — and the connection is marked held.
+                // it verbatim — and the connection is marked held. The
+                // packet and remainder were in this buffer together
+                // before the drain and the page (if any) is still held,
+                // so the reserve cannot fail; the guard only keeps a
+                // capacity slip from writing past the inline bytes.
                 let rem = s.conns[ci].reass_len as usize;
-                core::ptr::copy(
-                    s.conns[ci].reass_buf.as_ptr(),
-                    s.conns[ci].reass_buf.as_mut_ptr().add(pkt_size),
-                    rem,
-                );
-                core::ptr::copy_nonoverlapping(
-                    s.in_buf.as_ptr().add(1),
-                    s.conns[ci].reass_buf.as_mut_ptr(),
-                    pkt_size,
-                );
+                if !s.reass_reserve(ci, rem + pkt_size) {
+                    s.parse_errors += 1;
+                    s.reass_reset(ci);
+                    return false;
+                }
+                let (reass, _) = s.reass_ptr(ci);
+                core::ptr::copy(reass, reass.add(pkt_size), rem);
+                core::ptr::copy_nonoverlapping(s.in_buf.as_ptr().add(CID), reass, pkt_size);
                 s.conns[ci].reass_len = (rem + pkt_size) as u16;
                 s.held_ci = (ci + 1) as u16;
                 s.proposals_held = s.proposals_held.wrapping_add(1);
@@ -1459,12 +1747,14 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: u8) -
             }
             s.packets_decoded += 1;
         } // end inner reassembly-drain loop
+        s.reass_release_if_empty(ci);
         false
     }
 }
 
 /// Encode one session response into MQTT frames on `out_frames`.
-/// Payload (post-envelope-strip) is `[conn_id][proto][pkt_type][flags][body]`.
+/// Payload (post-envelope-strip) is
+/// `[conn_id:u16 LE][proto][pkt_type][flags][body]`.
 /// Returns `false` when the frame edge refused the encoded packet and
 /// the response must be offered again; `true` when it was written or
 /// there is nothing to write.
@@ -1482,14 +1772,14 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
         }
         s.resp_buf[..plen].copy_from_slice(payload);
         dev_log(sys, 3, b"[mqtt] resp rx".as_ptr(), 14);
-        if plen < 4 {
+        if plen < 5 {
             return true;
         }
         let n = plen;
-        let conn_id = s.resp_buf[0];
-        let pkt_type = s.resp_buf[2];
-        let flags = s.resp_buf[3];
-        let body = core::slice::from_raw_parts(s.resp_buf.as_ptr().add(4), n - 4);
+        let conn_id = u16::from_le_bytes([s.resp_buf[0], s.resp_buf[1]]);
+        let pkt_type = s.resp_buf[3];
+        let flags = s.resp_buf[4];
+        let body = core::slice::from_raw_parts(s.resp_buf.as_ptr().add(5), n - 5);
 
         // PUBLISH delivery routes through one of two encoders:
         //   * MQTT 5 subscriber → alias-aware encoder that
@@ -1579,11 +1869,18 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
             proto_v >= 5 && matches!(pkt_type, PKT_CONNACK | PKT_SUBACK | PKT_UNSUBACK,);
         let frame_len = if pkt_type == PKT_PUBLISH && proto_v >= 5 {
             let alias_max = s.conns[ci_resp].sub_topic_alias_max;
+            // With no table (none needed, or the pool exhausted) the
+            // encoder sees an empty table and sends the full topic —
+            // spec-legal, the subscriber just learns no alias.
+            let table: &mut [TopicAlias] = match s.alias_out_index(ci_resp) {
+                Some(t) => &mut s.alias_pool[t],
+                None => &mut [],
+            };
             encode_mqtt5_publish_with_alias(
                 &mut s.frame,
                 flags,
                 body,
-                &mut s.conns[ci_resp].sub_aliases,
+                table,
                 alias_max,
                 &mut s.conns[ci_resp].sub_alias_next,
             )
@@ -1626,7 +1923,7 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
 ///
 /// Format (wire envelope: `[msg_type:u8][len:u16 LE][payload]`):
 ///   msg_type = `session_msg_type` (e.g. MSG_SESSION_PROPOSAL)
-///   payload  = [conn_id][envelope bytes from the per-packet builder]
+///   payload  = [conn_id:u16 LE][envelope bytes from the per-packet builder]
 ///
 /// Envelope framing matters because codec_in is a fan-in port and the
 /// underlying channel is a byte FIFO — without per-message length, two
@@ -1638,21 +1935,21 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
 unsafe fn write_conn_frame_with_mtype(
     sys: &SyscallTable,
     chan: i32,
-    conn_id: u8,
+    conn_id: wire::ConnId,
     msg_type: u8,
     bytes: &[u8],
 ) -> bool {
     if chan < 0 {
         return false;
     }
-    const PAYLOAD_BUF: usize = MAX_PACKET + 1;
-    let total = 1 + bytes.len();
+    const PAYLOAD_BUF: usize = CID + MAX_PACKET;
+    let total = CID + bytes.len();
     if total > PAYLOAD_BUF {
         return false;
     }
     let mut out = [0u8; PAYLOAD_BUF];
-    out[0] = conn_id;
-    out[1..total].copy_from_slice(bytes);
+    out[..CID].copy_from_slice(&conn_id.to_le_bytes());
+    out[CID..total].copy_from_slice(bytes);
     let w = wire::channel_write_msg(sys, chan, msg_type, &out[..total]);
     w > 0
 }

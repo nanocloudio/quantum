@@ -220,7 +220,12 @@ pub const MSG_PROTOCOL_MQTT: u8 = 0x90;
 pub const MSG_PROTOCOL_KAFKA: u8 = 0x91;
 pub const MSG_PROTOCOL_AMQP: u8 = 0x92;
 
-// Codec-to-session
+// Codec-to-session. Every message on `codec_in` / `codec_out` carries the
+// session envelope `[conn_id:u16 LE][proto:u8][pkt_type:u8][flags:u8][body]`
+// (5-byte header); `conn_id` is the [`ConnId`] of the client connection
+// the packet belongs to. Kafka and AMQP replace the `[pkt_type][flags]`
+// pair with their own per-protocol fields after the same
+// `[conn_id:u16 LE][proto:u8]` prefix (see the codecs).
 pub const MSG_SESSION_PROPOSAL: u8 = 0x98;
 pub const MSG_SESSION_RESPONSE: u8 = 0x99;
 pub const MSG_SESSION_CONNECT: u8 = 0x9A;
@@ -359,8 +364,14 @@ pub const MSG_METRICS_ROLLUP: u8 = 0xE8;
 // same pair, and the two id spaces meet on shared edges. Do not
 // reassign.
 
+/// Client connection id: `peer_router`'s slot index for the client
+/// socket, unique among live connections on this node. Encoded as
+/// `u16 LE` everywhere it crosses an edge — the client-frame family
+/// below and the session envelope on `codec_in` / `codec_out`.
+pub type ConnId = u16;
+
 /// Client-facing frame on the `codec → protocol → peer_router.client_resp`
-/// chain. Payload is `[conn_id:u8][protocol bytes]`. Carries an
+/// chain. Payload is `[conn_id:u16 LE][protocol bytes]`. Carries an
 /// envelope so back-to-back writes don't coalesce on the merge
 /// module's byte FIFO — same rationale as the `codec_in` fan-in fix.
 /// `peer_router` ignores the msg_type and just unwraps the conn_id
@@ -369,7 +380,7 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 
 /// Transport-level connection-closed notice on the same
 /// `peer_router.cleartext → protocol::router → codec` chain as
-/// MSG_CLIENT_FRAME. Payload is `[conn_id:u8]`. peer_router emits it when
+/// MSG_CLIENT_FRAME. Payload is `[conn_id:u16 LE]`. peer_router emits it when
 /// a CLIENT socket closes (NMSG_CLOSED, replica_id < 0); `protocol::router`
 /// clears its sniff state and forwards it to the conn's codec, which
 /// clears per-conn reassembly and forwards MSG_SESSION_DISCONNECT to
@@ -379,7 +390,7 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 /// and closes the conn_id-reuse cross-delivery hazard.
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
 
-/// Ask `peer_router` to CLOSE a client connection. Payload `[conn_id:u8]`.
+/// Ask `peer_router` to CLOSE a client connection. Payload `[conn_id:u16 LE]`.
 /// The inverse of [`MSG_CONN_CLOSED`], which is a notice; this is a
 /// command. MQTT 3.1.1 has no server-initiated DISCONNECT, so closing the
 /// socket is the only way to tell a 3.1.1 client its session moved.

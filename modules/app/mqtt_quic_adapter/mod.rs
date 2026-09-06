@@ -5,7 +5,7 @@
 //! `quic.app_in` and `protocol.raw_in` / `protocol.frames_out`.
 //!
 //! Inbound (quic → protocol): takes `MSG_MUX_STREAM_RX` on the session's
-//! MQTT control stream and emits the plain `[cid][data]` shape
+//! MQTT control stream and emits the plain `[cid:u16 LE][data]` shape
 //! `protocol.raw_in` already accepts from the TCP path. PEER_IDENTITY and
 //! DATAGRAM_RX are observed but not propagated — identity is a future
 //! mTLS hook, and the datagram path is reserved for an optional
@@ -13,7 +13,7 @@
 //!
 //! Outbound (protocol → quic): consumes envelope-framed
 //! MSG_CLIENT_FRAME (0xEA) messages from `protocol.frames_out`, payload
-//! shape `[cid][mqtt bytes]`, and re-emits as `CMD_MUX_STREAM_SEND` on
+//! shape `[cid:u16 LE][mqtt bytes]`, and re-emits as `CMD_MUX_STREAM_SEND` on
 //! that same stream. The QUIC engine appends `data…` to the stream's send
 //! buffer and the next module_step flushes it as a STREAM frame.
 //!
@@ -58,8 +58,8 @@ mod wire;
 // every message is a net-protocol frame `[msg_type:u8][len:u16 LE]
 // [payload]`, and stream payloads are prefixed with
 // `[session_id:u32 LE][stream_id:u32 LE]`. In the QUIC v1 constrained
-// profile the session_id IS the provider's connection index, small
-// enough to use as the MQTT conn_id; the stream_id is an opaque
+// profile the session_id IS the provider's connection index, and its
+// low 16 bits are the MQTT conn_id; the stream_id is an opaque
 // handle (see the module docs above). Constants duplicated here to
 // avoid cross-repo header sharing; they're part of the foundation
 // module's public contract.
@@ -118,10 +118,12 @@ const MAX_PACKET: usize = 4096;
 const QUIC_RX_BUF: usize = NET_FRAME_HDR + STREAM_DATA_PREFIX + MAX_PACKET;
 /// Scratch for an outbound CMD_MUX_STREAM_SEND frame, same shape.
 const QUIC_TX_BUF: usize = NET_FRAME_HDR + STREAM_DATA_PREFIX + MAX_PACKET;
+/// Bytes of conn-id prefix on a client frame (`wire::ConnId`, LE).
+const CID: usize = 2;
 /// Scratch for the codec→adapter response path. Envelope payload is
-/// `[cid][mqtt bytes]`; one extra byte beyond MAX_PACKET covers the
-/// conn_id prefix.
-const FRAME_BUF: usize = 1 + MAX_PACKET;
+/// `[cid:u16 LE][mqtt bytes]`; the extra bytes beyond MAX_PACKET cover
+/// the conn_id prefix.
+const FRAME_BUF: usize = CID + MAX_PACKET;
 
 #[repr(C)]
 struct ModuleState {
@@ -355,22 +357,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 dev_log(sys, 2, b"[mqtt_quic] rx unknown".as_ptr(), 22);
                 continue;
             }
-            // session_id (provider connection index) → mqtt conn_id.
-            let cid = s.rx_buf[base];
+            // session_id (provider connection index) → mqtt conn_id:
+            // the low 16 bits, u16 LE on the frame.
+            let cid = session as u16;
             let data_off = base + STREAM_DATA_PREFIX;
             let data_len = pl - STREAM_DATA_PREFIX;
             if data_len == 0 {
                 continue;
             }
-            let total = 1 + data_len;
+            let total = CID + data_len;
             if total > s.frame_buf.len() {
                 s.dropped += 1;
                 continue;
             }
-            s.frame_buf[0] = cid;
+            s.frame_buf[..CID].copy_from_slice(&cid.to_le_bytes());
             core::ptr::copy_nonoverlapping(
                 s.rx_buf.as_ptr().add(data_off),
-                s.frame_buf.as_mut_ptr().add(1),
+                s.frame_buf.as_mut_ptr().add(CID),
                 data_len,
             );
             // protocol.raw_in is length-delimited (MSG_CLIENT_FRAME
@@ -419,11 +422,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── Outbound: protocol.frames_out → quic.app_in ───────────
         //
         // frames_out emits envelope-framed MSG_CLIENT_FRAME (0xEA) with payload
-        // `[cid][mqtt bytes]`. Re-emit as a CMD_MUX_STREAM_SEND net-frame:
-        // payload `[session_id:4 LE][stream_id:4 LE][data]`, where session_id
-        // is the provider connection index (== cid) and stream_id is 0. quic
-        // reads app_in with net_read_frame_aligned, so the net_write_frame
-        // header is exactly what it expects.
+        // `[cid:u16 LE][mqtt bytes]`. Re-emit as a CMD_MUX_STREAM_SEND
+        // net-frame: payload `[session_id:4 LE][stream_id:4 LE][data]`, where
+        // session_id is the provider connection index (== cid widened) and
+        // stream_id is the handle learned for that session. quic reads app_in
+        // with net_read_frame_aligned, so the net_write_frame header is
+        // exactly what it expects.
         if s.frames_in >= 0 && s.quic_out >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.frames_in, 0x01);
@@ -431,16 +435,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     break;
                 }
                 let (mtype, plen) = wire::channel_read_msg(sys, s.frames_in, &mut s.frame_buf);
-                if plen < 1 {
+                let plen = plen as usize;
+                if plen < CID {
                     continue;
                 }
                 if mtype != wire::MSG_CLIENT_FRAME {
                     s.dropped += 1;
                     continue;
                 }
-                let plen = plen as usize;
-                let cid = s.frame_buf[0];
-                let data_len = plen - 1;
+                let cid = u16::from_le_bytes([s.frame_buf[0], s.frame_buf[1]]);
+                let data_len = plen - CID;
                 let payload_len = STREAM_DATA_PREFIX + data_len;
                 if NET_FRAME_HDR + payload_len > s.tx_buf.len() {
                     s.dropped += 1;
@@ -467,7 +471,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 payload[4..8].copy_from_slice(&stream.to_le_bytes());
                 if data_len > 0 {
                     core::ptr::copy_nonoverlapping(
-                        s.frame_buf.as_ptr().add(1),
+                        s.frame_buf.as_ptr().add(CID),
                         payload.as_mut_ptr().add(STREAM_DATA_PREFIX),
                         data_len,
                     );

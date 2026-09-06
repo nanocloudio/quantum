@@ -39,4 +39,14 @@ requires_contract = "channel"
 access            = "read"
 
 [observability]
-exempt = "Kafka consumer-group connector; throughput is observed at the network provider"
+# Membership health — the honest observable for a connector whose job is
+# JoinGroup/SyncGroup/heartbeat. Consumer-group lag (per partition/group) is
+# deliberately ABSENT: it needs committed offsets + high watermarks, i.e. the
+# fetch/OffsetFetch protocol this module documents as its follow-on, and a
+# fabricated series is worse than none. `membership_stable` is an updown
+# gauge (1 = Stable group member).
+metrics = ["joins", "heartbeats", "rebalances", "errors", "membership_stable"]
+
+[[observability.instrument]]
+name = "membership_stable"
+kind = "updown"

@@ -19,8 +19,9 @@ use super::{dev_channel_port, dev_log, dev_millis, wire};
 /// session-proposal header is prepended.
 const RASM: usize = 8192;
 /// Largest accepted value of the Kafka `size` field. Leaves room for
-/// the session envelope (10 bytes) + conn_id + tagged-proposal (18
-/// bytes) + wire envelope (3 bytes) downstream of the 8 KiB channel cap.
+/// the session envelope (`SESSION_HDR` bytes, conn_id included) +
+/// tagged-proposal (18 bytes) + wire envelope (3 bytes) downstream of
+/// the 8 KiB channel cap.
 const MAX_KREQ: usize = 8100;
 /// Concurrent Kafka connections per node.
 ///
@@ -44,6 +45,11 @@ const OUT_BUF: usize = 8192;
 /// records/tick; response encode matches the session side's burst.
 const RX_QUOTA: usize = 64;
 const RESP_QUOTA: usize = 64;
+/// Bytes of conn-id prefix on every client record.
+const CID: usize = 2;
+/// Session envelope header:
+/// `[conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE][corr_id:i32 LE]`.
+const SESSION_HDR: usize = 11;
 
 const API_PRODUCE: i16 = 0;
 const API_FETCH: i16 = 1;
@@ -66,7 +72,7 @@ const MAX_HOST_LEN: usize = 48;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct KConn {
-    conn_id: u8,
+    conn_id: wire::ConnId,
     active: u8,
     len: u16,
     buf: [u8; RASM],
@@ -190,26 +196,26 @@ pub fn finish_init(s: &mut Kafka) {
     }
 }
 
-/// Emit a `[conn_id][bytes]` payload as a `MSG_CLIENT_FRAME` envelope
-/// toward peer_router. See `the mqtt component::write_conn_frame` for the
+/// Emit a `[conn_id:u16 LE][bytes]` payload as a `MSG_CLIENT_FRAME`
+/// envelope toward peer_router. See `mqtt::write_conn_frame` for the
 /// rationale.
 /// # Safety
-unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: u8, bytes: &[u8]) -> bool {
+unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: wire::ConnId, bytes: &[u8]) -> bool {
     if chan < 0 {
         return false;
     }
-    let total = 1 + bytes.len();
+    let total = CID + bytes.len();
     if total > OUT_BUF {
         return false;
     }
     let mut out = [0u8; OUT_BUF];
-    out[0] = conn_id;
-    out[1..total].copy_from_slice(bytes);
+    out[..CID].copy_from_slice(&conn_id.to_le_bytes());
+    out[CID..total].copy_from_slice(bytes);
     let w = wire::channel_write_msg(sys, chan, wire::MSG_CLIENT_FRAME, &out[..total]);
     w > 0
 }
 
-fn find_conn(s: &mut Kafka, conn_id: u8) -> usize {
+fn find_conn(s: &mut Kafka, conn_id: wire::ConnId) -> usize {
     for i in 0..KCONNS {
         if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
             return i;
@@ -223,8 +229,8 @@ fn find_conn(s: &mut Kafka, conn_id: u8) -> usize {
             return i;
         }
     }
-    // Table full: evict slot 0. peer_router caps client conns at 64 but
-    // only a fraction speak Kafka; the bench profile stays well inside 32.
+    // Table full: evict slot 0. Only a fraction of peer_router's client
+    // conns speak Kafka; the bench profile stays well inside 32.
     s.conns[0].conn_id = conn_id;
     s.conns[0].active = 1;
     s.conns[0].len = 0;
@@ -255,7 +261,7 @@ fn remember_topic(s: &mut Kafka, name: &[u8]) {
 unsafe fn send_response(
     s: &mut Kafka,
     sys: &SyscallTable,
-    conn_id: u8,
+    conn_id: wire::ConnId,
     corr: i32,
     body_len: usize,
 ) {
@@ -516,7 +522,7 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
 unsafe fn handle_request(
     s: &mut Kafka,
     sys: &SyscallTable,
-    conn_id: u8,
+    conn_id: wire::ConnId,
     ci: usize,
     off: usize,
     total: usize,
@@ -640,21 +646,22 @@ unsafe fn handle_request(
         }
         API_PRODUCE | API_FETCH | API_LIST_OFFSETS | API_OFFSET_COMMIT | API_OFFSET_FETCH
         | API_JOIN_GROUP | API_HEARTBEAT | API_LEAVE_GROUP | API_SYNC_GROUP => {
-            // Envelope: [conn_id][proto=1][api_key LE][api_ver LE][corr LE][body]
+            // Envelope: [conn_id:u16 LE][proto=1][api_key LE][api_ver LE]
+            //           [corr LE][body]
             let body_len = total - body_off;
-            let env_len = 10 + body_len;
-            if env_len + 1 > OUT_BUF {
+            let env_len = SESSION_HDR + body_len;
+            if env_len > OUT_BUF {
                 s.parse_errors = s.parse_errors.wrapping_add(1);
                 return;
             }
-            s.scratch[0] = conn_id;
-            s.scratch[1] = 1; // PROTO_KAFKA
-            s.scratch[2..4].copy_from_slice(&api_key.to_le_bytes());
-            s.scratch[4..6].copy_from_slice(&api_ver.to_le_bytes());
-            s.scratch[6..10].copy_from_slice(&corr.to_le_bytes());
+            s.scratch[0..2].copy_from_slice(&conn_id.to_le_bytes());
+            s.scratch[2] = 1; // PROTO_KAFKA
+            s.scratch[3..5].copy_from_slice(&api_key.to_le_bytes());
+            s.scratch[5..7].copy_from_slice(&api_ver.to_le_bytes());
+            s.scratch[7..11].copy_from_slice(&corr.to_le_bytes());
             core::ptr::copy_nonoverlapping(
                 s.conns[ci].buf.as_ptr().add(off + body_off),
-                s.scratch.as_mut_ptr().add(10),
+                s.scratch.as_mut_ptr().add(SESSION_HDR),
                 body_len,
             );
             let out = s.out_proposals;
@@ -662,7 +669,7 @@ unsafe fn handle_request(
                 sys,
                 out,
                 wire::MSG_SESSION_PROPOSAL,
-                &s.scratch[..10 + body_len],
+                &s.scratch[..env_len],
             );
             if w <= 0 {
                 // codec_in saturated — drop; producer retries on timeout.
@@ -701,7 +708,7 @@ pub unsafe fn drain_leader_state(s: &mut Kafka, sys: &SyscallTable) {
     }
 }
 
-/// Handle one client record: `[conn_id][tcp chunk]` framed as
+/// Handle one client record: `[conn_id:u16 LE][tcp chunk]` framed as
 /// MSG_CLIENT_FRAME, or MSG_CONN_CLOSED carrying just the conn id.
 /// Appends to the connection's reassembly buffer and drains every
 /// complete size-delimited request from it.
@@ -719,10 +726,10 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             return;
         }
         s.frame[..n].copy_from_slice(payload);
-        if n < 1 {
+        if n < CID {
             return;
         }
-        let conn_id = s.frame[0];
+        let conn_id = u16::from_le_bytes([s.frame[0], s.frame[1]]);
 
         // Connection closed: release this conn's reassembly slot and
         // tell session_processor to drop conn-keyed state (groups).
@@ -737,14 +744,14 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             // that type already means "MQTT DISCONNECT packet" on this
             // fan-in lane and is claimed by session_processor's MQTT
             // path). session_processor releases conn-keyed state on it.
-            let cb = [conn_id];
+            let cb = conn_id.to_le_bytes();
             wire::channel_write_msg(sys, s.out_proposals, wire::MSG_CONN_CLOSED, &cb);
             return;
         }
-        if n <= 1 {
+        if n <= CID {
             return;
         }
-        let data_len = n - 1;
+        let data_len = n - CID;
         let ci = find_conn(s, conn_id);
 
         // Append to the conn's reassembly buffer.
@@ -757,7 +764,7 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             return;
         }
         core::ptr::copy_nonoverlapping(
-            s.frame.as_ptr().add(1),
+            s.frame.as_ptr().add(CID),
             s.conns[ci].buf.as_mut_ptr().add(have),
             data_len,
         );
@@ -809,7 +816,7 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
 /// Encode one session response into a Kafka response frame.
 ///
 /// Payload is the session envelope
-/// `[conn_id:u8][proto=1][api_key:i16 LE][api_ver:i16 LE][corr_id:i32 LE][body]`
+/// `[conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE][corr_id:i32 LE][body]`
 /// (see session_processor's `emit_kafka_response`). The body is already a
 /// complete, correctly-versioned response body for `api_key`/`api_ver`;
 /// this only reframes it as the wire form `[size:i32 BE][corr:i32 BE][body]`
@@ -820,20 +827,20 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
 /// `sys` must point at a live kernel syscall table.
 pub unsafe fn on_response(s: &mut Kafka, sys: &SyscallTable, payload: &[u8]) {
     let plen = payload.len();
-    // conn(1) + proto(1) + api_key(2) + api_ver(2) + corr(4)
-    if plen < 10 {
+    // conn(2) + proto(1) + api_key(2) + api_ver(2) + corr(4)
+    if plen < SESSION_HDR {
         return;
     }
-    let conn_id = payload[0];
-    // payload[1] is the PROTO_KAFKA discriminator; the dispatch table has
+    let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
+    // payload[2] is the PROTO_KAFKA discriminator; the dispatch table has
     // already matched it.
-    let corr = i32::from_le_bytes([payload[6], payload[7], payload[8], payload[9]]);
-    let body_len = plen - 10;
+    let corr = i32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
+    let body_len = plen - SESSION_HDR;
     if body_len > s.scratch.len() {
         s.parse_errors = s.parse_errors.wrapping_add(1);
         return;
     }
-    s.scratch[..body_len].copy_from_slice(&payload[10..plen]);
+    s.scratch[..body_len].copy_from_slice(&payload[SESSION_HDR..plen]);
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
         send_response(s, sys, conn_id, corr, body_len);
