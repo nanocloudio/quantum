@@ -60,10 +60,10 @@ there are authoritative for body shape.
 |---|---|---|
 | 0x01 | `QOP_CONNECT` | `[clean_start:u8][keep_alive_s:u16 BE][stream_hash:u64 LE][cid_len:u16 BE][cid][protocol:u8][will_flag:u8]` then, when `will_flag == 1`, the Will section `[will_qos:u8][will_retain:u8][will_delay_s:u32 LE][will_topic_len:u16 BE][will_topic][will_payload_len:u16 BE][will_payload]`; the trailer is `[session_expiry_s:u32 LE][receive_maximum:u16 LE]` |
 | 0x02 | `QOP_DISCONNECT` | `[reason:u8][stream_hash:u64 LE]` |
-| 0x03 | `QOP_PUBLISH` | V1: `[pub_qos:u8][packet_id:u16 BE][stream_hash:u64 LE][session_epoch:u32 LE][retain:u8][topic_len:u16 BE][topic][payload]`. V2 inserts `[user_props_count:u8][{key_len:u16 BE, key, val_len:u16 BE, val}…]` between `topic` and `payload` |
+| 0x03 | `QOP_PUBLISH` | V1: `[pub_qos:u8][packet_id:u16 BE][stream_hash:u64 LE][session_generation:u32 LE][retain:u8][topic_len:u16 BE][topic][payload]`. V2 inserts `[user_props_count:u8][{key_len:u16 BE, key, val_len:u16 BE, val}…]` between `topic` and `payload` |
 | 0x04 | `QOP_SUBSCRIBE` | `[req_qos:u8][stream_hash:u64 LE][topic_len:u16 BE][topic]` |
 | 0x05 | `QOP_UNSUBSCRIBE` | `[stream_hash:u64 LE][topic_len:u16 BE][topic]` |
-| 0x06 | `QOP_PUBREL` | `[packet_id:u16 BE][stream_hash:u64 LE][session_epoch:u32 LE]`. The epoch is a trailing field: entries logged without it replay against the session's current epoch, as they did when written |
+| 0x06 | `QOP_PUBREL` | `[packet_id:u16 BE][stream_hash:u64 LE][session_generation:u32 LE]`. The generation is a trailing field, so an entry logged without one replays against the session's current generation |
 | 0x07 | `QOP_RETAINED_CLEAR` | `[topic_len:u16 BE][topic]` |
 | 0x08 | `QOP_KAFKA_PRODUCE` | `[origin:u8][partition:u16 LE][topic_len:u16 LE][topic][records — the verbatim Kafka record batch]`; tagged when `acks != 0`, untagged for `acks == 0`. `origin` is the replica id that accepted the produce, so only that node stamps the offset back onto a waiting client |
 | 0x09 | `QOP_AMQP_PUBLISH` | `[rk_len:u16 LE][routing_key][payload]`; tagged when the channel is in confirm mode |
@@ -96,7 +96,7 @@ ops) the `correlation_id`, then dispatches on the canonical op:
 
 | Op | Apply action |
 |---|---|
-| `QOP_CONNECT` | Allocate/resurrect/refresh the session slot; reconcile any propose-side transient record for this `(tenant, stream_hash)`; set `session_epoch`, `keep_alive_ms`, `protocol`. |
+| `QOP_CONNECT` | Allocate/resurrect/refresh the session slot; reconcile any propose-side transient record for this `(tenant, stream_hash)`; set `session_generation`, `keep_alive_ms`, `protocol`. |
 | `QOP_DISCONNECT` | Deactivate the slot. On `QDISC_REASON_CLEAN`, emit `MSG_SESSION_DROP` so `topic_engine` purges subscriptions; otherwise park the slot `persisted = 1` per MQTT 3.1.1 §3.1.2.4. |
 | `QOP_PUBLISH` | Emit `MSG_DEDUP_CHECK`, `MSG_RETAINED_WRITE` (if `retain`) on `out_messaging` and `MSG_TOPIC_PUBLISH` on `out_topic`. On the leader the publisher's PUBACK follows from `flow`'s ack component; on a follower the stash slot is allocated and released without a client-facing emit. For QoS 2, every node also opens the publisher's in-flight slot in the PUBLISH phase and records that phase on the dedupe entry, so the transaction is known to be live wherever it is replayed. |
 | `QOP_SUBSCRIBE` / `QOP_UNSUBSCRIBE` | Emit `MSG_TOPIC_SUBSCRIBE` / `MSG_TOPIC_UNSUBSCRIBE` keyed to the apply-side slot. |
@@ -164,7 +164,7 @@ bump.
 
 | Component | Content |
 |-----------|---------|
-| Session records | `{tenant_id, stream_id, session_epoch, connected_at, keep_alive, protocol_state}` |
+| Session records | `{tenant_id, stream_id, session_generation, connected_at, keep_alive, protocol_state}` |
 | Subscription index | Active subscriptions, QoS levels, shared-group assignments |
 | Dedupe shards | 16-shard `DedupeKey → DedupeState` with expiry |
 | Offline queues | Per-session FIFO entries |

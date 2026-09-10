@@ -326,6 +326,28 @@ pub fn count_overdue(s: &Correlate, now: u64, timeout_ms: u64) -> u32 {
 /// after its slot was bound, a throttled operation, a session torn down
 /// mid-flight. Kept here so the drop count is the component's, not a
 /// tally spread across every call site.
+/// True while any tagged proposal of `session_slot` awaits its Raft
+/// assignment — the session is mid-transaction and not exportable.
+pub fn pending_for_slot(s: &Correlate, session_slot: u32) -> bool {
+    s.pending
+        .iter()
+        .any(|p| p.active == 1 && p.session_slot == session_slot)
+}
+
+/// True while a delivery for `session_slot` is parked on the defer
+/// queue (delivery envelopes carry the slot in their first four bytes).
+pub fn dlv_parked_for_slot(s: &Correlate, session_slot: u32) -> bool {
+    let want = session_slot.to_le_bytes();
+    (0..PENDING_DLV_SLOTS)
+        .any(|i| s.dlv_active[i] == 1 && s.dlv_len[i] >= 4 && s.dlv_env[i][..4] == want)
+}
+
+/// True while an ack registration for `session_slot` is parked.
+pub fn ack_parked_for_slot(s: &Correlate, session_slot: u32) -> bool {
+    let want = session_slot.to_le_bytes();
+    (0..PENDING_ACK_SLOTS).any(|i| s.ack_active[i] == 1 && s.ack_buf[i][..4] == want)
+}
+
 pub fn note_dropped(s: &mut Correlate) {
     s.dropped = s.dropped.wrapping_add(1);
 }

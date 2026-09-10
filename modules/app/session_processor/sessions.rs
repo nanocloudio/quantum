@@ -24,8 +24,8 @@
 //! per-second sweeps in the parent module do their own linear walk.
 
 use super::{
-    SessionEpoch, StreamHash, TenantId, MAX_INFLIGHT_PER_SESSION, MAX_SESSIONS, MAX_WILL_PAYLOAD,
-    MAX_WILL_TOPIC, PROTO_UNKNOWN, QOS2_PUBLISH,
+    SessionGeneration, StreamHash, TenantId, MAX_INFLIGHT_PER_SESSION, MAX_SESSIONS,
+    MAX_WILL_PAYLOAD, MAX_WILL_TOPIC, PROTO_UNKNOWN, QOS2_PUBLISH,
 };
 
 #[repr(C)]
@@ -39,14 +39,21 @@ pub struct Inflight {
     /// the session's epoch, so a QoS 2 transaction that spans one must
     /// carry the epoch it started with rather than read the session's
     /// current value. 0 for slots opened before any publish named one.
-    session_epoch: SessionEpoch,
+    session_generation: SessionGeneration,
     wal_index: u64,
     /// Raft correlation_id for the proposal that owns this slot (QoS 1+
     /// only; 0 for QoS 0 and subscriber-side slots). Used to look up the
     /// stashed topic-publish envelope on durability and to re-emit the
     /// proposal on MSG_ACK_REDELIVER.
     correlation_id: u64,
+    /// Raft partition the publish was assigned to, with `wal_index`:
+    /// the pair `flow` keys its ledger by, so an imported inflight can
+    /// be re-registered exactly.
+    partition_id: u16,
     direction: u8,
+    /// QoS 2 publisher flow: the PUBREC has been emitted, so a further
+    /// durability completion for the PUBLISH owes the client nothing.
+    rec_sent: u8,
     active: u8,
 }
 
@@ -56,10 +63,12 @@ impl Inflight {
             packet_id: 0,
             qos: 0,
             phase: 0,
-            session_epoch: 0,
+            session_generation: 0,
             wal_index: 0,
             correlation_id: 0,
+            partition_id: 0,
             direction: 0,
+            rec_sent: 0,
             active: 0,
         }
     }
@@ -70,7 +79,7 @@ impl Inflight {
 pub struct Session {
     tenant: TenantId,
     stream_hash: StreamHash,
-    session_epoch: SessionEpoch,
+    session_generation: SessionGeneration,
     protocol: u8,
     conn_id: u16,
     /// 1 once the durable session record exists on this node, set by
@@ -160,7 +169,7 @@ impl Session {
         Self {
             tenant: 0,
             stream_hash: 0,
-            session_epoch: 0,
+            session_generation: 0,
             protocol: PROTO_UNKNOWN,
             conn_id: 0,
             present: 0,
@@ -195,10 +204,12 @@ impl Session {
                     packet_id,
                     qos,
                     phase: if qos == 2 { QOS2_PUBLISH } else { 0 },
-                    session_epoch: 0,
+                    session_generation: 0,
                     wal_index: 0,
                     correlation_id: 0,
+                    partition_id: 0,
                     direction,
+                    rec_sent: 0,
                     active: 1,
                 };
                 return Some(i);
@@ -276,6 +287,85 @@ pub struct Sessions {
     free_stack: [u16; MAX_SESSIONS],
     free_len: u32,
     in_free: [u8; MAX_SESSIONS],
+
+    // ── Worker slot ownership ──
+    //
+    // Two session workers sharing one node (an anchor-preserved
+    // handoff pair, docs/architecture/session_continuity.md) share the
+    // slot NUMBER SPACE — topic_engine, flow and messaging key by slot
+    // — so each allocates new sessions only from its own range. A slot
+    // index is therefore globally unique across the pair, and a
+    // session keeps its index when it moves: the importer places it
+    // at the same index, which is free there because the ranges are
+    // disjoint.
+    //
+    // `lent` marks a slot in THIS worker's range whose session was
+    // handed to the other worker. It stays off the free stack until the
+    // session comes back (`unlend` on import), so the index is never
+    // handed to a second client while the first still lives elsewhere.
+    alloc_lo: u16,
+    /// Exclusive upper bound; 0 means `MAX_SESSIONS`.
+    alloc_hi: u16,
+    lent: [u8; MAX_SESSIONS],
+}
+
+/// Restrict new-session allocation to `[lo, hi)` (`hi == 0` means the
+/// whole table). Must be set before the table is built, since the free
+/// stack is populated as slots are cleared.
+pub fn set_alloc_range(s: &mut Sessions, lo: u16, hi: u16) {
+    s.alloc_lo = lo;
+    s.alloc_hi = hi;
+}
+
+#[inline]
+fn alloc_hi(s: &Sessions) -> usize {
+    if s.alloc_hi == 0 {
+        MAX_SESSIONS
+    } else {
+        usize::from(s.alloc_hi).min(MAX_SESSIONS)
+    }
+}
+
+/// True when `si` is one this worker allocates from.
+#[inline]
+pub fn in_alloc_range(s: &Sessions, si: usize) -> bool {
+    si >= usize::from(s.alloc_lo) && si < alloc_hi(s)
+}
+
+/// True when the slot's session lives on another worker.
+#[inline]
+pub fn is_lent(s: &Sessions, si: usize) -> bool {
+    si < MAX_SESSIONS && s.lent[si] == 1
+}
+
+/// True when this worker holds a session at `si` in any state.
+#[inline]
+pub fn holds(s: &Sessions, si: usize) -> bool {
+    si < MAX_SESSIONS && {
+        let x = &s.slots[si];
+        x.present == 1 || x.transient == 1 || x.active == 1 || x.persisted == 1
+    }
+}
+
+/// Hand the session at `si` to another worker: the record goes, the
+/// index stays reserved. The caller has already exported it.
+pub fn lend(s: &mut Sessions, si: usize) {
+    if si >= MAX_SESSIONS {
+        return;
+    }
+    s.lent[si] = 1;
+    s.slots[si] = Session::zero();
+    s.prefetch_credit[si] = 0;
+    s.sub_outstanding[si] = 0;
+    reindex(s, si);
+}
+
+/// The session at `si` is (back) on this worker; `import_record` fills
+/// the slot next.
+pub fn unlend(s: &mut Sessions, si: usize) {
+    if si < MAX_SESSIONS {
+        s.lent[si] = 0;
+    }
 }
 
 pub fn init(s: &mut Sessions) {
@@ -384,7 +474,12 @@ fn reindex(s: &mut Sessions, si: usize) {
         s.idx_in_conn[si] = 1;
     }
 
-    if !want_stream && s.in_free[si] == 0 && (s.free_len as usize) < MAX_SESSIONS {
+    if !want_stream
+        && s.in_free[si] == 0
+        && s.lent[si] == 0
+        && in_alloc_range(s, si)
+        && (s.free_len as usize) < MAX_SESSIONS
+    {
         s.free_stack[s.free_len as usize] = si as u16;
         s.free_len += 1;
         s.in_free[si] = 1;
@@ -610,7 +705,7 @@ pub fn is_active(s: &Sessions, si: usize) -> bool {
 pub struct SessionView {
     pub tenant: TenantId,
     pub stream_hash: StreamHash,
-    pub session_epoch: SessionEpoch,
+    pub session_generation: SessionGeneration,
     pub protocol: u8,
     pub conn_id: u16,
     pub active: bool,
@@ -635,7 +730,7 @@ pub fn view(s: &Sessions, si: usize) -> Option<SessionView> {
     Some(SessionView {
         tenant: x.tenant,
         stream_hash: x.stream_hash,
-        session_epoch: x.session_epoch,
+        session_generation: x.session_generation,
         protocol: x.protocol,
         conn_id: x.conn_id,
         active: x.active == 1,
@@ -682,9 +777,9 @@ pub fn tenant(s: &Sessions, si: usize) -> TenantId {
     }
 }
 
-pub fn session_epoch(s: &Sessions, si: usize) -> SessionEpoch {
+pub fn generation(s: &Sessions, si: usize) -> SessionGeneration {
     if si < MAX_SESSIONS {
-        s.slots[si].session_epoch
+        s.slots[si].session_generation
     } else {
         0
     }
@@ -821,9 +916,9 @@ pub struct ConnectParams {
     pub keep_alive_ms: u32,
 }
 
-/// Apply a committed CONNECT. Bumps the session epoch — the fencing
-/// token every in-flight round-trip is validated against — and clears
-/// `persisted`, since the session is no longer parked.
+/// Apply a committed CONNECT. Bumps the session generation — the
+/// fencing token every in-flight round-trip is validated against —
+/// and clears `persisted`, since the session is no longer parked.
 pub fn commit_connect(s: &mut Sessions, si: usize, p: ConnectParams) {
     if si >= MAX_SESSIONS {
         return;
@@ -831,7 +926,7 @@ pub fn commit_connect(s: &mut Sessions, si: usize, p: ConnectParams) {
     let x = &mut s.slots[si];
     x.tenant = p.tenant;
     x.stream_hash = p.stream_hash;
-    x.session_epoch = x.session_epoch.wrapping_add(1);
+    x.session_generation = x.session_generation.wrapping_add(1);
     x.protocol = p.protocol;
     x.clean_start = u8::from(p.clean_start);
     x.keep_alive_ms = p.keep_alive_ms;
@@ -1015,6 +1110,260 @@ pub fn release_foreign(
     released
 }
 
+// ── Handoff record ──────────────────────────────────────────────────
+//
+// The per-session state a worker move carries. Everything here is what
+// the committed log does NOT determine for the importing worker — or
+// what it determines but the importer has not applied, which the import
+// reconciles against (`session_identity_core::reconcile_generation`).
+// Subscriptions are deliberately absent: they live in `topic_engine`,
+// keyed by the slot index the session keeps across the move.
+//
+// Layout (all LE):
+//   [magic "QSR1":4][tenant:4][stream_hash:8][generation:4][slot:4]
+//   [protocol:1][clean_start:1][persisted:1][keep_alive_ms:4]
+//   [next_msg_id:4][session_expiry_s:4][receive_maximum:2]
+//   [last_activity_age_ms:4]  — `now - last_activity`, rebased on import
+//   [prefetch_credit:4][sub_outstanding:4]
+//   [will_present:1][will_qos:1][will_retain:1][will_delay_ms:4]
+//   [will_topic_len:2][topic][will_payload_len:2][payload]
+//   [inflight_count:1] then per entry
+//     [packet_id:2][qos:1][phase:1][direction:1][generation:4]
+//     [wal_index:8][correlation_id:8][partition_id:2][rec_sent:1]
+//
+// `RECORD_MAX` bounds the blob; the worker's import buffer is sized to
+// it, so an oversize record is refused at EXPORT_BEGIN rather than
+// truncated.
+
+const RECORD_MAGIC: [u8; 4] = *b"QSR1";
+const RECORD_FIXED: usize =
+    4 + 4 + 8 + 4 + 4 + 1 + 1 + 1 + 4 + 4 + 4 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 2 + 2 + 1;
+const INFLIGHT_RECORD: usize = 2 + 1 + 1 + 1 + 4 + 8 + 8 + 2 + 1;
+/// Largest handoff record a session can export.
+pub const RECORD_MAX: usize =
+    RECORD_FIXED + MAX_WILL_TOPIC + MAX_WILL_PAYLOAD + MAX_INFLIGHT_PER_SESSION * INFLIGHT_RECORD;
+
+/// Serialise the session at `si` into `out`. Returns the byte count, or
+/// 0 if the slot holds nothing or `out` is too short.
+pub fn export_record(s: &Sessions, si: usize, now: u64, out: &mut [u8]) -> usize {
+    if !holds(s, si) || out.len() < RECORD_MAX {
+        return 0;
+    }
+    let x = &s.slots[si];
+    let mut p = 0usize;
+    let mut put = |b: &[u8], p: &mut usize| {
+        out[*p..*p + b.len()].copy_from_slice(b);
+        *p += b.len();
+    };
+    put(&RECORD_MAGIC, &mut p);
+    put(&x.tenant.to_le_bytes(), &mut p);
+    put(&x.stream_hash.to_le_bytes(), &mut p);
+    put(&x.session_generation.to_le_bytes(), &mut p);
+    put(&(si as u32).to_le_bytes(), &mut p);
+    put(&[x.protocol, x.clean_start, x.persisted], &mut p);
+    put(&x.keep_alive_ms.to_le_bytes(), &mut p);
+    put(&x.next_msg_id.to_le_bytes(), &mut p);
+    put(&x.session_expiry_s.to_le_bytes(), &mut p);
+    put(&x.receive_maximum.to_le_bytes(), &mut p);
+    let age = now
+        .saturating_sub(x.last_activity_ms)
+        .min(u64::from(u32::MAX)) as u32;
+    put(&age.to_le_bytes(), &mut p);
+    put(&s.prefetch_credit[si].to_le_bytes(), &mut p);
+    put(&s.sub_outstanding[si].to_le_bytes(), &mut p);
+    put(&[x.will_present, x.will_qos, x.will_retain], &mut p);
+    put(&x.will_delay_ms.to_le_bytes(), &mut p);
+    let wt = usize::from(x.will_topic_len).min(MAX_WILL_TOPIC);
+    put(&(wt as u16).to_le_bytes(), &mut p);
+    put(&x.will_topic[..wt], &mut p);
+    let wp = usize::from(x.will_payload_len).min(MAX_WILL_PAYLOAD);
+    put(&(wp as u16).to_le_bytes(), &mut p);
+    put(&x.will_payload[..wp], &mut p);
+    let count_at = p;
+    p += 1;
+    let mut n = 0u8;
+    for e in x.inflight.iter() {
+        if e.active == 0 {
+            continue;
+        }
+        put(&e.packet_id.to_le_bytes(), &mut p);
+        put(&[e.qos, e.phase, e.direction], &mut p);
+        put(&e.session_generation.to_le_bytes(), &mut p);
+        put(&e.wal_index.to_le_bytes(), &mut p);
+        put(&e.correlation_id.to_le_bytes(), &mut p);
+        put(&e.partition_id.to_le_bytes(), &mut p);
+        put(&[e.rec_sent], &mut p);
+        n += 1;
+    }
+    out[count_at] = n;
+    p
+}
+
+/// The identity a record names, read without importing it:
+/// `(tenant, stream_hash, generation, slot)`. `None` if the record is
+/// not one.
+pub fn record_identity(blob: &[u8]) -> Option<(TenantId, StreamHash, SessionGeneration, u32)> {
+    if blob.len() < RECORD_FIXED || blob[..4] != RECORD_MAGIC {
+        return None;
+    }
+    let tenant = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+    let mut h = [0u8; 8];
+    h.copy_from_slice(&blob[8..16]);
+    let generation = u32::from_le_bytes([blob[16], blob[17], blob[18], blob[19]]);
+    let slot = u32::from_le_bytes([blob[20], blob[21], blob[22], blob[23]]);
+    Some((tenant, u64::from_le_bytes(h), generation, slot))
+}
+
+/// Place the record in `blob` at slot `si` as a live, connection-bound
+/// session. `false` if the record is malformed or the slot is taken by
+/// a different session. `generation` is the reconciled value the
+/// importer resolved (see `session_identity_core`).
+pub fn import_record(
+    s: &mut Sessions,
+    si: usize,
+    blob: &[u8],
+    conn_id: u16,
+    generation: SessionGeneration,
+    now: u64,
+) -> bool {
+    let Some((tenant, stream_hash, _, _)) = record_identity(blob) else {
+        return false;
+    };
+    if si >= MAX_SESSIONS {
+        return false;
+    }
+    if holds(s, si) && (s.slots[si].tenant != tenant || s.slots[si].stream_hash != stream_hash) {
+        return false;
+    }
+    let mut p = 24usize;
+    macro_rules! rd {
+        ($n:expr) => {{
+            if p + $n > blob.len() {
+                return false;
+            }
+            let at = p;
+            p += $n;
+            at
+        }};
+    }
+    let mut x = Session::zero();
+    x.tenant = tenant;
+    x.stream_hash = stream_hash;
+    x.session_generation = generation;
+    let at = rd!(3);
+    x.protocol = blob[at];
+    x.clean_start = blob[at + 1];
+    let at = rd!(4);
+    x.keep_alive_ms = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    let at = rd!(4);
+    x.next_msg_id = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    let at = rd!(4);
+    x.session_expiry_s = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    let at = rd!(2);
+    x.receive_maximum = u16::from_le_bytes([blob[at], blob[at + 1]]);
+    let at = rd!(4);
+    let age = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    x.last_activity_ms = now.saturating_sub(u64::from(age));
+    let at = rd!(4);
+    let prefetch = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    let at = rd!(4);
+    let outstanding = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    let at = rd!(3);
+    x.will_present = blob[at];
+    x.will_qos = blob[at + 1];
+    x.will_retain = blob[at + 2];
+    let at = rd!(4);
+    x.will_delay_ms = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
+    let at = rd!(2);
+    let wt = usize::from(u16::from_le_bytes([blob[at], blob[at + 1]]));
+    if wt > MAX_WILL_TOPIC {
+        return false;
+    }
+    let at = rd!(wt);
+    x.will_topic[..wt].copy_from_slice(&blob[at..at + wt]);
+    x.will_topic_len = wt as u16;
+    let at = rd!(2);
+    let wp = usize::from(u16::from_le_bytes([blob[at], blob[at + 1]]));
+    if wp > MAX_WILL_PAYLOAD {
+        return false;
+    }
+    let at = rd!(wp);
+    x.will_payload[..wp].copy_from_slice(&blob[at..at + wp]);
+    x.will_payload_len = wp as u16;
+    let at = rd!(1);
+    let n = usize::from(blob[at]);
+    if n > MAX_INFLIGHT_PER_SESSION {
+        return false;
+    }
+    for i in 0..n {
+        let at = rd!(INFLIGHT_RECORD);
+        let b = &blob[at..at + INFLIGHT_RECORD];
+        let mut w = [0u8; 8];
+        w.copy_from_slice(&b[9..17]);
+        let mut c = [0u8; 8];
+        c.copy_from_slice(&b[17..25]);
+        let partition_id = u16::from_le_bytes([b[25], b[26]]);
+        let rec_sent = b[27];
+        x.inflight[i] = Inflight {
+            packet_id: u16::from_le_bytes([b[0], b[1]]),
+            qos: b[2],
+            phase: b[3],
+            direction: b[4],
+            session_generation: u32::from_le_bytes([b[5], b[6], b[7], b[8]]),
+            wal_index: u64::from_le_bytes(w),
+            correlation_id: u64::from_le_bytes(c),
+            partition_id,
+            rec_sent,
+            active: 1,
+        };
+    }
+    // Bound and live on this worker: the anchor kept the connection.
+    x.conn_id = conn_id;
+    x.conn_bound = 1;
+    x.present = 1;
+    x.active = 1;
+    x.persisted = 0;
+    x.transient = 0;
+    s.lent[si] = 0;
+    s.slots[si] = x;
+    s.prefetch_credit[si] = prefetch;
+    s.sub_outstanding[si] = outstanding;
+    reindex(s, si);
+    true
+}
+
+/// Every active inflight entry at `si`, for re-registration after an
+/// import: `(index, packet_id, wal_index, correlation_id, generation,
+/// qos, phase, direction)`. Returns how many were written into `out`.
+pub fn inflight_entries(
+    s: &Sessions,
+    si: usize,
+    out: &mut [InflightView; MAX_INFLIGHT_PER_SESSION],
+) -> usize {
+    if si >= MAX_SESSIONS {
+        return 0;
+    }
+    let mut n = 0usize;
+    for (ii, e) in s.slots[si].inflight.iter().enumerate() {
+        if e.active == 1 {
+            out[n] = InflightView {
+                index: ii,
+                packet_id: e.packet_id,
+                qos: e.qos,
+                phase: e.phase,
+                session_generation: e.session_generation,
+                wal_index: e.wal_index,
+                correlation_id: e.correlation_id,
+                partition_id: e.partition_id,
+                rec_sent: e.rec_sent == 1,
+                direction: e.direction,
+            };
+            n += 1;
+        }
+    }
+    n
+}
+
 // ── Will messages ───────────────────────────────────────────────────
 
 /// The stored Will, as the publish path needs it.
@@ -1135,11 +1484,33 @@ pub fn will_delay_ms(s: &Sessions, si: usize) -> u32 {
 /// What an in-flight entry carries for the QoS state machine.
 #[derive(Clone, Copy)]
 pub struct InflightView {
+    pub index: usize,
+    pub packet_id: u16,
     pub qos: u8,
     pub phase: u8,
-    pub session_epoch: SessionEpoch,
+    pub direction: u8,
+    pub partition_id: u16,
+    pub rec_sent: bool,
+    pub session_generation: SessionGeneration,
     pub correlation_id: u64,
     pub wal_index: u64,
+}
+
+impl InflightView {
+    pub const fn zero() -> Self {
+        Self {
+            index: 0,
+            packet_id: 0,
+            qos: 0,
+            phase: 0,
+            direction: 0,
+            partition_id: 0,
+            rec_sent: false,
+            session_generation: 0,
+            correlation_id: 0,
+            wal_index: 0,
+        }
+    }
 }
 
 pub fn inflight_view(s: &Sessions, si: usize, ii: usize) -> Option<InflightView> {
@@ -1151,9 +1522,14 @@ pub fn inflight_view(s: &Sessions, si: usize, ii: usize) -> Option<InflightView>
         return None;
     }
     Some(InflightView {
+        index: ii,
+        packet_id: e.packet_id,
+        direction: e.direction,
+        partition_id: e.partition_id,
+        rec_sent: e.rec_sent == 1,
         qos: e.qos,
         phase: e.phase,
-        session_epoch: e.session_epoch,
+        session_generation: e.session_generation,
         correlation_id: e.correlation_id,
         wal_index: e.wal_index,
     })
@@ -1180,6 +1556,13 @@ pub fn inflight_release(s: &mut Sessions, si: usize, ii: usize) {
 }
 
 /// Advance a QoS 2 entry to the PUBREL phase.
+/// The PUBREC for this QoS 2 flow went out.
+pub fn inflight_mark_rec_sent(s: &mut Sessions, si: usize, ii: usize) {
+    if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
+        s.slots[si].inflight[ii].rec_sent = 1;
+    }
+}
+
 pub fn inflight_set_phase(s: &mut Sessions, si: usize, ii: usize, phase: u8) {
     if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
         s.slots[si].inflight[ii].phase = phase;
@@ -1188,9 +1571,9 @@ pub fn inflight_set_phase(s: &mut Sessions, si: usize, ii: usize, phase: u8) {
 
 /// Stamp the session epoch the flow opened under. Set once, when the
 /// publish that opened the flow applies.
-pub fn inflight_set_epoch(s: &mut Sessions, si: usize, ii: usize, epoch: SessionEpoch) {
+pub fn inflight_set_generation(s: &mut Sessions, si: usize, ii: usize, epoch: SessionGeneration) {
     if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
-        s.slots[si].inflight[ii].session_epoch = epoch;
+        s.slots[si].inflight[ii].session_generation = epoch;
     }
 }
 
@@ -1200,8 +1583,15 @@ pub fn inflight_set_correlation(s: &mut Sessions, si: usize, ii: usize, cid: u64
     }
 }
 
-pub fn inflight_set_wal_index(s: &mut Sessions, si: usize, ii: usize, wal_index: u64) {
+pub fn inflight_set_wal_index(
+    s: &mut Sessions,
+    si: usize,
+    ii: usize,
+    partition_id: u16,
+    wal_index: u64,
+) {
     if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
+        s.slots[si].inflight[ii].partition_id = partition_id;
         s.slots[si].inflight[ii].wal_index = wal_index;
     }
 }

@@ -4,7 +4,7 @@ Source: `modules/app/session_processor/`
 
 `session_processor` is one graph module — one scheduler entity, one
 arena, the ports its manifest declares — decomposed internally into
-four components, each a source file owning its own state behind an
+five components, each a source file owning its own state behind an
 entry-point boundary. `mod.rs` holds the dispatch: the phase-ordered
 step function, the protocol handlers, and the apply arms. This
 document states the component split, the seam it follows, and the
@@ -42,6 +42,7 @@ clean, rather than at components, which would not be.
 | `store` | `store.rs` | `KPart` message logs and the protocol-neutral durable-publish inflight — the primitive behind Kafka produce/fetch and AMQP publish/Basic.Get. |
 | `consumers` | `consumers.rs` | Consumer-group membership, committed offsets, and AMQP push consumers. Record types are private; membership, generation bumps, delivery-tag arithmetic and prefetch credit are operations, not exposed fields. |
 | `correlate` | `correlate.rs` | Correlation tables, the commit-gating stash (a publish is released only once dedup verdict and durability proof have both arrived, in either order), and the pending delivery/ack slots. |
+| `worker` | `worker.rs` | The SessionCtrlV1 session-worker role: attachments by `conn_id`, delivery cursors, drain-to-quiescent, the opaque export/import over `sessions::export_record`, resume and return-to-service, and the frozen/settling states a moved session passes through. See [session_continuity.md](session_continuity.md). |
 
 Every interaction with a component's state crosses one of its entry
 points; `mod.rs` contains no direct reads or writes of component

@@ -156,7 +156,10 @@ impl ConnCtx {
 
 #[repr(C)]
 pub struct Mqtt {
-    pub out_proposals: i32,
+    /// The composite's anchor: every proposal goes through it
+    /// ([`write_proposal`]), which is what binds the connection to a
+    /// session worker and holds it across a handoff.
+    pub anchor: *mut super::anchor::Anchor,
     pub out_frames: i32,
 
     packets_decoded: u32,
@@ -1713,13 +1716,7 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire:
                 }
             }
 
-            if !write_conn_frame_with_mtype(
-                sys,
-                s.out_proposals,
-                conn_id,
-                session_msg_type,
-                &s.envelope[..pos],
-            ) {
+            if !write_proposal(s, sys, conn_id, session_msg_type, pos) {
                 // Refused. A dropped PUBLISH is one the client never
                 // hears back about, so the packet goes back to the
                 // front of the reassembly buffer — `in_buf` still holds
@@ -1917,6 +1914,30 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
         s.packets_encoded += 1;
         true
     }
+}
+
+/// Hand the proposal envelope staged in `s.envelope[..len]` to the
+/// anchor, which forwards it to the worker the connection is bound to
+/// or holds it across a handoff. `false` only when the live worker's
+/// channel refused it.
+///
+/// # Safety
+unsafe fn write_proposal(
+    s: &mut Mqtt,
+    sys: &SyscallTable,
+    conn_id: wire::ConnId,
+    msg_type: u8,
+    len: usize,
+) -> bool {
+    const PAYLOAD_BUF: usize = CID + MAX_PACKET;
+    let total = CID + len;
+    if total > PAYLOAD_BUF || s.anchor.is_null() {
+        return false;
+    }
+    let mut out = [0u8; PAYLOAD_BUF];
+    out[..CID].copy_from_slice(&conn_id.to_le_bytes());
+    out[CID..total].copy_from_slice(&s.envelope[..len]);
+    super::anchor::forward_env(&mut *s.anchor, sys, msg_type, &out[..total])
 }
 
 /// Write a framed proposal envelope to session_processor.codec_in.

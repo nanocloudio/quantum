@@ -23,6 +23,7 @@
 //!   in[6]  deliver_in     — topic deliveries
 //!   in[7]  assigned_in    — MSG_PROPOSAL_ASSIGNED (correlation → wal index)
 //!   in[8]  wal_reply      — WAL records for a cold Kafka Fetch
+//!   in[9]  ctrl_in        — SessionCtrlV1 commands from the anchor
 //!   out[0] proposals      — to consensus (fluxor wire envelope)
 //!   out[1] codec_out      — [conn_id:u16 LE][proto][pkt_type][flags][body] responses to codecs
 //!   out[2] topic_out      — publish + subscribe + unsubscribe (wire envelope)
@@ -34,6 +35,7 @@
 //!   out[8] wal_request    — cold-read request for a Kafka Fetch
 //!   out[9] retention_floor — lowest raft index this broker still needs
 //!   out[10] cp_out        — committed entries the control plane owns
+//!   out[11] ctrl_out      — SessionCtrlV1 replies and export frames
 
 #![no_std]
 #![allow(
@@ -101,6 +103,33 @@ define_params! {
     // record the other would have kept.
     3, kafka_compact, u8, 0
         => |s, d, len| { s.kafka_compact = p_u8(d, len, 0, 0); };
+
+    // ── Session-worker identity (docs/architecture/session_continuity.md) ──
+    //
+    // Two session_processor instances can share one node as an
+    // anchor-preserved handoff pair. They share topic_engine, flow and
+    // messaging, all keyed by session slot, so each allocates NEW
+    // sessions from its own slot range and applies only the committed
+    // entries of sessions it holds. A node with one worker leaves all
+    // four at their defaults: worker 0, no peers, the whole table.
+    4, worker_id, u8, 0
+        => |s, d, len| { s.worker_id = p_u8(d, len, 0, 0); };
+    // Bitmask of OTHER worker ids on this node (bit n = worker n).
+    // Non-zero turns on the apply-side ownership filter.
+    5, co_located_workers, u8, 0
+        => |s, d, len| { s.co_located_workers = p_u8(d, len, 0, 0); };
+    // Slot range this worker allocates from: `[slot_base, slot_base +
+    // slot_count)`; `slot_count = 0` runs to the end of the table.
+    6, slot_base, u16, 0
+        => |s, d, len| { s.slot_base = p_u16(d, len, 0, 0); };
+    7, slot_count, u16, 0
+        => |s, d, len| { s.slot_count = p_u16(d, len, 0, 0); };
+    // Fault injection for the cursor gate: bytes ADDED to the inbound
+    // cursor every export carries, so the anchor's admission check
+    // sees a blob that accounts for bytes it never forwarded and must
+    // refuse the handoff. 0 in every deployment.
+    8, export_cursor_skew, u32, 0
+        => |s, d, len| { s.worker.cursor_skew = p_u32(d, len, 0, 0); };
 }
 
 /// Kafka idempotent-producer sequence bookkeeping. Enforced on the
@@ -145,6 +174,7 @@ mod consumers;
 mod correlate;
 mod sessions;
 mod store;
+mod worker;
 
 /// Kernel step ABI: 0=Continue, 1=Done, 2=Burst, 3=Ready. Returning
 /// Burst re-runs the domain's exec rotation within the same tick (up to
@@ -163,8 +193,8 @@ const MAX_SESSIONS: usize = 16384;
 
 /// Apply cursors, one per hosted raft partition. Must be at least
 /// clustor's `consensus` `K_MAX` (64); a partition id at or above this
-/// falls back to cursor 0, which degrades to the old single-cursor
-/// behaviour for that partition rather than indexing out of bounds.
+/// shares cursor 0 rather than indexing out of bounds, which costs that
+/// partition the per-partition sequencing but never memory safety.
 const MAX_APPLY_PARTITIONS: usize = 64;
 const MAX_INFLIGHT_PER_SESSION: usize = 16;
 /// Proposal credit the codec drain requires before it takes a packet
@@ -551,11 +581,11 @@ struct ModuleState {
     in_ack: i32,
     in_cp: i32,
     /// Placement view learned from the control plane over `cp_in`.
-    /// Until W9 hands per-shard state over on a migration, this is
-    /// read-only: it lets the module SAY which shards it owns
-    /// (`shard_owned_locally`) without yet moving state, so the
-    /// ownership answer is available to the stores and to tests before
-    /// the handover machinery that consumes it exists.
+    ///
+    /// Read-only here: it answers which shards this node owns
+    /// (`shard_owned_locally`) for the stores and the ownership gates.
+    /// Moving per-shard state when ownership changes is the control
+    /// plane's migration path, not this view's job.
     view: edge::EdgeMap,
     /// Placement updates applied.
     placement_updates: u32,
@@ -577,6 +607,18 @@ struct ModuleState {
     kafka_retention_ms: u32,
     /// Non-zero enables key compaction.
     kafka_compact: u8,
+    /// This instance's worker id and the ids sharing the node (params
+    /// 4–7). See `entry_is_mine`.
+    worker_id: u8,
+    co_located_workers: u8,
+    slot_base: u16,
+    slot_count: u16,
+    /// QoS 2 PUBLISH retransmissions answered from the in-flight ledger
+    /// instead of starting a second flow.
+    qos2_dup_answered: u32,
+    /// Committed publishes the dedupe table filed as duplicates: acked,
+    /// not fanned out.
+    dedup_duplicates: u32,
     /// Records dropped by time retention.
     #[cfg(feature = "kafka")]
     kafka_retention_evictions: u32,
@@ -670,6 +712,8 @@ struct ModuleState {
     follower_factor_q16: i32,
 
     sessions: sessions::Sessions,
+    /// SessionCtrlV1 session-worker role (`worker.rs`).
+    worker: worker::Worker,
     /// Per-subscriber prefetch credit set by the prefetch component.
     /// Populated from MSG_PREFETCH_CREDIT on flow_in; 0 = unset / no cap.
     /// Enforced on the MSG_TOPIC_DELIVER push path.
@@ -906,13 +950,16 @@ pub unsafe extern "C" fn module_new(
         s.out_metrics = dev_channel_port(sys, 1, 6);
         // Declared LAST in the manifest, so these take the highest
         // indices and nothing above shifted.
+        // retention_floor and cp_out are not Kafka's: every variant
+        // forwards the control plane's entries and publishes its floor.
+        // Left at zero in the mqtt variant they named channel 0.
+        s.out_retention_floor = dev_channel_port(sys, 1, 9);
+        s.out_cp = dev_channel_port(sys, 1, 10);
+        s.cp_forwarded = 0;
+        s.cp_refused = 0;
         #[cfg(feature = "kafka")]
         {
             s.out_wal_request = dev_channel_port(sys, 1, 8);
-            s.out_retention_floor = dev_channel_port(sys, 1, 9);
-            s.out_cp = dev_channel_port(sys, 1, 10);
-            s.cp_forwarded = 0;
-            s.cp_refused = 0;
             s.in_wal_reply = dev_channel_port(sys, 0, 8);
             s.cold = [ColdFetch::zero(); COLD_FETCH_SLOTS];
             s.next_cold_id = 1;
@@ -940,11 +987,23 @@ pub unsafe extern "C" fn module_new(
         s.apply_index = [0; MAX_APPLY_PARTITIONS];
         s.applying_index = 0;
         s.apply_resets = 0;
+        // The allocation range must be in place before the table is
+        // built: `clear` pushes each free slot in range onto the stack.
+        let hi = if s.slot_count == 0 {
+            0
+        } else {
+            s.slot_base.saturating_add(s.slot_count)
+        };
+        sessions::set_alloc_range(&mut s.sessions, s.slot_base, hi);
         for i in 0..MAX_SESSIONS {
             sessions::clear(&mut s.sessions, i);
             sessions::clear_flow(&mut s.sessions, i);
         }
         correlate::init(&mut s.correlate);
+        worker::init(&mut s.worker, s.worker_id);
+        // Declared last in the manifest: in[9] / out[11].
+        s.worker.in_ctrl = dev_channel_port(sys, 0, 9);
+        s.worker.out_ctrl = dev_channel_port(sys, 1, 11);
         store::init(&mut s.store);
         s.sub_inflight_dropped_on_resume = 0;
         s.conn_bindings_evicted = 0;
@@ -994,6 +1053,42 @@ pub unsafe extern "C" fn module_new(
 ///
 /// # Safety
 unsafe fn emit_codec_response(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u16,
+    proto: u8,
+    pkt_type: u8,
+    flags: u8,
+    body: &[u8],
+) -> bool {
+    let chan = s.out_codec;
+    if chan < 0 {
+        return false;
+    }
+    // A session frozen mid-handoff emits nothing: the importing worker
+    // answers from the state it received (worker.rs §Frozen sessions).
+    if worker::is_frozen(&s.worker, conn_id) {
+        s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
+        return true;
+    }
+    let ok = emit_codec_response_raw(sys, chan, conn_id, proto, pkt_type, flags, body);
+    if ok {
+        worker::note_out(
+            &mut s.worker,
+            conn_id,
+            wire::ENVELOPE_HDR + CODEC_ENV_HDR + body.len(),
+        );
+    }
+    ok
+}
+
+/// `emit_codec_response` without the worker bookkeeping, for the one
+/// caller that cannot hold the module state: the redirect sent to a
+/// connection whose session is being released — nothing of that
+/// session is exported afterwards, so its cursor no longer matters.
+///
+/// # Safety
+unsafe fn emit_codec_response_raw(
     sys: &SyscallTable,
     chan: i32,
     conn_id: u16,
@@ -3852,7 +3947,7 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
         STASH_DEDUP_OK | STASH_DEDUP_REFUSED if env_len >= 18 => {
             // Stash holds the QOP_PUBLISH V2 op-body:
             //   [pub_qos:u8][packet_id:u16 BE][stream_hash:u64 LE]
-            //   [session_epoch:u32 LE][retain:u8][topic_len:u16 BE]
+            //   [session_generation:u32 LE][retain:u8][topic_len:u16 BE]
             //   [topic][user_props_count:u8][per prop ...][payload]
             // Build the MSG_TOPIC_PUBLISH envelope topic_engine expects:
             //   [tenant:u32 LE][qos:u8][_pad:u8][topic_len:u16 LE][topic]
@@ -3914,6 +4009,7 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
             }
         }
         STASH_DEDUP_DUPLICATE => {
+            s.dedup_duplicates = s.dedup_duplicates.wrapping_add(1);
             correlate::stash_release(&mut s.correlate, stash_idx);
             true
         }
@@ -3982,6 +4078,29 @@ unsafe fn enqueue_offline(s: &mut ModuleState, sys: &SyscallTable, session_slot:
     );
 }
 
+/// `try_deliver` for a messaging REPLY (an offline drain, a retained
+/// read). Replies reach every worker on the node, so one for a session
+/// whose attachment is frozen here — exported and not yet detached, or
+/// imported and not yet resumed — belongs to the other worker and is
+/// dropped rather than parked a second time. A topic delivery is
+/// different: it is routed to exactly one worker, so a frozen one parks
+/// it (see `try_deliver`).
+///
+/// # Safety
+unsafe fn try_deliver_reply(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> DeliverResult {
+    if env.len() >= 4 {
+        let slot = u32::from_le_bytes([env[0], env[1], env[2], env[3]]) as usize;
+        if slot < MAX_SESSIONS
+            && sessions::is_active(&s.sessions, slot)
+            && worker::is_frozen(&s.worker, sessions::conn_id(&s.sessions, slot))
+        {
+            s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
+            return DeliverResult::Dropped;
+        }
+    }
+    try_deliver(s, sys, env)
+}
+
 /// Attempt one delivery of a single MSG_TOPIC_DELIVER envelope. Used both
 /// for fresh inbound deliveries and for the defer-queue drain so the
 /// backpressure path stays consistent.
@@ -4002,13 +4121,27 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
     // for replay on reconnect. Treated as Delivered from the caller's
     // perspective: the message is now the offline queue's responsibility.
     if !sessions::is_active(&s.sessions, session_slot) {
-        if sessions::is_persisted(&s.sessions, session_slot) {
+        // Persisted (offline) — or lent to the other worker while its
+        // subscriptions still point here: park it by slot, which the
+        // holder's settle drain replays. Dropping it would lose a
+        // committed publish to a live subscriber.
+        if sessions::is_persisted(&s.sessions, session_slot)
+            || sessions::is_lent(&s.sessions, session_slot)
+        {
             enqueue_offline(s, sys, session_slot as u32, env);
             return DeliverResult::Delivered;
         }
         return DeliverResult::Dropped;
     }
     let conn_id = sessions::conn_id(&s.sessions, session_slot);
+    // Exported and not yet detached — or just resumed and settling:
+    // park it, keyed by the slot the session keeps; the importing
+    // worker's settle drain replays the queue in order.
+    if worker::is_frozen(&s.worker, conn_id) || worker::is_settling(&s.worker, conn_id) {
+        enqueue_offline(s, sys, session_slot as u32, env);
+        s.worker.frozen_parked = s.worker.frozen_parked.wrapping_add(1);
+        return DeliverResult::Delivered;
+    }
     let sub_qos = env[4] & 0x03;
 
     let topic_len = u16::from_le_bytes([env[12], env[13]]) as usize;
@@ -4110,14 +4243,16 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
     );
 
     let flags = sub_qos << 1;
+    let mut body = [0u8; BUF_SIZE];
+    body[..body_len].copy_from_slice(&s.out_buf[..body_len]);
     let emitted = emit_codec_response(
+        s,
         sys,
-        s.out_codec,
         conn_id,
         PROTO_MQTT,
         PKT_PUBLISH,
         flags,
-        &s.out_buf[..body_len],
+        &body[..body_len],
     );
     if emitted {
         s.pid_entry_credits = s.pid_entry_credits.saturating_sub(1);
@@ -4217,6 +4352,29 @@ unsafe fn apply_reset(
 /// # Safety
 /// Caller must hold an exclusive `&mut ModuleState`, supply a valid
 /// `&SyscallTable`, and guarantee `body_start <= body_end <= s.in_buf.len()`.
+/// Whether this worker applies a committed session-scoped entry.
+///
+/// One worker per node (the default, `co_located_workers == 0`) applies
+/// everything — it must hold every session's durable record, as a Raft
+/// follower does. When two workers share a node, each applies only the
+/// entries of sessions it holds, or of slots it allocates and has not
+/// lent out: an entry proposed by the other worker for a session it
+/// owns must not create a second, persisted copy here, whose
+/// subscriptions and offline queue would then shadow the live one. Ops
+/// that name no session (Kafka logs, control-plane records, remote
+/// subscriptions) belong to worker 0.
+fn entry_is_mine(s: &ModuleState, slot: u32) -> bool {
+    if s.co_located_workers == 0 {
+        return true;
+    }
+    if slot == SESSION_SLOT_REMOTE || slot as usize >= MAX_SESSIONS {
+        return s.worker_id == 0;
+    }
+    let si = slot as usize;
+    sessions::holds(&s.sessions, si)
+        || (sessions::in_alloc_range(&s.sessions, si) && !sessions::is_lent(&s.sessions, si))
+}
+
 unsafe fn apply_committed_op(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -4361,7 +4519,7 @@ unsafe fn apply_committed_op(
 
 /// Apply-side handler for QOP_CONNECT. Promotes a transient slot
 /// (leader path) or builds a fresh durable record (follower / replay
-/// path), bumps `session_epoch`, and fans out the
+/// path), bumps `session_generation`, and fans out the
 /// `MSG_SESSION_DROP` / `MSG_OFFLINE_RECONNECT` notices to downstream
 /// modules, so every node observes the same downstream effects.
 ///
@@ -4756,6 +4914,18 @@ unsafe fn apply_qop_disconnect(
     let Some(i) = sessions::find_by_stream(&s.sessions, tenant, stream_hash) else {
         return;
     };
+    // The slot has been taken over: a CONNECT for the same client id
+    // was admitted after this disconnect was proposed and is waiting
+    // for its own commit. The connection this entry ends is already
+    // gone from the slot; closing it now would end the NEW
+    // connection's session under it — a client that disconnects and
+    // reconnects at once (one `mosquitto_pub` per message) then
+    // publishes into nothing. The takeover's own CONNECT commit
+    // carries the session forward.
+    if sessions::is_transient(&s.sessions, i) {
+        s.applied = s.applied.wrapping_add(1);
+        return;
+    }
 
     // Will-message handling (MQTT 3.1.1 §3.1.2.5 / MQTT 5 §3.1.3.2):
     // any non-CLEAN reason — keep-alive timeout, forced admin
@@ -4908,7 +5078,7 @@ unsafe fn apply_qop_subscribe(
     };
 
     // MSG_TOPIC_SUBSCRIBE body:
-    //   [tenant:u32 LE][session_slot:u32 LE][req_qos:u8][_pad:u8]
+    //   [tenant:u32 LE][session_slot:u32 LE][req_qos:u8][worker:u8]
     //   [topic_len:u16 LE][topic][stream_hash:u64 LE]
     // `stream_hash` is appended LAST so the prefix is byte-identical to
     // the shape topic_engine already parsed.
@@ -4917,7 +5087,9 @@ unsafe fn apply_qop_subscribe(
         s.out_buf[0..4].copy_from_slice(&tenant.to_le_bytes());
         s.out_buf[4..8].copy_from_slice(&session_slot.to_le_bytes());
         s.out_buf[8] = req_qos;
-        s.out_buf[9] = 0;
+        // The worker holding the session: topic_engine delivers to its
+        // port (MSG_TOPIC_MOVE re-points it when the session moves).
+        s.out_buf[9] = s.worker_id;
         s.out_buf[10..12].copy_from_slice(&(topic_len as u16).to_le_bytes());
         let src = s.in_buf.as_ptr().add(topic_off);
         s.out_buf[12 + topic_len..12 + topic_len + 8].copy_from_slice(&stream_hash.to_le_bytes());
@@ -5056,7 +5228,7 @@ unsafe fn apply_qop_pubrel(
         return;
     }
     let body_len = body_end - body_start;
-    // [packet_id:u16 BE][stream_hash:u64 LE][session_epoch:u32 LE]
+    // [packet_id:u16 BE][stream_hash:u64 LE][session_generation:u32 LE]
     //
     // The epoch is a trailing field. Entries logged before it existed
     // are 10 bytes and replay with `logged_epoch == 0`, which falls back
@@ -5099,7 +5271,7 @@ unsafe fn apply_qop_pubrel(
     let mut flow_epoch = if logged_epoch != 0 {
         logged_epoch
     } else {
-        sessions::session_epoch(&s.sessions, i)
+        sessions::generation(&s.sessions, i)
     };
     if let Some(ii) = ii {
         sessions::inflight_set_phase(&mut s.sessions, i, ii, QOS2_PUBREL);
@@ -5108,8 +5280,8 @@ unsafe fn apply_qop_pubrel(
         // not share.
         if logged_epoch == 0 {
             if let Some(v) = sessions::inflight_view(&s.sessions, i, ii) {
-                if v.session_epoch != 0 {
-                    flow_epoch = v.session_epoch;
+                if v.session_generation != 0 {
+                    flow_epoch = v.session_generation;
                 }
             }
         }
@@ -5243,7 +5415,7 @@ unsafe fn apply_qop_publish(
         s.in_buf[body_start + 9],
         s.in_buf[body_start + 10],
     ]);
-    let session_epoch = u32::from_le_bytes([
+    let session_generation = u32::from_le_bytes([
         s.in_buf[body_start + 11],
         s.in_buf[body_start + 12],
         s.in_buf[body_start + 13],
@@ -5305,7 +5477,7 @@ unsafe fn apply_qop_publish(
                 // The epoch this publish named is the one its dedupe
                 // record is keyed by, and a reconnect mid-transaction
                 // moves the session's own epoch on.
-                sessions::inflight_set_epoch(&mut s.sessions, i, ii, session_epoch);
+                sessions::inflight_set_generation(&mut s.sessions, i, ii, session_generation);
             }
         }
     }
@@ -5341,7 +5513,7 @@ unsafe fn apply_qop_publish(
             &mut dkey,
             tenant,
             stream_hash,
-            session_epoch,
+            session_generation,
             packet_id as u32,
         );
     }
@@ -5559,6 +5731,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // ── Phase 1b: SessionCtrlV1 from the anchor ──
+        worked += worker::handle_ctrl(s, sys, now);
+
         // ── Phase 2: process codec proposals (envelope-framed) ──
         //
         // Wire format on codec_in: wire envelope `[mtype:u8][len:u16 LE][payload]`
@@ -5621,6 +5796,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.hb_codec = s.hb_codec.wrapping_add(1);
                     wire::channel_read_msg(sys, s.in_codec, &mut s.in_buf)
                 };
+                // Delivery cursor: every envelope for the attachment,
+                // header included, whatever it carries. A frozen
+                // attachment (exported, not yet detached) consumes
+                // nothing — the anchor holds its records, so one that
+                // still arrives is a stale one and is dropped.
+                if plen >= 2 {
+                    let c = env_conn_id(&s.in_buf);
+                    if worker::is_frozen(&s.worker, c) {
+                        s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
+                        continue;
+                    }
+                    worker::note_in(&mut s.worker, c, wire::ENVELOPE_HDR + plen as usize);
+                }
 
                 // Transport connection-closed notice (payload `[conn_id:u16 LE]`,
                 // forwarded by any codec on socket close). Distinct from
@@ -5743,8 +5931,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     _ => wire::MQTT_REASON_MOVED,
                                 };
                                 emit_codec_response(
+                                    s,
                                     sys,
-                                    s.out_codec,
                                     conn_id,
                                     PROTO_MQTT,
                                     PKT_CONNACK,
@@ -5798,7 +5986,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 keep_alive_s.saturating_mul(1000),
                             );
                             // Propose-side admission marker; apply flips
-                            // transient→active and bumps session_epoch.
+                            // transient→active and bumps session_generation.
                             sessions::mark_transient(&mut s.sessions, i);
                             Some(i)
                         } else if let Some(i) = sessions::allocate(&mut s.sessions) {
@@ -5851,8 +6039,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             let connack_body =
                                 [if resurrecting_persisted { 1u8 } else { 0u8 }, 0u8];
                             emit_codec_response(
+                                s,
                                 sys,
-                                s.out_codec,
                                 conn_id,
                                 PROTO_MQTT,
                                 PKT_CONNACK,
@@ -6184,6 +6372,43 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // continuing to route + propose without an
                                 // inflight slot would silently downgrade the
                                 // contract to QoS 0 and break PUBACK matching.
+                                // A QoS 2 retransmission of a flow this
+                                // session already has in flight (MQTT
+                                // 3.1.1 §4.3.3): the receiver answers
+                                // PUBREC again and must not start a
+                                // second flow — a second proposal would
+                                // be a second inflight entry and a second
+                                // PUBCOMP. Before the first is durable
+                                // there is nothing to answer yet; the
+                                // original's PUBREC will cover both.
+                                if qos == 2 {
+                                    if let Some(si) = session_idx {
+                                        if let Some(ii) = sessions::inflight_find(
+                                            &s.sessions,
+                                            si,
+                                            packet_id,
+                                            INFLIGHT_PUB,
+                                        ) {
+                                            let durable =
+                                                sessions::inflight_view(&s.sessions, si, ii)
+                                                    .is_some_and(|v| v.wal_index != 0);
+                                            if durable {
+                                                emit_codec_response(
+                                                    s,
+                                                    sys,
+                                                    conn_id,
+                                                    PROTO_MQTT,
+                                                    PKT_PUBREC,
+                                                    0,
+                                                    &packet_id.to_be_bytes(),
+                                                );
+                                            }
+                                            s.qos2_dup_answered =
+                                                s.qos2_dup_answered.wrapping_add(1);
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if qos > 0 {
                                     let Some(si) = session_idx else {
                                         // No session is bound to this
@@ -6246,14 +6471,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let stream_hash = session_idx
                                     .map(|si| sessions::stream_hash(&s.sessions, si))
                                     .unwrap_or(0);
-                                let session_epoch = session_idx
-                                    .map(|si| sessions::session_epoch(&s.sessions, si))
+                                let session_generation = session_idx
+                                    .map(|si| sessions::generation(&s.sessions, si))
                                     .unwrap_or(0);
                                 let session_slot = session_idx.unwrap_or(0) as u32;
 
                                 // QOP_PUBLISH V2 op-body shape (see wire::QOP_PUBLISH):
                                 //   [pub_qos:u8][packet_id:u16 BE]
-                                //   [stream_hash:u64 LE][session_epoch:u32 LE]
+                                //   [stream_hash:u64 LE][session_generation:u32 LE]
                                 //   [retain:u8][topic_len:u16 BE][topic]
                                 //   [user_props_count:u8][per prop ...]
                                 //   [payload]
@@ -6367,7 +6592,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 s.out_buf[off + 3..off + 11]
                                     .copy_from_slice(&stream_hash.to_le_bytes());
                                 s.out_buf[off + 11..off + 15]
-                                    .copy_from_slice(&session_epoch.to_le_bytes());
+                                    .copy_from_slice(&session_generation.to_le_bytes());
                                 s.out_buf[off + 15] = retain as u8;
                                 s.out_buf[off + 16..off + 18]
                                     .copy_from_slice(&(topic_len as u16).to_be_bytes());
@@ -6549,13 +6774,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 suback[0..2].copy_from_slice(&packet_id.to_be_bytes());
                                 suback[2] = req_qos;
                                 emit_codec_response(
-                                    sys,
-                                    s.out_codec,
-                                    conn_id,
-                                    PROTO_MQTT,
-                                    PKT_SUBACK,
-                                    0,
-                                    &suback,
+                                    s, sys, conn_id, PROTO_MQTT, PKT_SUBACK, 0, &suback,
                                 );
                             }
 
@@ -6619,8 +6838,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let mut unsuback = [0u8; 2];
                                 unsuback.copy_from_slice(&packet_id.to_be_bytes());
                                 emit_codec_response(
+                                    s,
                                     sys,
-                                    s.out_codec,
                                     conn_id,
                                     PROTO_MQTT,
                                     PKT_UNSUBACK,
@@ -6656,12 +6875,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                             let mut pubrel = [0u8; 2];
                                             pubrel.copy_from_slice(&packet_id.to_be_bytes());
                                             emit_codec_response(
-                                                sys,
-                                                s.out_codec,
-                                                conn_id,
-                                                PROTO_MQTT,
-                                                PKT_PUBREL,
-                                                0x02,
+                                                s, sys, conn_id, PROTO_MQTT, PKT_PUBREL, 0x02,
                                                 &pubrel,
                                             );
                                         }
@@ -6725,6 +6939,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     inflight_ii,
                                     QOS2_PUBREL,
                                 );
+                                // The PUBREL's own registration names the
+                                // flow from here: until it is assigned,
+                                // no completion — the PUBLISH's late one
+                                // above all — may read as the PUBCOMP.
+                                sessions::inflight_set_wal_index(
+                                    &mut s.sessions,
+                                    si,
+                                    inflight_ii,
+                                    0,
+                                    0,
+                                );
                                 let inflight_idx = Some(inflight_ii);
 
                                 let tenant = sessions::tenant(&s.sessions, si);
@@ -6756,7 +6981,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
                                 // QOP_PUBREL body:
                                 //   [packet_id:u16 BE][stream_hash:u64 LE]
-                                //   [session_epoch:u32 LE]
+                                //   [session_generation:u32 LE]
                                 let qbody_len = 2 + 8 + 4;
                                 let prop_total = wire::QPROP_TAGGED_HDR_LEN + qbody_len;
                                 let mut emit_ok = false;
@@ -6782,10 +7007,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         session_slot as usize,
                                         inflight_ii,
                                     )
-                                    .map(|v| v.session_epoch)
+                                    .map(|v| v.session_generation)
                                     .filter(|e| *e != 0)
                                     .unwrap_or_else(|| {
-                                        sessions::session_epoch(&s.sessions, session_slot as usize)
+                                        sessions::generation(&s.sessions, session_slot as usize)
                                     });
                                     s.out_buf[off + 10..off + 14]
                                         .copy_from_slice(&flow_epoch.to_le_bytes());
@@ -7102,7 +7327,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 dev_log(sys, 2, b"[sess] cp forward refused".as_ptr(), 25);
                             }
                         }
-                        if let Some(p) = peeled {
+                        if let Some(p) = peeled.filter(|p| entry_is_mine(s, p.session_slot)) {
                             let body_start = wire::COMMITTED_ENTRY_HDR + p.op_body_offset;
                             // The index of the entry being applied RIGHT
                             // NOW. `apply_index` is the last COMPLETED
@@ -7170,7 +7395,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // distinguishes them when MSG_ACK_EMIT later fires for
                     // the same (session_slot, packet_id) tuple. The epoch
                     // pins the completion to this session generation.
-                    let reg_epoch = sessions::session_epoch(&s.sessions, session_slot as usize);
+                    let reg_epoch = sessions::generation(&s.sessions, session_slot as usize);
                     let mut reg = [0u8; wire::ACK_REGISTER_LEN];
                     reg[0..4].copy_from_slice(&session_slot.to_le_bytes());
                     reg[4..8].copy_from_slice(&(packet_id as u32).to_le_bytes());
@@ -7187,7 +7412,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         if let Some(ii) =
                             sessions::inflight_find(&s.sessions, ssize, packet_id, INFLIGHT_PUB)
                         {
-                            sessions::inflight_set_wal_index(&mut s.sessions, ssize, ii, wal_index);
+                            sessions::inflight_set_wal_index(
+                                &mut s.sessions,
+                                ssize,
+                                ii,
+                                partition_id,
+                                wal_index,
+                            );
                         }
                     }
                     // NOTE: `wal_index` is NOT the produce's
@@ -7363,14 +7594,18 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // the flow this answers is gone; drop it. Epoch 0 is a
                 // registration made before the session had one and is
                 // not matched against.
+                let mut ack_wal: u64 = 0;
                 if (plen as usize) >= wire::ACK_EMIT_LEN {
                     let emit_epoch =
                         u32::from_le_bytes([s.in_buf[8], s.in_buf[9], s.in_buf[10], s.in_buf[11]]);
-                    let live_epoch = sessions::session_epoch(&s.sessions, session_slot);
+                    let live_epoch = sessions::generation(&s.sessions, session_slot);
                     if emit_epoch != 0 && emit_epoch != live_epoch {
                         s.acks_stale_epoch = s.acks_stale_epoch.wrapping_add(1);
                         continue;
                     }
+                    let mut w = [0u8; 8];
+                    w.copy_from_slice(&s.in_buf[12..20]);
+                    ack_wal = u64::from_le_bytes(w);
                 }
 
                 match mt {
@@ -7388,6 +7623,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             continue;
                         }
                         let conn_id = sessions::conn_id(&s.sessions, session_slot);
+                        // Completions reach every worker on the node. One
+                        // for a session this worker has imported but not
+                        // resumed belongs to the exporter's copy of the
+                        // flow: touching the imported ledger here would
+                        // release an inflight whose completion the
+                        // client never saw (it is re-registered on RESUME).
+                        if worker::phase(&s.worker, conn_id) == worker::Phase::Imported {
+                            continue;
+                        }
                         let Some(ii) = sessions::inflight_find(
                             &s.sessions,
                             session_slot,
@@ -7400,6 +7644,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let qos = iv.map(|v| v.qos).unwrap_or(0);
                         let phase = iv.map(|v| v.phase).unwrap_or(0);
                         let correlation_id = iv.map(|v| v.correlation_id).unwrap_or(0);
+                        let inflight_wal = iv.map(|v| v.wal_index).unwrap_or(0);
+                        // The completion must answer THIS registration:
+                        // a QoS 2 flow's PUBLISH completion landing after
+                        // its PUBREL was proposed is not the PUBREL's.
+                        let awaiting_pubrel_assignment =
+                            qos == 2 && phase == QOS2_PUBREL && inflight_wal == 0;
+                        if ack_wal != 0 && (ack_wal != inflight_wal || awaiting_pubrel_assignment) {
+                            s.acks_stale_epoch = s.acks_stale_epoch.wrapping_add(1);
+                            continue;
+                        }
 
                         // Stash bookkeeping for PUBLISH ops — mark durable
                         // and finalise if dedup already resolved.
@@ -7439,38 +7693,30 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             );
                             dev_log(sys, 3, line.as_ptr(), pos);
                         }
+                        // An exported session's copy of the flow: the
+                        // stash above was this worker's to finalise, the
+                        // client-facing ledger is now the importer's.
+                        if worker::is_frozen(&s.worker, conn_id) {
+                            continue;
+                        }
                         let body = packet_id.to_be_bytes();
                         if qos == 1 {
                             sessions::inflight_release(&mut s.sessions, session_slot, ii);
-                            emit_codec_response(
-                                sys,
-                                s.out_codec,
-                                conn_id,
-                                PROTO_MQTT,
-                                PKT_PUBACK,
-                                0,
-                                &body,
-                            );
+                            emit_codec_response(s, sys, conn_id, PROTO_MQTT, PKT_PUBACK, 0, &body);
                         } else if qos == 2 {
                             if phase == QOS2_PUBLISH {
                                 // PUBLISH commit landed; emit PUBREC and
                                 // keep inflight alive to await PUBREL.
                                 emit_codec_response(
-                                    sys,
-                                    s.out_codec,
-                                    conn_id,
-                                    PROTO_MQTT,
-                                    PKT_PUBREC,
-                                    0,
-                                    &body,
+                                    s, sys, conn_id, PROTO_MQTT, PKT_PUBREC, 0, &body,
                                 );
                             } else if phase == QOS2_PUBREL {
                                 // PUBREL commit landed; emit PUBCOMP and
                                 // release the publisher inflight.
                                 sessions::inflight_release(&mut s.sessions, session_slot, ii);
                                 emit_codec_response(
+                                    s,
                                     sys,
-                                    s.out_codec,
                                     conn_id,
                                     PROTO_MQTT,
                                     PKT_PUBCOMP,
@@ -7529,10 +7775,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     .copy_from_slice(&stream_hash.to_le_bytes());
                                 let flow_epoch =
                                     sessions::inflight_view(&s.sessions, session_slot, ii)
-                                        .map(|v| v.session_epoch)
+                                        .map(|v| v.session_generation)
                                         .filter(|e| *e != 0)
                                         .unwrap_or_else(|| {
-                                            sessions::session_epoch(&s.sessions, session_slot)
+                                            sessions::generation(&s.sessions, session_slot)
                                         });
                                 s.out_buf[off + 10..off + 14]
                                     .copy_from_slice(&flow_epoch.to_le_bytes());
@@ -7814,7 +8060,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let dst_payload = buf.as_mut_ptr().add(14 + topic_len + 1);
                         core::ptr::copy_nonoverlapping(src_payload, dst_payload, payload_len);
 
-                        match try_deliver(s, sys, &buf[..dlv_total]) {
+                        match try_deliver_reply(s, sys, &buf[..dlv_total]) {
                             DeliverResult::Delivered | DeliverResult::Dropped => {}
                             DeliverResult::Backpressured => {
                                 if !correlate::dlv_park(&mut s.correlate, &buf[..dlv_total]) {
@@ -7843,7 +8089,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let src = s.in_buf.as_ptr().add(6);
                         let dst = buf.as_mut_ptr();
                         core::ptr::copy_nonoverlapping(src, dst, env_len);
-                        match try_deliver(s, sys, &buf[..env_len]) {
+                        match try_deliver_reply(s, sys, &buf[..env_len]) {
                             DeliverResult::Delivered | DeliverResult::Dropped => {}
                             DeliverResult::Backpressured => {
                                 if !correlate::dlv_park(&mut s.correlate, &buf[..env_len]) {
@@ -7856,12 +8102,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
-        // The other inputs (in_cp, etc.) are still pure no-ops.
-        // `cp_in` carries the control plane's placement. It was drained
-        // and discarded, so this module had no idea which shards it
-        // owned — the gap W9 has to close before per-shard state can be
-        // handed over on a migration. Parsing is the shared core's, so
-        // this module and `topic_engine` cannot read one frame two ways.
+        // `cp_in` carries the control plane's placement: which shards
+        // this node serves, and the fence while one is moving. Parsing
+        // is the shared core's, so this module and `topic_engine`
+        // cannot read one frame two ways.
         if s.in_cp >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.in_cp, 0x01);
@@ -7958,7 +8202,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // per version and drops it for 3.1.1,
                                 // which has no server DISCONNECT.
                                 if let Some(conn_id) = conn {
-                                    emit_codec_response(
+                                    emit_codec_response_raw(
                                         sys,
                                         out_codec,
                                         conn_id,
@@ -8154,7 +8398,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // applied — plus the refusals and holds along the way.
         if now.wrapping_sub(s.last_hb_ms) >= 1000 {
             s.last_hb_ms = now;
-            let mut line = [0u8; 224];
+            let mut line = [0u8; 288];
             let mut pos = 0usize;
             for (label, v) in [
                 (&b"[sess] hb codec="[..], s.hb_codec),
@@ -8178,6 +8422,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" cpref="[..], s.cp_refused),
                 (&b" pheld="[..], s.proposals_held),
                 (&b" dedupref="[..], s.dedup_refused_delivered),
+                (&b" dedupdup="[..], s.dedup_duplicates),
+                (&b" hexp="[..], s.worker.exported),
+                (&b" himp="[..], s.worker.imported),
+                (&b" hres="[..], s.worker.resumed),
+                (&b" href="[..], s.worker.refused),
+                (&b" hfull="[..], s.worker.busy_overflow),
             ] {
                 for &b in label {
                     line[pos] = b;
@@ -8236,6 +8486,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 correlate::count_overdue(&s.correlate, now, CORRELATION_TIMEOUT_MS);
             for i in 0..MAX_SESSIONS {
                 if !sessions::is_active(&s.sessions, i) {
+                    continue;
+                }
+                // A session mid-handoff is exempt: the silence is the
+                // anchor's hold, not the client's.
+                if worker::is_held(&s.worker, sessions::conn_id(&s.sessions, i)) {
                     continue;
                 }
                 let kalive = sessions::view(&s.sessions, i)
@@ -8360,6 +8615,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 sessions::clear_will(&mut s.sessions, i);
             }
         }
+
+        // ── Phase 5f: handoff drains — declare DRAINED and export the
+        // attachments that reached quiescence this step.
+        worker::step(s, sys, now);
 
         // ── Phase 6: metrics (wire envelope) ──
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 && s.out_metrics >= 0 {

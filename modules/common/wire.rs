@@ -271,6 +271,13 @@ pub const MSG_TOPIC_FORWARD: u8 = 0xAB;
 /// subscriptions still keyed to the now-defunct slot; otherwise a future
 /// client reusing the slot would inherit them.
 pub const MSG_SESSION_DROP: u8 = 0xAD;
+/// Session moved to another worker on this node. Body:
+/// `[session_slot:u32 LE][worker:u8]`. The slot keeps its number across
+/// an anchor-preserved handoff; only the worker that delivers to it
+/// changes, so topic_engine re-points every subscription anchored to
+/// the slot at that worker's delivery port. Emitted by the IMPORTING
+/// worker once the record is committed, before it resumes.
+pub const MSG_TOPIC_MOVE: u8 = 0xAE;
 
 // Messaging infrastructure
 pub const MSG_OFFLINE_ENQUEUE: u8 = 0xB0;
@@ -330,18 +337,27 @@ pub const MSG_DELIVERY_LAG: u8 = 0xC5;
 
 /// MSG_ACK_REGISTER body:
 /// `[session_slot:u32 LE][message_id:u32 LE][partition_id:u16 LE]
-///  [wal_index:u64 LE][session_epoch:u32 LE]`.
+///  [wal_index:u64 LE][session_generation:u32 LE]`.
 ///
-/// The epoch names the session generation the publish was accepted
-/// under. It travels back on MSG_ACK_EMIT so a completion arriving
+/// The generation names the session incarnation the publish was
+/// accepted under. It travels back on MSG_ACK_EMIT so a completion arriving
 /// after the slot has been reused for a different client is discarded
 /// rather than matched on `(session_slot, message_id)` alone — MQTT
 /// packet ids are client-chosen and collide freely across sessions.
 pub const ACK_REGISTER_LEN: usize = 22;
 
 /// MSG_ACK_EMIT body:
-/// `[session_slot:u32 LE][message_id:u32 LE][session_epoch:u32 LE]`.
-pub const ACK_EMIT_LEN: usize = 12;
+/// `[session_slot:u32 LE][message_id:u32 LE][session_generation:u32 LE]
+///  [wal_index:u64 LE]`.
+///
+/// `wal_index` names the registration this completion answers. A QoS 2
+/// flow registers twice under one `(session_slot, packet_id)` — its
+/// PUBLISH and its PUBREL — and a session that moved between workers
+/// may hold a registration made by each; the phase alone cannot tell a
+/// late PUBLISH completion from the PUBREL's, and reading one as the
+/// other is a PUBCOMP too many. The consumer matches it against the
+/// inflight's own `wal_index`.
+pub const ACK_EMIT_LEN: usize = 20;
 
 // Control plane (Quantum-specific)
 pub const MSG_TENANT_RECORD: u8 = 0xD0;
@@ -550,12 +566,18 @@ pub fn decode_durability_proof(buf: &[u8]) -> (u16, u64, u64, u8) {
     (partition_id, term, index, replica)
 }
 
-/// DedupKey: (tenant_id: u32, stream_hash: u64, session_epoch: u32, message_id: u32) = 20 bytes.
+/// DedupKey: (tenant_id: u32, stream_hash: u64, session_generation: u32, message_id: u32) = 20 bytes.
 #[inline]
-pub fn encode_dedup_key(buf: &mut [u8], tenant: u32, stream_hash: u64, epoch: u32, msg_id: u32) {
+pub fn encode_dedup_key(
+    buf: &mut [u8],
+    tenant: u32,
+    stream_hash: u64,
+    generation: u32,
+    msg_id: u32,
+) {
     buf[0..4].copy_from_slice(&tenant.to_le_bytes());
     buf[4..12].copy_from_slice(&stream_hash.to_le_bytes());
-    buf[12..16].copy_from_slice(&epoch.to_le_bytes());
+    buf[12..16].copy_from_slice(&generation.to_le_bytes());
     buf[16..20].copy_from_slice(&msg_id.to_le_bytes());
 }
 
@@ -921,12 +943,12 @@ pub const QOP_CONNECT: u8 = 0x01;
 /// Op-body: `[reason:u8][stream_hash:u64 LE]` (see `QDISC_REASON_*`).
 pub const QOP_DISCONNECT: u8 = 0x02;
 
-/// PUBLISH: protocol-neutral publish. The `stream_hash + session_epoch`
+/// PUBLISH: protocol-neutral publish. The `stream_hash + session_generation`
 /// fields key the apply-side dedup decision without needing the
 /// propose-side session table to exist on the follower.
 ///
 /// V1 op-body: `[pub_qos:u8][packet_id:u16 BE][stream_hash:u64 LE]
-///              [session_epoch:u32 LE][retain:u8][topic_len:u16 BE]
+///              [session_generation:u32 LE][retain:u8][topic_len:u16 BE]
 ///              [topic][payload]`.
 ///
 /// V2 op-body adds an MQTT 5 User Property block between `topic` and
@@ -934,7 +956,7 @@ pub const QOP_DISCONNECT: u8 = 0x02;
 /// extending to end, so the block must sit before payload):
 ///
 ///   `[pub_qos:u8][packet_id:u16 BE][stream_hash:u64 LE]
-///    [session_epoch:u32 LE][retain:u8][topic_len:u16 BE][topic]
+///    [session_generation:u32 LE][retain:u8][topic_len:u16 BE][topic]
 ///    [user_props_count:u8]
 ///    [for each prop: key_len:u16 BE, key, val_len:u16 BE, val]
 ///    [payload]`

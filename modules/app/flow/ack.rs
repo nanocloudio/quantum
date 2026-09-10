@@ -42,7 +42,7 @@ struct InflightEntry {
     message_id: u32,
     /// Session generation the publish was accepted under; carried back
     /// on MSG_ACK_EMIT so a completion cannot land on a reused slot.
-    session_epoch: u32,
+    session_generation: u32,
     partition_id: u16,
     wal_index: u64,
     sent_ms: u64,
@@ -56,7 +56,7 @@ impl InflightEntry {
         Self {
             session_slot: 0,
             message_id: 0,
-            session_epoch: 0,
+            session_generation: 0,
             partition_id: 0,
             wal_index: 0,
             sent_ms: 0,
@@ -164,7 +164,8 @@ pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) -> bool {
         payload[16],
         payload[17],
     ]);
-    let session_epoch = u32::from_le_bytes([payload[18], payload[19], payload[20], payload[21]]);
+    let session_generation =
+        u32::from_le_bytes([payload[18], payload[19], payload[20], payload[21]]);
     if (partition_id as usize) >= MAX_PARTITIONS {
         return false;
     }
@@ -181,7 +182,7 @@ pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) -> bool {
             a.entries[i] = InflightEntry {
                 session_slot,
                 message_id,
-                session_epoch,
+                session_generation,
                 partition_id,
                 wal_index,
                 sent_ms: now,
@@ -234,7 +235,8 @@ pub unsafe fn step_acks(a: &mut Ack, sys: &SyscallTable) {
         let mut ack = [0u8; wire::ACK_EMIT_LEN];
         ack[0..4].copy_from_slice(&a.entries[i].session_slot.to_le_bytes());
         ack[4..8].copy_from_slice(&a.entries[i].message_id.to_le_bytes());
-        ack[8..12].copy_from_slice(&a.entries[i].session_epoch.to_le_bytes());
+        ack[8..12].copy_from_slice(&a.entries[i].session_generation.to_le_bytes());
+        ack[12..20].copy_from_slice(&a.entries[i].wal_index.to_le_bytes());
         if a.out_ack >= 0 {
             // The entry is released only once the ACK is provably on the
             // channel. `channel_poll` reports writability, not success —

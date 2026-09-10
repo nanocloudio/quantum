@@ -69,6 +69,20 @@ pub mod kafka_metadata {
     include!("../../../modules/common/cores/kafka_metadata_core.rs");
 }
 
+/// Session identity: Fluxor `session_id` minting and the rule that keeps
+/// Quantum's `session_generation` and Fluxor's `session_epoch` from
+/// diverging.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod session_identity {
+    include!("../../../modules/common/cores/session_identity_core.rs");
+}
+
 #[cfg(test)]
 mod edge_routing_tests;
 #[cfg(test)]
@@ -79,3 +93,5 @@ mod kafka_idem_tests;
 mod kafka_log_tests;
 #[cfg(test)]
 mod kafka_metadata_tests;
+#[cfg(test)]
+mod session_identity_tests;

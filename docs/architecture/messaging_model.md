@@ -19,9 +19,9 @@ sits on top.
 | **CP-Raft** | Control Plane Raft cluster holding tenant manifests, routing epochs, quotas, PKI bundles, feature gates, and durability proofs. |
 | **Protocol adapter** | Module that maps a wire protocol onto session-processor APIs and Clustor durability primitives. Quantum ships three: `protocol`'s mqtt component, `protocol`'s kafka component, `protocol`'s amqp component. |
 | **Session Processor** | Messaging state machine (the `session_processor` module). Handles connection binding, QoS / ack handshakes, inflight replay, offline queues, protocol reason codes. Plugs into Clustor's `consensus` apply path. |
-| **session_epoch** | Monotone counter per `(tenant_id, stream_id)` fencing session state; increments on clean reconnect or fenced takeover. |
+| **session_generation** | Monotone counter per `(tenant_id, stream_id)` fencing session state; increments on clean reconnect or fenced takeover. |
 | **stream_id** | Protocol-defined logical stream identifier (MQTT `client_id`, Kafka producer ID, AMQP container ID). |
-| **dedupe entry** | `(tenant_id, stream_id, session_epoch, message_id)` map rejecting duplicates until the dedupe TTL expires. Owned by `messaging`'s dedup component. |
+| **dedupe entry** | `(tenant_id, stream_id, session_generation, message_id)` map rejecting duplicates until the dedupe TTL expires. Owned by `messaging`'s dedup component. |
 | **offline queue** | Persistent FIFO storing durable deliveries for disconnected or throttled sessions. Owned by `messaging`'s offline component. |
 | **dirty_epoch** | Routing-epoch mismatch condition; adapters map it to protocol-specific outcomes (reject, disconnect, retry). |
 
@@ -45,7 +45,7 @@ bounded. The TTLs are module constants, not graph parameters.
 session_record {
     tenant_id
     stream_id
-    session_epoch
+    session_generation
     connected_at
     keep_alive_ms?
     protocol_state          // adapter-specific

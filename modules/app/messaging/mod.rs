@@ -17,10 +17,20 @@
 //! types multiplexed by `msg_type`, and `result_out` carries all three
 //! reply types back.
 //!
+//! A node running an anchor-preserved handoff pair
+//! (docs/architecture/session_continuity.md) has two session workers
+//! sharing this module, so there is a bus per worker: `op_in2` /
+//! `result_out2` for worker 1. A reply always goes back on the port of
+//! the bus that carried the request, which is what keeps the two
+//! workers from both acting on one answer. Both are unwired on a
+//! one-worker node.
+//!
 //! ## Dispatch table
 //!
-//! One drain of `op_in` per step, at most [`OP_BUDGET`] records, demuxed
-//! by frame type. Per-component budgets below are the components' own
+//! One drain of each worker bus per step, at most [`OP_BUDGET`] records
+//! from each, demuxed by frame type. The per-component budgets below
+//! are shared across the two buses, so the module's per-step work is
+//! bounded whatever the worker split is. Per-component budgets below are the components' own
 //! declared per-step bounds; a record whose budget is exhausted is left
 //! on the ring for the next step, and the drain stops so ordering within
 //! a type is preserved.
@@ -119,6 +129,13 @@ const METRIC_BYTES: usize = 36;
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_op: i32,
+    /// Session worker 1's op bus and its replies (`op_in2` /
+    /// `result_out2`). A reply goes back to the worker that asked, so
+    /// two workers sharing this module never both act on one. Unwired
+    /// on a one-worker node.
+    in_op2: i32,
+    out_result: i32,
+    out_result2: i32,
     out_metrics: i32,
     last_metrics_ms: u64,
 
@@ -191,6 +208,10 @@ pub unsafe extern "C" fn module_new(
         s.syscalls = sys;
         s.in_op = in_chan;
         s.out_metrics = dev_channel_port(sys, 1, 1);
+        // Declared last in the manifest: in[1] / out[2].
+        s.in_op2 = dev_channel_port(sys, 0, 1);
+        s.out_result = out_chan;
+        s.out_result2 = dev_channel_port(sys, 1, 2);
         s.last_metrics_ms = 0;
 
         dedup::init(&mut s.dedup);
@@ -271,7 +292,25 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let mut reads = 0u8;
         let mut worked = 0u32;
 
-        if s.in_op >= 0 {
+        // One drain per worker bus. A component answers on the result
+        // port of the bus the request came in on, so two workers
+        // sharing this module never both act on one reply.
+        //
+        // The per-type budgets are declared once and spent across both
+        // buses, which bounds the module's step rather than each
+        // worker's. Worker 0's bus is drained first and can therefore
+        // spend the step's budget before worker 1's is polled; the
+        // budgets refill every step, so this is an ordering preference
+        // under saturation, not starvation. It also matches the shape
+        // of a handoff pair, where the busy worker and the standby
+        // trade places rather than run hot together.
+        for (in_chan, out_chan) in [(s.in_op, s.out_result), (s.in_op2, s.out_result2)] {
+            if in_chan < 0 || out_chan < 0 {
+                continue;
+            }
+            s.dedup.out_result = out_chan;
+            s.offline.out_drain = out_chan;
+            s.retained.out_read = out_chan;
             for _ in 0..OP_BUDGET {
                 // Every budget decision precedes consumption. A record's
                 // type is not known until it is read, so once ANY
@@ -287,11 +326,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 {
                     break;
                 }
-                let poll = (sys.channel_poll)(s.in_op, 0x01);
+                let poll = (sys.channel_poll)(in_chan, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
                 }
-                let (mt, plen) = wire::channel_read_msg(sys, s.in_op, &mut s.buf);
+                let (mt, plen) = wire::channel_read_msg(sys, in_chan, &mut s.buf);
                 let plen = plen as usize;
                 if plen > s.buf.len() {
                     continue;
@@ -360,6 +399,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
+        // Leave the reply ports on worker 0 rather than on whichever
+        // bus drained last. The sweeps below emit nothing, so this
+        // costs nothing today and keeps a future emitter outside the
+        // loop from inheriting an arbitrary worker's port.
+        s.dedup.out_result = s.out_result;
+        s.offline.out_drain = s.out_result;
+        s.retained.out_read = s.out_result;
 
         // ── 7-8: periodic sweeps ─────────────────────────────────────
         dedup::step(&mut s.dedup, now);

@@ -24,6 +24,11 @@ hardware_targets = ["bcm2712"]
 
 permissions = []
 
+# Transport-anchor role (docs/architecture/session_continuity.md): this
+# module owns the client-visible attachment and moves the session worker
+# behind it. Consumed by the `continuity` config block validator.
+capabilities = ["transport.anchor.stream"]
+
 [[variant]]
 name = "full"
 features = ["mqtt", "kafka", "amqp"]
@@ -108,4 +113,66 @@ metrics = [
 [[ports]]
 name = "leader_state"
 direction = "input"
+content_type = "OctetStream"
+
+# ── Session continuity (docs/architecture/session_continuity.md) ─────
+#
+# SessionCtrlV1 sideband to worker 0 (`session_processor`), and the
+# second worker's full set for an anchor-preserved handoff pair:
+# `proposals2_out` / `responses2_in` carry the same envelopes as
+# `proposals_out` / `responses_in`, to and from the standby. Every port
+# is inert until wired — an instance with `ctrl_out` unwired anchors
+# nothing and serves the plain seam. Declared last: the index is the
+# ABI. Inputs [3] ctrl_in [4] ctrl2_in [5] responses2_in [6] dir_in;
+# outputs [3] ctrl_out [4] ctrl2_out [5] proposals2_out [6] dir_out.
+[[ports]]
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl2_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "responses2_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl2_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "proposals2_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Session directory (clustor `session_directory`): the anchor mirrors
+# every binding — BIND on attach, EPOCH_BUMP + BIND on a swap, UNBIND on
+# close — as MSG_SR_REQUEST and reads the quorum-committed verdicts. A
+# refusal as stale is the fencing signal. Optional.
+[[ports]]
+name = "dir_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "dir_out"
+direction = "output"
 content_type = "OctetStream"

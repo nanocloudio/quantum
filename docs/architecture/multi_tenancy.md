@@ -21,7 +21,7 @@ Every resource is scoped to a tenant:
 |---|---|
 | Topics / queues / partitions | `(tenant_id, name)` — no cross-tenant name collisions, no cross-tenant addressability. |
 | Sessions | `(tenant_id, client_id)` — `session_processor` rejects connects whose presented identity does not match the cert-derived tenant. |
-| Dedupe entries | `(tenant_id, stream_id, session_epoch, message_id)` — see [messaging_model.md](messaging_model.md). |
+| Dedupe entries | `(tenant_id, stream_id, session_generation, message_id)` — see [messaging_model.md](messaging_model.md). |
 | PRGs | One ring per tenant; `tenant_prg_count` is set in the tenant record. |
 | Certificates | Per-tenant trust bundle stored in CP-Raft. |
 | ACLs / RBAC | Per-tenant policy bundle. |

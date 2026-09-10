@@ -98,6 +98,11 @@ struct Subscription {
     qos: u8,
     shared_group_id: u16, // 0 = not shared
     remote_prg: u16,      // 0 = local, >0 = cross-PRG
+    /// Which session worker on this node delivers to the slot: 0 on
+    /// `deliver_out`, 1 on `deliver_out2`. Set from the subscribe
+    /// record's worker byte and re-pointed by `MSG_TOPIC_MOVE` when
+    /// the session moves in an anchor-preserved handoff.
+    worker: u8,
     active: u8,
 }
 
@@ -112,6 +117,7 @@ impl Subscription {
             qos: 0,
             shared_group_id: 0,
             remote_prg: 0,
+            worker: 0,
             active: 0,
         }
     }
@@ -147,6 +153,12 @@ struct ModuleState {
     in_op: i32,
     out_deliver: i32,
     out_metrics: i32,
+    /// Deliveries for subscriptions held by session worker 1 (the
+    /// standby of a handoff pair). Unwired (-1) on a one-worker node,
+    /// where every delivery goes to `deliver_out`.
+    out_deliver2: i32,
+    /// Subscriptions re-pointed by `MSG_TOPIC_MOVE`.
+    moves: u32,
 
     /// This node's placement: local PRG, epoch, PRG count and the
     /// migration fence. Held as the shared `EdgeMap` rather than as
@@ -552,18 +564,22 @@ unsafe fn deliver_match(
     s.out_buf[5..8].fill(0);
     s.out_buf[8..12].copy_from_slice(&s.buf[0..4]);
     s.out_buf[12..total].copy_from_slice(&s.buf[6..plen]);
-    if s.out_deliver >= 0 {
+    // The port is the subscriber's worker's; a second worker's port that
+    // is not wired falls back to the first, which is the one-worker
+    // graph's behaviour exactly.
+    let out_chan = if s.subs[i].worker != 0 && s.out_deliver2 >= 0 {
+        s.out_deliver2
+    } else {
+        s.out_deliver
+    };
+    if out_chan >= 0 {
         // Skip the pre-write channel_poll: it races with the downstream
         // drain and silently drops deliveries when poll says full but
         // write would have succeeded. Use the write result directly;
         // failure here counts as a real backpressure event the operator
         // should see.
-        let written = wire::channel_write_msg(
-            sys,
-            s.out_deliver,
-            wire::MSG_TOPIC_DELIVER,
-            &s.out_buf[..total],
-        );
+        let written =
+            wire::channel_write_msg(sys, out_chan, wire::MSG_TOPIC_DELIVER, &s.out_buf[..total]);
         let expected = (wire::ENVELOPE_HDR + total) as i32;
         if written == expected {
             s.deliveries = s.deliveries.wrapping_add(1);
@@ -622,6 +638,9 @@ pub unsafe extern "C" fn module_new(
         s.in_op = in_chan;
         s.out_deliver = out_chan;
         s.out_metrics = dev_channel_port(sys, 1, 1);
+        // Declared LAST in the manifest so nothing above renumbers.
+        s.out_deliver2 = dev_channel_port(sys, 1, 2);
+        s.moves = 0;
         s.view = edge::EdgeMap::new(0, 0);
         s.routing_fenced = 0;
         s.routing_stale = 0;
@@ -686,7 +705,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let tenant = u32::from_le_bytes([s.buf[0], s.buf[1], s.buf[2], s.buf[3]]);
                     let session = u32::from_le_bytes([s.buf[4], s.buf[5], s.buf[6], s.buf[7]]);
                     let qos = s.buf[8];
-                    let _shared_flag = s.buf[9];
+                    // The worker that holds the subscriber's session.
+                    let worker = s.buf[9];
                     let pat_len = u16::from_le_bytes([s.buf[10], s.buf[11]]) as usize;
                     if 12 + pat_len > plen || pat_len > MAX_TOPIC {
                         continue;
@@ -735,6 +755,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.subs[i].qos = qos;
                     s.subs[i].shared_group_id = group_id;
                     s.subs[i].remote_prg = remote_prg;
+                    s.subs[i].worker = worker;
                     s.subs[i].pattern_len = effective_len as u16;
                     s.subs[i].pattern[..effective_len].copy_from_slice(effective_pat);
                     s.subs[i].active = 1;
@@ -964,6 +985,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 {
                                     remove_shared_member(&mut s.shared, tenant, group_id, slot);
                                 }
+                            }
+                        }
+                    }
+                } else if mt == wire::MSG_TOPIC_MOVE {
+                    // Body: [session_slot:u32 LE][worker:u8]. The session
+                    // kept its slot number and changed worker; every
+                    // subscription anchored to the slot now delivers on
+                    // that worker's port. Nothing else about the
+                    // subscription changes, so a publish matched during
+                    // the move is delivered exactly once — to whichever
+                    // worker the slot pointed at when it was matched.
+                    if plen >= 5 {
+                        let slot = u32::from_le_bytes([s.buf[0], s.buf[1], s.buf[2], s.buf[3]]);
+                        let worker = s.buf[4];
+                        for i in 0..MAX_SUBS {
+                            if s.subs[i].active == 1 && s.subs[i].session_slot == slot {
+                                s.subs[i].worker = worker;
+                                s.moves = s.moves.wrapping_add(1);
                             }
                         }
                     }

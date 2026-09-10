@@ -147,7 +147,10 @@ impl AConn {
 
 #[repr(C)]
 pub struct Amqp {
-    pub out_proposals: i32,
+    /// The composite's anchor: every proposal goes through it
+    /// ([`forward`]), which is what binds the connection to a session
+    /// worker and holds it across a handoff.
+    pub anchor: *mut super::anchor::Anchor,
     pub out_frames: i32,
 
     frames_decoded: u32,
@@ -168,6 +171,23 @@ pub struct Amqp {
 
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
+/// Hand a staged envelope to the anchor, which forwards it to the
+/// worker the connection is bound to or holds it across a handoff.
+/// `false` only when the live worker's channel refused it.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+#[inline]
+unsafe fn forward(
+    anchor: *mut super::anchor::Anchor,
+    sys: &SyscallTable,
+    mt: u8,
+    payload: &[u8],
+) -> bool {
+    !anchor.is_null() && super::anchor::forward_env(&mut *anchor, sys, mt, payload)
+}
+
 pub fn init(s: &mut Amqp) {
     for c in s.conns.iter_mut() {
         *c = AConn::zero();
@@ -484,9 +504,12 @@ unsafe fn forward_publish(
         body_len,
     );
     s.conns[ci].pending[pi].state = P_NONE;
-    let out = s.out_proposals;
-    let w = wire::channel_write_msg(sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..env_len]);
-    if w > 0 {
+    if forward(
+        s.anchor,
+        sys,
+        wire::MSG_SESSION_PROPOSAL,
+        &s.scratch[..env_len],
+    ) {
         s.publishes_forwarded = s.publishes_forwarded.wrapping_add(1);
     } else {
         // codec_in saturated — drop; publisher retries / times out.
@@ -674,10 +697,12 @@ unsafe fn handle_method(
             let qb = 19 + tag_len;
             s.scratch[qb..qb + 2].copy_from_slice(&(ql as u16).to_le_bytes());
             s.scratch[qb + 2..qb + 2 + ql].copy_from_slice(&a[qo..qo + ql]);
-            let out = s.out_proposals;
-            let w =
-                wire::channel_write_msg(sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..total]);
-            if w > 0 {
+            if forward(
+                s.anchor,
+                sys,
+                wire::MSG_SESSION_PROPOSAL,
+                &s.scratch[..total],
+            ) {
                 s.consumes_started = s.consumes_started.wrapping_add(1);
             }
         }
@@ -706,14 +731,12 @@ unsafe fn handle_method(
             put_prefix(s, conn_id, OP_CANCEL, channel, 0);
             s.scratch[14..16].copy_from_slice(&(tl as u16).to_le_bytes());
             s.scratch[16..16 + tl].copy_from_slice(&tag[..tl]);
-            let out = s.out_proposals;
-            let w = wire::channel_write_msg(
+            if forward(
+                s.anchor,
                 sys,
-                out,
                 wire::MSG_SESSION_PROPOSAL,
                 &s.scratch[..16 + tl],
-            );
-            if w > 0 {
+            ) {
                 s.consumes_cancelled = s.consumes_cancelled.wrapping_add(1);
             }
         }
@@ -776,8 +799,12 @@ unsafe fn handle_method(
             put_prefix(s, conn_id, OP_GET, channel, 0);
             s.scratch[14..16].copy_from_slice(&(ql as u16).to_le_bytes());
             s.scratch[16..16 + ql].copy_from_slice(&a[qo..qo + ql]);
-            let out = s.out_proposals;
-            wire::channel_write_msg(sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..env_len]);
+            forward(
+                s.anchor,
+                sys,
+                wire::MSG_SESSION_PROPOSAL,
+                &s.scratch[..env_len],
+            );
         }
         // Basic.Ack / Basic.Nack / Basic.Reject → op=5 forward,
         // no response frame to the client.
@@ -801,9 +828,7 @@ unsafe fn handle_method(
             // op=5: [prefix, dt = frame's delivery-tag][flags:u8]
             put_prefix(s, conn_id, OP_ACK, channel, dt);
             s.scratch[14] = flags;
-            let out = s.out_proposals;
-            let w = wire::channel_write_msg(sys, out, wire::MSG_SESSION_PROPOSAL, &s.scratch[..15]);
-            if w > 0 {
+            if forward(s.anchor, sys, wire::MSG_SESSION_PROPOSAL, &s.scratch[..15]) {
                 s.client_acks_forwarded = s.client_acks_forwarded.wrapping_add(1);
             }
         }
@@ -1032,7 +1057,7 @@ pub unsafe fn on_frame(s: &mut Amqp, sys: &SyscallTable, mtype: u8, payload: &[u
             // shared codec_in fan-in). session_processor cancels this
             // conn's push consumers on it.
             let cb = conn_id.to_le_bytes();
-            wire::channel_write_msg(sys, s.out_proposals, wire::MSG_CONN_CLOSED, &cb);
+            forward(s.anchor, sys, wire::MSG_CONN_CLOSED, &cb);
             return;
         }
         if n <= CID {

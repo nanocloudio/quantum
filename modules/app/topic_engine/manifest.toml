@@ -25,6 +25,18 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
+# Deliveries for subscriptions held by session worker 1 — the standby of
+# an anchor-preserved handoff pair (docs/architecture/session_continuity.md).
+# A subscription records the worker that holds its session (byte 9 of the
+# subscribe record) and `MSG_TOPIC_MOVE` re-points it when the session
+# moves; each delivery then goes to exactly one worker. Unwired on a
+# one-worker node, where everything goes to `deliver_out`. Declared last:
+# the port index is the ABI.
+[[ports]]
+name = "deliver_out2"
+direction = "output"
+content_type = "OctetStream"
+
 [observability]
 metrics = [
     "bytes_in",

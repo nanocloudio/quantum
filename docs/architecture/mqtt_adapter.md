@@ -18,9 +18,9 @@ rule:
 
 | Connect flag | Behaviour |
 |---|---|
-| `clean_start=true` | Increment `session_epoch`, purge prior inflight state, begin fresh session record. |
-| `clean_start=false` | Reuse the stored session record if `session_epoch` matches; resume inflight QoS 1/2 packets and drain the offline queue. |
-| Same `client_id`, different connection | Fenced takeover: increment `session_epoch`, drop the prior connection, begin a fresh apply context for the new connection. |
+| `clean_start=true` | Increment `session_generation`, purge prior inflight state, begin fresh session record. |
+| `clean_start=false` | Reuse the stored session record if `session_generation` matches; resume inflight QoS 1/2 packets and drain the offline queue. |
+| Same `client_id`, different connection | Fenced takeover: increment `session_generation`, drop the prior connection, begin a fresh apply context for the new connection. |
 
 The keep-alive deadline is the client-proposed value × 1.5. A missing
 PINGREQ within that window triggers DISCONNECT and Will processing.

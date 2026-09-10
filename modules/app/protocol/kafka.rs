@@ -91,7 +91,10 @@ impl KConn {
 
 #[repr(C)]
 pub struct Kafka {
-    pub out_proposals: i32,
+    /// The composite's anchor: every proposal goes through it
+    /// ([`forward`]), which is what binds the connection to a session
+    /// worker and holds it across a handoff.
+    pub anchor: *mut super::anchor::Anchor,
     pub out_frames: i32,
 
     // Params
@@ -168,6 +171,23 @@ pub unsafe fn set_advertised_host(s: &mut Kafka, d: *const u8, len: usize) {
 
 /// Component defaults. Channel handles are assigned by the
 /// composite after this returns.
+/// Hand a staged envelope to the anchor, which forwards it to the
+/// worker the connection is bound to or holds it across a handoff.
+/// `false` only when the live worker's channel refused it.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+#[inline]
+unsafe fn forward(
+    anchor: *mut super::anchor::Anchor,
+    sys: &SyscallTable,
+    mt: u8,
+    payload: &[u8],
+) -> bool {
+    !anchor.is_null() && super::anchor::forward_env(&mut *anchor, sys, mt, payload)
+}
+
 pub fn init(s: &mut Kafka) {
     for c in s.conns.iter_mut() {
         *c = KConn::zero();
@@ -664,14 +684,12 @@ unsafe fn handle_request(
                 s.scratch.as_mut_ptr().add(SESSION_HDR),
                 body_len,
             );
-            let out = s.out_proposals;
-            let w = wire::channel_write_msg(
+            if !forward(
+                s.anchor,
                 sys,
-                out,
                 wire::MSG_SESSION_PROPOSAL,
                 &s.scratch[..env_len],
-            );
-            if w <= 0 {
+            ) {
                 // codec_in saturated — drop; producer retries on timeout.
                 s.parse_errors = s.parse_errors.wrapping_add(1);
             }
@@ -745,7 +763,7 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             // fan-in lane and is claimed by session_processor's MQTT
             // path). session_processor releases conn-keyed state on it.
             let cb = conn_id.to_le_bytes();
-            wire::channel_write_msg(sys, s.out_proposals, wire::MSG_CONN_CLOSED, &cb);
+            forward(s.anchor, sys, wire::MSG_CONN_CLOSED, &cb);
             return;
         }
         if n <= CID {

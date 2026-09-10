@@ -7,7 +7,13 @@
 
 pub type TenantId = u32;
 pub type StreamHash = u64;
-pub type SessionEpoch = u32;
+/// Quantum's session fence: advances on every committed CONNECT and keys
+/// the dedupe table and every in-flight QoS completion. Deliberately NOT
+/// called an epoch: Fluxor's SessionCtrlV1 `session_epoch` fences the
+/// placement of a client attachment and advances on every rebind, and a
+/// worker move must leave this counter untouched. The rule relating the
+/// two lives in `cores/session_identity_core.rs`.
+pub type SessionGeneration = u32;
 pub type MessageId = u32;
 pub type PrgId = u16;
 pub type RoutingEpoch = u32;

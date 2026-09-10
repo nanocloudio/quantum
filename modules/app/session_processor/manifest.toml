@@ -3,6 +3,11 @@ type             = "Transformer"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
+# Session-worker role (docs/architecture/session_continuity.md): this
+# module is the movable half behind the `protocol` anchor. Consumed by
+# the `continuity` config block validator (class edge_anchored).
+capabilities = ["session.worker", "session.handoff", "session.resume"]
+
 # Variants mirror `protocol`'s: a deployment that serves one protocol
 # compiles out the others' handlers and their component state. MQTT is
 # the base — its session lifecycle, QoS state machine and delivery path
@@ -42,7 +47,7 @@ features = ["mqtt", "amqp"]
 # The index is the ABI — a graph binds a port by position — so a port is
 # only ever appended, never inserted or reordered.
 #
-# Inputs (9):
+# Inputs (10):
 #   [0] codec_in         — MQTT/Kafka/AMQP proposals (demux by PROTO_* byte)
 #   [1] committed_in     — applied entries from consensus
 #   [2] flow_in          — PID credits + backpressure + prefetch (demux by msg_type)
@@ -52,8 +57,9 @@ features = ["mqtt", "amqp"]
 #   [6] deliver_in       — topic deliveries from topic_engine
 #   [7] assigned_in      — MSG_PROPOSAL_ASSIGNED from consensus (correlation_id → wal_index)
 #   [8] wal_reply        — WAL records answering a cold Kafka Fetch
+#   [9] ctrl_in          — SessionCtrlV1 commands from the anchor
 #
-# Outputs (11):
+# Outputs (12):
 #   [0] proposals         — untagged proposals to consensus (CONNECT/DISCONNECT/etc)
 #   [1] codec_out         — responses to codecs (tag by PROTO_*)
 #   [2] topic_out         — publish + subscribe + unsubscribe to topic_engine
@@ -65,6 +71,7 @@ features = ["mqtt", "amqp"]
 #   [8] wal_request       — cold-read request for a Kafka Fetch
 #   [9] retention_floor   — lowest raft index this broker still needs
 #   [10] cp_out           — committed entries belonging to the control plane
+#   [11] ctrl_out         — SessionCtrlV1 replies + export frames to the anchor
 
 [[ports]]
 name = "codec_in"
@@ -213,3 +220,23 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192
 max_record = 2067
+
+# SessionCtrlV1 sideband with the anchor (`protocol`): attach, drain,
+# the opaque export/import handoff and resume. One channel pair carries
+# every session the anchor serves; each frame names its session. An
+# export chunk (512 bytes + the session header) is the largest record.
+# Unwired, the module is anchored by nothing and serves the plain seam.
+# Declared last: the port index is the ABI.
+[[ports]]
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027

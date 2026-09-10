@@ -64,3 +64,19 @@ metrics = [
     "enqueued", "drained", "expired", "active",
     "writes", "reads",
 ]
+
+# Session worker 1's op bus and its replies — the standby of an
+# anchor-preserved handoff pair (docs/architecture/session_continuity.md).
+# A dedup verdict, an offline drain or a retained read answers on the
+# port of the worker that asked, so two workers sharing this module
+# never both act on one reply. Unwired on a one-worker node. Declared
+# last: the port index is the ABI.
+[[ports]]
+name = "op_in2"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "result_out2"
+direction = "output"
+content_type = "OctetStream"
