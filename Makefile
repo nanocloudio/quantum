@@ -46,8 +46,8 @@ clean:
 	fluxor clean
 
 # Not a lifecycle stage — a genuine composition (../standards/make.md §1.3),
-# and §3 allows plain invocations in sequence, which is all this is. The seven
-# MQTT smokes each bind port 9090, so they must run strictly sequentially, and
+# and §3 allows plain invocations in sequence, which is all this is. Every
+# script below binds port 9090, so they must run strictly sequentially, and
 # the graph boots from prebuilt PIC fmods, so the module build precedes them.
 test-mqtt-suite:
 	fluxor modules build --target bcm2712 --out target
@@ -58,3 +58,5 @@ test-mqtt-suite:
 	bash tests/integration/module_graph_will_delay.sh
 	bash tests/integration/module_graph_load.sh
 	bash tests/integration/module_graph_mqtt_quic.sh
+	bash tests/integration/session_handoff.sh
+	bash tests/integration/session_handoff_peer.sh
