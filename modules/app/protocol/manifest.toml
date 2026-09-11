@@ -163,10 +163,11 @@ name = "proposals2_out"
 direction = "output"
 content_type = "OctetStream"
 
-# Session directory (clustor `session_directory`): the anchor mirrors
-# every binding — BIND on attach, EPOCH_BUMP + BIND on a swap, UNBIND on
-# close — as MSG_SR_REQUEST and reads the quorum-committed verdicts. A
-# refusal as stale is the fencing signal. Optional.
+# Session directory (`session.directory`): the anchor speaks the
+# contract's directory verbs — ATTACH when a session is minted, ATTACH at
+# the next epoch with the new worker on a swap, DETACH on close — on
+# `dir_out` and reads the verdicts on `dir_in` (ATTACHED / DETACHED /
+# ERROR). A refusal as stale is the fencing signal. Optional.
 [[ports]]
 name = "dir_in"
 direction = "input"

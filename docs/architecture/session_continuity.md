@@ -134,7 +134,8 @@ plane through the same path. Per connection:
    anchor sends `RESUME` at epoch + 1.
 5. On `RESUMED` the forwarding target flips, the epoch advances, the
    held ingress is released to the importing worker, the exporting one
-   is detached, and the directory is told (`EPOCH_BUMP`, `BIND`).
+   is detached, and the directory is told with one `ATTACH` at the new
+   epoch naming the importing worker.
 
 Cursors that disagree, an import the standby refuses, a worker error
 mid-swap, or a window past `session_drain_ms` refuse the handoff: the
@@ -221,11 +222,17 @@ continuity:
 
 `examples/linux/handoff.yaml` declares two workers (which requires
 `session.handoff` on both) and clustor's `session_directory` as the
-directory member; the anchor mirrors every binding to it — `BIND` on
-attach, `EPOCH_BUMP` and `BIND` on a swap, `UNBIND` on close — and
-counts its verdicts: a refusal as stale is the fencing signal that the
-cluster holds a newer generation of the binding than this anchor
-believes it owns.
+directory member. The anchor states every binding to it in the
+contract's own verbs — `ATTACH` when a session is minted, `ATTACH`
+again at the next epoch naming the new worker when it swaps, `DETACH`
+on close — so one verb carries a binding whatever changed about it, and
+the directory reads the epoch to tell a first binding from a rebind.
+
+It counts the verdicts that come back. A binding refused as stale is
+the fencing signal: the cluster holds a newer generation of this
+session than the anchor believes it owns. The reservation grant the
+directory proposes once a binding commits belongs to the transport, so
+the anchor reads past it.
 
 `transport_migratable` is the same graph widened on bare metal:
 `mechanism: platform_replicated_state` with the AEAD class
@@ -235,11 +242,15 @@ a `transport.anchor.stream.secure` anchor (the `tls` module), the
 directory, and the fence in two halves — `ip`'s, whose cutoff reaches
 the wire on the target, and an out-of-band fence agent. The validator
 refuses it on a hosted target, where TCP belongs to the host kernel and
-cannot be checkpointed; the hosted gate proves that refusal. The rig
-graphs declare `edge_anchored` today: this store carries no out-of-band
-fence agent, and a declaration the validator would refuse is not one to
-ship. The widening is a declaration and a composition, not a second
-implementation.
+cannot be checkpointed; the hosted gate proves that refusal.
+
+Both the directory and the fence agent are members placed on another
+node, because the host that must be proved quiet is the one that may
+have failed — Fluxor's reference agent cuts the board's power through
+the bench's plug. `examples/rig/pi5_migratable.yaml` is that graph: the
+same front door with `tls` as the anchor, and a bench driver that holds
+a QoS 2 subscription across a real cut. The widening is a declaration
+and a composition, not a second implementation.
 
 ## Gates
 
@@ -261,9 +272,9 @@ implementation.
   mosquitto on both ends of a QoS 2 burst while the anchor swaps the
   sessions repeatedly inside it. Exactly once, in order, one connection.
 
-Neither suite is in CI (port 9090, a booted broker); run them as
-`bash tests/integration/session_handoff.sh` and
-`bash tests/integration/session_handoff_peer.sh`.
+Both run under `make test-mqtt-suite`, sequentially with the other
+broker smokes, because each boots a broker on port 9090. That keeps
+them out of `fluxor ci`, which builds and lints but boots nothing.
 
 ## Parameters
 

@@ -83,24 +83,22 @@ pub const SC_CC_EDGE_ANCHORED: u8 = 4;
 pub const SC_DETACH_NORMAL: u8 = 0;
 pub const SC_DETACH_CLIENT_GONE: u8 = 4;
 pub const SC_STATUS_OK: u8 = 0;
+pub const SC_STATUS_STALE_EPOCH: u8 = 1;
 
-// ── Session directory (clustor session_registry, MSG_SR_*) ───────────
+// ── Session directory ─────────────────────────────────────────────────
 //
-// The directory is the single-writer authority per (session_id,
-// epoch). The anchor mirrors every binding change to it and reads its
-// verdicts: a BIND or EPOCH_BUMP the directory refuses as stale is the
-// fencing signal that this anchor's view of a session's generation has
-// fallen behind the cluster's. Requests carry `[request_id:u64 LE]`
-// then the op body; the request id is `(conn_id << 32) | epoch` so a
-// reply can be matched without a table.
-pub const MSG_SR_REQUEST: u8 = 0x90;
-pub const MSG_SR_REPLY: u8 = 0x91;
-const SR_OP_BIND: u8 = 1;
-const SR_OP_EPOCH_BUMP: u8 = 2;
-const SR_OP_UNBIND: u8 = 9;
-const SR_ST_OK: u8 = 0;
-const SR_ST_STALE_EPOCH: u8 = 1;
-const SR_REPLY_LEN: usize = 1 + 1 + 16 + 4 + 8 + 8;
+// The directory is the single-writer authority per (session_id, epoch),
+// and the anchor speaks the contract's verbs to it: ATTACH when a
+// session is minted, ATTACH again at the next epoch naming the new
+// worker when it swaps, DETACH on close. One verb states a binding
+// whatever changed about it — the directory reads the epoch to tell a
+// first binding from a rebind.
+//
+// The verdicts come back as ATTACHED / DETACHED / ERROR. A binding
+// refused as stale is the fencing signal: the cluster holds a newer
+// generation of this session than the anchor believes it owns. The
+// reservation grant the directory proposes once a binding commits is
+// the transport's to consume, so it is read past here.
 
 const SID: usize = 16;
 const SID_EPOCH: usize = SID + 4;
@@ -265,64 +263,42 @@ fn worker_id_bytes(w: u8) -> [u8; 8] {
     b
 }
 
-/// BIND `[sid:16][epoch:4][anchor:8][worker:8][flags:1]`.
-unsafe fn dir_bind(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
+/// ATTACH `[sid:16][anchor_id:8][epoch:4][cc:1][worker_id:8]`.
+unsafe fn dir_attach(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
     if a.dir_out < 0 {
         return;
     }
     let c = a.conns[usize::from(conn)];
-    let mut p = [0u8; 8 + 1 + SID + 4 + 8 + 8 + 1];
-    let rid = (u64::from(conn) << 32) | u64::from(c.epoch);
-    p[..8].copy_from_slice(&rid.to_le_bytes());
-    p[8] = SR_OP_BIND;
-    p[9..9 + SID].copy_from_slice(&c.session_id);
-    p[25..29].copy_from_slice(&c.epoch.to_le_bytes());
-    p[29..37].copy_from_slice(&a.anchor_id);
-    p[37..45].copy_from_slice(&worker_id_bytes(c.worker));
-    p[45] = 0;
-    if wire::channel_write_msg(sys, a.dir_out, MSG_SR_REQUEST, &p) <= 0 {
+    let mut p = [0u8; ATTACH_LEN];
+    p[..SID].copy_from_slice(&c.session_id);
+    p[SID..SID + 8].copy_from_slice(&a.anchor_id);
+    p[SID + 8..SID + 12].copy_from_slice(&c.epoch.to_le_bytes());
+    p[SID + 12] = SC_CC_EDGE_ANCHORED;
+    p[SID + 13..SID + 21].copy_from_slice(&worker_id_bytes(c.worker));
+    if wire::channel_write_msg(sys, a.dir_out, SC_CMD_ATTACH, &p) <= 0 {
         a.dir_refused = a.dir_refused.wrapping_add(1);
     }
 }
 
-/// EPOCH_BUMP `[sid:16][old:4][new:4]`.
-unsafe fn dir_epoch_bump(a: &mut Anchor, sys: &SyscallTable, conn: u16, old: u32, new: u32) {
+/// DETACH `[sid:16][epoch:4][reason:1]`.
+unsafe fn dir_detach(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
     if a.dir_out < 0 {
         return;
     }
     let c = a.conns[usize::from(conn)];
-    let mut p = [0u8; 8 + 1 + SID + 4 + 4];
-    let rid = (u64::from(conn) << 32) | u64::from(new);
-    p[..8].copy_from_slice(&rid.to_le_bytes());
-    p[8] = SR_OP_EPOCH_BUMP;
-    p[9..9 + SID].copy_from_slice(&c.session_id);
-    p[25..29].copy_from_slice(&old.to_le_bytes());
-    p[29..33].copy_from_slice(&new.to_le_bytes());
-    if wire::channel_write_msg(sys, a.dir_out, MSG_SR_REQUEST, &p) <= 0 {
-        a.dir_refused = a.dir_refused.wrapping_add(1);
-    }
-}
-
-/// UNBIND `[sid:16][epoch:4]`.
-unsafe fn dir_unbind(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
-    if a.dir_out < 0 {
-        return;
-    }
-    let c = a.conns[usize::from(conn)];
-    let mut p = [0u8; 8 + 1 + SID + 4];
-    let rid = (u64::from(conn) << 32) | u64::from(c.epoch);
-    p[..8].copy_from_slice(&rid.to_le_bytes());
-    p[8] = SR_OP_UNBIND;
-    p[9..9 + SID].copy_from_slice(&c.session_id);
-    p[25..29].copy_from_slice(&c.epoch.to_le_bytes());
-    if wire::channel_write_msg(sys, a.dir_out, MSG_SR_REQUEST, &p) <= 0 {
+    let mut p = [0u8; SID + 4 + 1];
+    p[..SID].copy_from_slice(&c.session_id);
+    p[SID..SID + 4].copy_from_slice(&c.epoch.to_le_bytes());
+    p[SID + 4] = SC_DETACH_NORMAL;
+    if wire::channel_write_msg(sys, a.dir_out, SC_CMD_DETACH, &p) <= 0 {
         a.dir_refused = a.dir_refused.wrapping_add(1);
     }
 }
 
 /// Read the directory's verdicts. A stale refusal is counted and said:
 /// it means the cluster holds a newer generation of the binding than
-/// this anchor believes it owns.
+/// this anchor believes it owns. Grants and HELLO_ACK are the
+/// transport's and the handshake's; neither is a verdict.
 ///
 /// # Safety
 /// `sys` must be the live kernel syscall table.
@@ -339,13 +315,15 @@ pub unsafe fn handle_dir(a: &mut Anchor, sys: &SyscallTable) -> u32 {
         let mut buf = [0u8; 64];
         let (mt, plen) = wire::channel_read_msg(sys, a.dir_in, &mut buf);
         worked += 1;
-        if mt != MSG_SR_REPLY || (plen as usize) < 8 + SR_REPLY_LEN {
-            continue;
-        }
-        let status = buf[9];
-        if status == SR_ST_OK {
+        let plen = plen as usize;
+        let status = match mt {
+            SC_MSG_ATTACHED | SC_MSG_ERROR if plen > SID_EPOCH => buf[SID_EPOCH],
+            SC_MSG_DETACHED if plen >= SID_EPOCH => SC_STATUS_OK,
+            _ => continue,
+        };
+        if status == SC_STATUS_OK {
             a.dir_ok = a.dir_ok.wrapping_add(1);
-        } else if status == SR_ST_STALE_EPOCH {
+        } else if status == SC_STATUS_STALE_EPOCH {
             a.dir_stale = a.dir_stale.wrapping_add(1);
             dev_log(sys, 1, b"[anchor] directory: stale epoch".as_ptr(), 31);
         } else {
@@ -664,7 +642,7 @@ pub unsafe fn conn_closed(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
         return;
     }
     hold_drop_conn(a, conn);
-    dir_unbind(a, sys, conn);
+    dir_detach(a, sys, conn);
     let w = usize::from(c.worker);
     let mid_swap = matches!(
         c.phase,
@@ -817,7 +795,7 @@ pub unsafe fn handle_ctrl(a: &mut Anchor, sys: &SyscallTable, w: usize, now: u64
                         a.conns[usize::from(conn)].phase = Phase::Active;
                         a.attached = a.attached.wrapping_add(1);
                         mon(a, sys, conn, super::MON_EV_ATTACHED, b"", b"ok");
-                        dir_bind(a, sys, conn);
+                        dir_attach(a, sys, conn);
                         flush_hold(a, sys);
                     } else {
                         mon(a, sys, conn, super::MON_EV_ATTACH_FAILED, b"", b"refused");
@@ -895,14 +873,16 @@ pub unsafe fn handle_ctrl(a: &mut Anchor, sys: &SyscallTable, w: usize, now: u64
                         cm.detach_old = 1;
                     }
                     send_detach(a, sys, old, conn, SC_DETACH_NORMAL);
-                    let new_epoch = a.conns[usize::from(conn)].epoch;
-                    dir_epoch_bump(a, sys, conn, new_epoch - 1, new_epoch);
-                    dir_bind(a, sys, conn);
+                    // One ATTACH at the next epoch naming the new worker is
+                    // the whole rebind: the directory records it against
+                    // that epoch and answers ATTACHED, so there is nothing
+                    // for a separate epoch verb to add.
+                    dir_attach(a, sys, conn);
+                    mon(a, sys, conn, super::MON_EV_ATTACH_REQ, b"", b"");
                     a.relocated = a.relocated.wrapping_add(1);
                     if a.swap_pending > 0 {
                         a.swap_pending -= 1;
                     }
-                    mon(a, sys, conn, super::MON_EV_EPOCH_BUMP, b"", b"ok");
                     mon(a, sys, conn, super::MON_EV_RELOCATED, b"", b"ok");
                     flush_hold(a, sys);
                 }
