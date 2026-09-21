@@ -99,22 +99,29 @@ mod mqtt;
 
 use router::{PROTO_AMQP, PROTO_KAFKA, PROTO_MQTT, PROTO_UNKNOWN};
 
+// The cluster's addresses, each named once as `host[:port]` — the same
+// core the broker's own connectors take their peer from.
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_QUANTUM_BROKER};
+
+/// Peers this module can be told about. Three is what the parameter
+/// space allocates (`peer0`..`peer2`); the Kafka codec's own table is at
+/// least this wide, and a peer past it has no parameter to arrive on.
+const ADVERTISED_PEERS: usize = 3;
+
 define_params! {
     ModuleState;
 
-    // Broker address advertised in Kafka Metadata responses. Must be the
-    // address CLIENTS can reach (the rig DUT's address, say), not the
-    // bind address. Default 127.0.0.1 keeps local dev working.
-    1, advertised_host, str, 0
+    // Tags 1, 2 and 6 to 11 are retired; the next allocation is 23.
+    //
+    // This broker as Kafka Metadata advertises it: `host[:port]`, port
+    // 9090 when it names none. It must be the address CLIENTS can reach
+    // (the rig DUT's address, say), not the bind address, and it is one
+    // value because it is one fact.
+    19, advertised, str, 0
         => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            kafka::set_advertised_host(&mut s.kafka, d, len);
-        };
-
-    2, advertised_port, u16, 9090
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            { s.kafka.advertised_port = p_u16(d, len, 0, 9090); }
+            s.advertised.set(core::slice::from_raw_parts(d, len));
         };
 
     // Partition count advertised per topic (clamped to 1..=16 so a full
@@ -149,41 +156,17 @@ define_params! {
             #[cfg(feature = "kafka")]
             { s.kafka.peer_count = p_u16(d, len, 0, 1) as u8; }
         };
-    6, peer0_port, u16, 0
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            { s.kafka.peer_ports[0] = p_u16(d, len, 0, 0); }
-        };
-    7, peer1_port, u16, 0
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            { s.kafka.peer_ports[1] = p_u16(d, len, 0, 0); }
-        };
-    8, peer2_port, u16, 0
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            { s.kafka.peer_ports[2] = p_u16(d, len, 0, 0); }
-        };
-
-    // Per-peer advertised host. Unset falls back to this node's address,
-    // which is right only for a co-located peer — across machines,
-    // advertising a wrong host sends the client somewhere that does not
-    // serve the partition.
-    9, peer0_host, str, 0
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            kafka::set_peer_host(&mut s.kafka, 0, d, len);
-        };
-    10, peer1_host, str, 0
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            kafka::set_peer_host(&mut s.kafka, 1, d, len);
-        };
-    11, peer2_host, str, 0
-        => |s, d, len| {
-            #[cfg(feature = "kafka")]
-            kafka::set_peer_host(&mut s.kafka, 2, d, len);
-        };
+    // Each peer as Metadata advertises it: `host[:port]`, port 9090 when
+    // it names none. A peer left unnamed falls back to this node's own
+    // address, which is right only for a co-located peer — across
+    // machines, advertising a wrong host sends the client somewhere that
+    // does not serve the partition.
+    20, peer0, str, 0
+        => |s, d, len| { s.peers[0].set(core::slice::from_raw_parts(d, len)); };
+    21, peer1, str, 0
+        => |s, d, len| { s.peers[1].set(core::slice::from_raw_parts(d, len)); };
+    22, peer2, str, 0
+        => |s, d, len| { s.peers[2].set(core::slice::from_raw_parts(d, len)); };
 
     // ── Transport anchor (docs/architecture/session_continuity.md) ──
     //
@@ -265,6 +248,12 @@ struct ModuleState {
     out_frames: i32,
     out_metrics: i32,
     last_metrics_ms: u64,
+
+    /// This broker as Metadata advertises it, and each peer the same
+    /// way: one `host[:port]` each, parsed at construction and handed to
+    /// the Kafka codec as the host and port it encodes.
+    advertised: Authority,
+    peers: [Authority; ADVERTISED_PEERS],
 
     router: router::Router,
     /// Transport-anchor role (`anchor.rs`).
@@ -357,6 +346,44 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub unsafe extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// Adopt the advertised addresses into the tables the Kafka codec
+/// encodes from. `false` when one was given and is not `host[:port]` —
+/// a broker that advertises an address nobody can parse sends every
+/// client somewhere that does not answer.
+///
+/// # Safety
+/// `s` is this module's state.
+unsafe fn adopt_addresses(s: &mut ModuleState) -> bool {
+    if s.advertised.offered() && !s.advertised.adopt(PORT_QUANTUM_BROKER) {
+        return false;
+    }
+    let mut i = 0;
+    while i < ADVERTISED_PEERS {
+        if s.peers[i].offered() && !s.peers[i].adopt(PORT_QUANTUM_BROKER) {
+            return false;
+        }
+        i += 1;
+    }
+    #[cfg(feature = "kafka")]
+    {
+        if s.advertised.is_set() {
+            let host = s.advertised.host();
+            kafka::set_advertised_host(&mut s.kafka, host.as_ptr(), host.len());
+            s.kafka.advertised_port = s.advertised.port();
+        }
+        let mut i = 0;
+        while i < ADVERTISED_PEERS {
+            if s.peers[i].is_set() {
+                let host = s.peers[i].host();
+                kafka::set_peer_host(&mut s.kafka, i, host.as_ptr(), host.len());
+                s.kafka.peer_ports[i] = s.peers[i].port();
+            }
+            i += 1;
+        }
+    }
+    true
+}
+
 /// PIC module ABI entry: construct module state in `state` (kernel-allocated
 /// from the manifest-declared `state_size`).
 ///
@@ -393,6 +420,8 @@ pub unsafe extern "C" fn module_new(
         s.syscalls = sys;
         s.in_raw = in_chan;
         s.last_metrics_ms = 0;
+        s.advertised = Authority::empty();
+        s.peers = [Authority::empty(), Authority::empty(), Authority::empty()];
 
         // out[0] proposals_out, out[1] frames_out, out[2] metrics.
         // Every codec shares the proposal and frame handles; the
@@ -455,6 +484,11 @@ pub unsafe extern "C" fn module_new(
         set_defaults(s);
         if !_params.is_null() && _params_len >= 4 {
             parse_tlv(s, _params, _params_len);
+        }
+        if !adopt_addresses(s) {
+            let m = b"[prot] refusing to construct: an advertised address is not host[:port]";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
         }
         #[cfg(feature = "kafka")]
         kafka::finish_init(&mut s.kafka);

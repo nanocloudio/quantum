@@ -17,11 +17,11 @@
 //!
 //! Ports:  net_in/net_out (transport), publish_in (unused; reserved for fetch/
 //!         produce), status_out (membership transitions).
-//! Params: `endpoint` (hex `[ip:4][port:2 LE]`), `group_id`, `client_id`,
-//!         `session_timeout_ms`, `heartbeat_ms`.
+//! Params: `authority` (`host[:port]`, port 9092 when omitted), `group_id`,
+//!         `client_id`, `session_timeout_ms`, `heartbeat_ms`.
 //!
 //! Scope: single-broker. The coordinator returned by FindCoordinator is assumed
-//! reachable at the configured endpoint; reconnecting to a different coordinator
+//! reachable at the configured authority; reconnecting to a different coordinator
 //! host/port is a documented follow-on, not built here.
 
 #![no_std]
@@ -47,15 +47,24 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 // Shared, host-tested cores — identical source to the `chronicle-bytecode` crate.
 include!("../../common/cores/kafka_core.rs");
-include!("../../common/cores/hex_core.rs");
 
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
 const NET_MSG_DATA: u8 = 0x02;
 const NET_MSG_CLOSED: u8 = 0x03;
 const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
+
+// The dial: the peer's authority travels on the record, and the
+// provider resolves a name.
+use abi::contracts::net::net_proto::{
+    connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
+    CONN_ID_LEN, REQUESTER_TAG_NONE,
+};
+
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_KAFKA};
 
 /// True when a `net_proto` frame's leading `[conn_id: u16 LE]` names
 /// `want`. Stated once because every inbound frame carries it, and a
@@ -81,10 +90,7 @@ struct KafkaState {
     publish_in: i32,
     status_out: i32,
 
-    ip: [u8; 4],
-    port: u16,
-    ep_hex: [u8; 16],
-    ep_hex_len: u16,
+    authority: Authority,
     group_id: [u8; NAME_BUF],
     group_id_len: u16,
     client_id: [u8; NAME_BUF],
@@ -136,10 +142,11 @@ struct KafkaState {
 define_params! {
     KafkaState;
 
-    1, endpoint, str, 0 => |s, d, len| {
-        let mut i = 0usize;
-        while i < len && (s.ep_hex_len as usize) < 16 {
-            s.ep_hex[s.ep_hex_len as usize] = *d.add(i); s.ep_hex_len += 1; i += 1;
+    // Tag 1 is retired.
+    // The broker, `host[:port]`; the port defaults to 9092.
+    7, authority, str, 0 => |s, d, len| {
+        if len > 0 {
+            s.authority.set(core::slice::from_raw_parts(d, len));
         }
     };
     2, group_id, str, 0 => |s, d, len| {
@@ -239,9 +246,7 @@ pub unsafe extern "C" fn module_new(
         s.net_out = out_chan;
         s.publish_in = dev_channel_port(sys, 0, 1);
         s.status_out = dev_channel_port(sys, 1, 1);
-        s.ip = [0u8; 4];
-        s.port = 0;
-        s.ep_hex_len = 0;
+        s.authority.clear();
         s.group_id_len = 0;
         s.client_id_len = 0;
         s.session_timeout_ms = 30_000;
@@ -267,12 +272,10 @@ pub unsafe extern "C" fn module_new(
         s.rebalances = 0;
         s.errors = 0;
         parse_tlv(s, params, params_len);
-        let mut ep = [0u8; 8];
-        if let Some(n) = hex_decode(&s.ep_hex[..s.ep_hex_len as usize], &mut ep) {
-            if n >= 6 {
-                s.ip = [ep[0], ep[1], ep[2], ep[3]];
-                s.port = u16::from_le_bytes([ep[4], ep[5]]);
-            }
+        if !s.authority.adopt(PORT_KAFKA) {
+            let m = b"[kafka] refusing to construct: authority (host[:port]) is required";
+            dev_log(sys, 2, m.as_ptr(), m.len());
+            return -1;
         }
         dev_log(sys, 3, b"[kafka] init".as_ptr(), 12);
         0
@@ -349,25 +352,19 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
 
     match action {
         KAct::Connect => {
-            let mut payload = [0u8; 8];
-            payload[0] = SOCK_TYPE_STREAM;
-            payload[1] = s.ip[3];
-            payload[2] = s.ip[2];
-            payload[3] = s.ip[1];
-            payload[4] = s.ip[0];
-            let port = s.port.to_le_bytes();
-            payload[5] = port[0];
-            payload[6] = port[1];
-            payload[7] = s.tag;
-            net_write_frame(
-                sys,
-                s.net_out,
-                NET_CMD_CONNECT,
-                payload.as_ptr(),
-                8,
-                s.nbuf.as_mut_ptr(),
-                NET_BUF,
-            );
+            let mut payload = [0u8; CONNECT_TO_MAX];
+            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            if n > 0 {
+                net_write_frame(
+                    sys,
+                    s.net_out,
+                    NET_CMD_CONNECT_TO,
+                    payload.as_ptr(),
+                    n,
+                    s.nbuf.as_mut_ptr(),
+                    NET_BUF,
+                );
+            }
             s.started_ms = now;
         }
         KAct::SendApiVersions => send_request(s, api::API_VERSIONS, &[], now),
@@ -592,9 +589,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 match msg {
                     // `[conn_id: u16 LE][requester_tag: u8]`
                     NET_MSG_CONNECTED if s.phase == KPhase::Connecting => {
-                        if plen >= 3 && *payload.add(2) == s.tag {
-                            s.conn_id = u16::from_le_bytes([*payload, *payload.add(1)]);
-                            feed(s, sys, KEv::Connected, now);
+                        let pl = core::slice::from_raw_parts(payload, plen);
+                        if plen >= CONN_ID_LEN {
+                            let (id, tag) = connected_parts(pl);
+                            if tag == s.tag || tag == REQUESTER_TAG_NONE {
+                                s.conn_id = id;
+                                feed(s, sys, KEv::Connected, now);
+                            }
                         }
                     }
                     // `[conn_id: u16 LE][data…]`
@@ -640,9 +641,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // — a connect-phase failure has a meaningless
                         // conn_id, so the tag is the only way to know it
                         // is ours.
+                        let pl = core::slice::from_raw_parts(payload, plen);
+                        let tag = if plen > CONN_ID_LEN {
+                            error_parts(pl).2
+                        } else {
+                            REQUESTER_TAG_NONE
+                        };
                         let ours = (s.phase == KPhase::Connecting
-                            && plen >= 4
-                            && *payload.add(3) == s.tag)
+                            && (tag == s.tag || tag == REQUESTER_TAG_NONE))
                             || (s.phase != KPhase::Disconnected
                                 && conn_matches(payload, plen, s.conn_id));
                         if ours {

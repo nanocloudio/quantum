@@ -67,7 +67,17 @@ const NET_MSG_ERROR: u8 = 0x06;
 // Net protocol command types (upstream: consumer → IP)
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+
+// The dial: the broker's authority travels on the record, and the
+// provider resolves a name.
+use abi::contracts::net::net_proto::{
+    connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
+    CONN_ID_LEN, REQUESTER_TAG_NONE,
+};
+
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_MQTT};
 
 // Buffer sizes
 const TX_BUF_SIZE: usize = 256;
@@ -117,11 +127,14 @@ mod params_def {
     define_params! {
         MqttState;
 
-        1, broker_ip, u32, 0
-            => |s, d, len| { s.broker_ip = p_u32(d, len, 0, 0); };
-
-        2, broker_port, u16, 1883
-            => |s, d, len| { s.broker_port = p_u16(d, len, 0, 1883); };
+        // Tags 1 and 2 are retired.
+        // The broker, `host[:port]`; the port defaults to 1883.
+        8, authority, str, 0
+            => |s, d, len| {
+                if len > 0 {
+                    s.authority.set(core::slice::from_raw_parts(d, len));
+                }
+            };
 
         3, keepalive_s, u8, 60
             => |s, d, len| { s.keepalive_s = p_u8(d, len, 0, 60); };
@@ -201,8 +214,7 @@ struct MqttState {
     net_out_chan: i32,
 
     // Connection params
-    broker_ip: u32,
-    broker_port: u16,
+    authority: Authority,
     keepalive_s: u8,
     client_id_len: u8,
     subscribe_topic_len: u8,
@@ -997,46 +1009,6 @@ pub unsafe extern "C" fn module_new(
 
         if is_tlv {
             params_def::parse_tlv(s, params, params_len);
-        } else if !params.is_null() && params_len >= 4 {
-            // Legacy binary params:
-            //   [0-3]     broker_ip: u32
-            //   [4-5]     broker_port: u16
-            //   [6]       keepalive_s: u8
-            //   [7]       client_id_len: u8
-            //   [8-39]    client_id: [u8; 32]
-            //   [40]      subscribe_topic_len: u8
-            //   [41]      publish_topic_len: u8
-            //   [42-43]   reserved
-            //   [44-139]  subscribe_topic: [u8; 96]
-            //   [140-235] publish_topic_prefix: [u8; 96]
-            let p = params;
-            let plen = params_len;
-
-            s.broker_ip = p_u32(p, plen, 0, 0);
-            s.broker_port = p_u16(p, plen, 4, 1883);
-            s.keepalive_s = p_u8(p, plen, 6, 60);
-            s.client_id_len = p_u8(p, plen, 7, 0);
-
-            let cid_len = (s.client_id_len as usize).min(MAX_CLIENT_ID_LEN);
-            s.client_id_len = cid_len as u8;
-            if cid_len > 0 && plen >= 8 + cid_len {
-                ptr_copy(s.client_id.as_mut_ptr(), p.add(8), cid_len);
-            }
-
-            s.subscribe_topic_len = p_u8(p, plen, 40, 0);
-            s.publish_topic_len = p_u8(p, plen, 41, 0);
-
-            let sub_len = (s.subscribe_topic_len as usize).min(MAX_TOPIC_LEN);
-            s.subscribe_topic_len = sub_len as u8;
-            if sub_len > 0 && plen >= 44 + sub_len {
-                ptr_copy(s.subscribe_topic.as_mut_ptr(), p.add(44), sub_len);
-            }
-
-            let pub_len = (s.publish_topic_len as usize).min(MAX_TOPIC_LEN);
-            s.publish_topic_len = pub_len as u8;
-            if pub_len > 0 && plen >= 140 + pub_len {
-                ptr_copy(s.publish_topic.as_mut_ptr(), p.add(140), pub_len);
-            }
         } else {
             params_def::set_defaults(s);
         }
@@ -1048,8 +1020,11 @@ pub unsafe extern "C" fn module_new(
         log_msg(s, b"[mqtt] init");
 
         // Validate
-        if s.broker_ip == 0 {
-            log_err(s, b"[mqtt] no broker ip");
+        if !s.authority.adopt(PORT_MQTT) {
+            log_err(
+                s,
+                b"[mqtt] refusing to construct: authority (host[:port]) is required",
+            );
             return -10;
         }
 
@@ -1095,25 +1070,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.phase = MqttPhase::Error;
                         return -1;
                     }
-                    // CMD_CONNECT: [sock_type][ip:4][port:2][requester_tag].
-                    // The tag (our module index) lets us claim only our own
-                    // MSG_CONNECTED on an ip.net_out fanned to other consumers.
-                    let mut payload = [0u8; 8];
-                    payload[0] = SOCK_TYPE_STREAM;
-                    let ip_bytes = s.broker_ip.to_le_bytes();
-                    *payload.as_mut_ptr().add(1) = *ip_bytes.as_ptr();
-                    *payload.as_mut_ptr().add(2) = *ip_bytes.as_ptr().add(1);
-                    *payload.as_mut_ptr().add(3) = *ip_bytes.as_ptr().add(2);
-                    *payload.as_mut_ptr().add(4) = *ip_bytes.as_ptr().add(3);
-                    *payload.as_mut_ptr().add(5) = (s.broker_port & 0xFF) as u8;
-                    *payload.as_mut_ptr().add(6) = (s.broker_port >> 8) as u8;
-                    *payload.as_mut_ptr().add(7) = dev_requester_tag(sys);
+                    // The record carries the authority; our tag (the module
+                    // index) lets us claim only our own MSG_CONNECTED on an
+                    // ip.net_out fanned to other consumers.
+                    let mut payload = [0u8; CONNECT_TO_MAX];
+                    let n = s
+                        .authority
+                        .connect_record(&mut payload, Some(dev_requester_tag(sys)));
+                    if n == 0 {
+                        log_err(s, b"[mqtt] authority does not fit a connect record");
+                        s.phase = MqttPhase::Error;
+                        return -1;
+                    }
                     let wrote = net_write_frame(
                         sys,
                         s.net_out_chan,
-                        NET_CMD_CONNECT,
+                        NET_CMD_CONNECT_TO,
                         payload.as_ptr(),
-                        8,
+                        n,
                         s.net_buf.as_mut_ptr(),
                         NET_BUF_SIZE,
                     );
@@ -1134,41 +1108,28 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let nbuf = s.net_buf.as_mut_ptr();
                         let (msg_type, payload_len) =
                             net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
-                            // Claim only our own outbound connection by tag.
-                            // The tag sits after the two-byte connection id;
-                            // reading it at +1 read the id's high byte, which
-                            // is zero for every connection the platform has
-                            // ever assigned — so this check passed
-                            // unconditionally and claimed other consumers'
-                            // connections too.
-                            let tag = if payload_len >= 3 {
-                                *nbuf.add(NET_FRAME_HDR + 2)
-                            } else {
-                                0
-                            };
-                            let me = dev_requester_tag(sys);
-                            if tag != 0 && tag != me {
+                        let pl = core::slice::from_raw_parts(
+                            nbuf.add(NET_FRAME_HDR) as *const u8,
+                            payload_len,
+                        );
+                        if msg_type == NET_MSG_CONNECTED && payload_len >= CONN_ID_LEN {
+                            // Claim only our own outbound connection by tag:
+                            // the tag sits after the two-byte connection id.
+                            let (id, tag) = connected_parts(pl);
+                            if tag != REQUESTER_TAG_NONE && tag != dev_requester_tag(sys) {
                                 return 0; // another consumer's connection.
                             }
-                            s.conn_id = u16::from_le_bytes([
-                                *nbuf.add(NET_FRAME_HDR),
-                                *nbuf.add(NET_FRAME_HDR + 1),
-                            ]);
+                            s.conn_id = id;
                             s.conn_present = 1;
                             log_msg(s, b"[mqtt] tcp connected");
                             s.phase = MqttPhase::MqttConnect;
                             continue;
                         }
-                        if msg_type == NET_MSG_ERROR {
-                            // Connect failure carries our tag at payload[2]
-                            // ([conn_id][errno][tag]); ignore another consumer's.
-                            let etag = if payload_len >= 3 {
-                                *nbuf.add(NET_FRAME_HDR + 2)
-                            } else {
-                                0
-                            };
-                            if etag == 0 || etag == dev_requester_tag(sys) {
+                        if msg_type == NET_MSG_ERROR && payload_len > CONN_ID_LEN {
+                            // A connect failure names its requester after the
+                            // errno; ignore another consumer's.
+                            let (_id, _errno, etag) = error_parts(pl);
+                            if etag == REQUESTER_TAG_NONE || etag == dev_requester_tag(sys) {
                                 log_err(s, b"[mqtt] connect rejected");
                                 enter_reconnect(s);
                             }

@@ -83,6 +83,22 @@ pub mod session_identity {
     include!("../../../modules/common/cores/session_identity_core.rs");
 }
 
+/// The dial authority the seven outbound connectors compose their
+/// `CMD_CONNECT_TO` records from. `#[path]`-mounted rather than
+/// `include!`d so its own mount of the SDK contract resolves against
+/// `modules/common/`, exactly as it does in a module build.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC helper verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+#[path = "../../../modules/common/authority.rs"]
+pub mod authority;
+
+#[cfg(test)]
+mod authority_tests;
 #[cfg(test)]
 mod edge_routing_tests;
 #[cfg(test)]

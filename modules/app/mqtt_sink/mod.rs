@@ -54,7 +54,17 @@ const NET_MSG_CONNECTED: u8 = 0x05;
 const NET_MSG_ERROR: u8 = 0x06;
 const NET_CMD_SEND: u8 = 0x11;
 const NET_CMD_CLOSE: u8 = 0x12;
-const NET_CMD_CONNECT: u8 = 0x13;
+
+// The dial: the peer's authority travels on the record, and the
+// provider resolves a name.
+use abi::contracts::net::net_proto::{
+    connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
+    CONN_ID_LEN, REQUESTER_TAG_NONE,
+};
+
+#[path = "../../common/authority.rs"]
+mod authority;
+use authority::{Authority, PORT_QUANTUM_BROKER};
 
 // ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
 
@@ -107,8 +117,7 @@ struct SinkState {
     publish_in_chan: i32,
     ack_out_chan: i32,
 
-    broker_ip: u32,
-    broker_port: u16,
+    authority: Authority,
     keepalive_s: u8,
     client_id_len: u8,
     topic_len: u8,
@@ -155,11 +164,14 @@ mod params_def {
     define_params! {
         SinkState;
 
-        1, broker_ip, u32, 0
-            => |s, d, len| { s.broker_ip = p_u32(d, len, 0, 0); };
-
-        2, broker_port, u16, 9090
-            => |s, d, len| { s.broker_port = p_u16(d, len, 0, 9090); };
+        // Tags 1 and 2 are retired.
+        // The broker, `host[:port]`; the port defaults to 9090.
+        6, authority, str, 0
+            => |s, d, len| {
+                if len > 0 {
+                    s.authority.set(core::slice::from_raw_parts(d, len));
+                }
+            };
 
         3, keepalive_s, u8, 60
             => |s, d, len| { s.keepalive_s = p_u8(d, len, 0, 60); };
@@ -735,8 +747,15 @@ pub unsafe extern "C" fn module_new(
         s.packet_id = 0;
         s.backoff_ms = BACKOFF_INIT_MS;
         log_msg(s, b"[mqttsink] init");
-        if s.broker_ip == 0 || s.topic_len == 0 {
-            log_err(s, b"[mqttsink] missing broker ip / topic");
+        if !s.authority.adopt(PORT_QUANTUM_BROKER) {
+            log_err(
+                s,
+                b"[mqttsink] refusing to construct: authority (host[:port]) is required",
+            );
+            return -10;
+        }
+        if s.topic_len == 0 {
+            log_err(s, b"[mqttsink] missing topic");
             return -10;
         }
         0
@@ -773,22 +792,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.phase = Phase::Error;
                         return -1;
                     }
-                    let mut payload = [0u8; 8];
-                    payload[0] = SOCK_TYPE_STREAM;
-                    let ip_bytes = s.broker_ip.to_le_bytes();
-                    payload[1] = ip_bytes[0];
-                    payload[2] = ip_bytes[1];
-                    payload[3] = ip_bytes[2];
-                    payload[4] = ip_bytes[3];
-                    payload[5] = (s.broker_port & 0xFF) as u8;
-                    payload[6] = (s.broker_port >> 8) as u8;
-                    payload[7] = dev_requester_tag(sys);
+                    let mut payload = [0u8; CONNECT_TO_MAX];
+                    let n = s
+                        .authority
+                        .connect_record(&mut payload, Some(dev_requester_tag(sys)));
+                    if n == 0 {
+                        log_err(s, b"[mqttsink] authority does not fit a connect record");
+                        s.phase = Phase::Error;
+                        return -1;
+                    }
                     let wrote = net_write_frame(
                         sys,
                         s.net_out_chan,
-                        NET_CMD_CONNECT,
+                        NET_CMD_CONNECT_TO,
                         payload.as_ptr(),
-                        8,
+                        n,
                         s.net_buf.as_mut_ptr(),
                         NET_BUF_SIZE,
                     );
@@ -808,24 +826,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let nbuf = s.net_buf.as_mut_ptr();
                         let (msg_type, payload_len) =
                             net_read_frame(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= 2 {
-                            let tag = if payload_len >= 3 {
-                                *nbuf.add(NET_FRAME_HDR + 2)
-                            } else {
-                                0
-                            };
-                            if payload_len < 3 || tag == dev_requester_tag(sys) {
-                                s.conn_id = u16::from_le_bytes([
-                                    *nbuf.add(NET_FRAME_HDR),
-                                    *nbuf.add(NET_FRAME_HDR + 1),
-                                ]);
+                        let pl = core::slice::from_raw_parts(
+                            nbuf.add(NET_FRAME_HDR) as *const u8,
+                            payload_len,
+                        );
+                        if msg_type == NET_MSG_CONNECTED && payload_len >= CONN_ID_LEN {
+                            let (id, tag) = connected_parts(pl);
+                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
+                                s.conn_id = id;
                                 s.conn_present = 1;
                                 s.phase = Phase::MqttConnect;
                                 continue;
                             }
-                        } else if msg_type == NET_MSG_ERROR {
-                            enter_reconnect(s);
-                            return 0;
+                        } else if msg_type == NET_MSG_ERROR && payload_len > CONN_ID_LEN {
+                            let (_id, _errno, tag) = error_parts(pl);
+                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
+                                enter_reconnect(s);
+                                return 0;
+                            }
                         }
                     }
                     if dev_millis(sys).wrapping_sub(s.state_start_ms) > CONNECT_TIMEOUT_MS {
