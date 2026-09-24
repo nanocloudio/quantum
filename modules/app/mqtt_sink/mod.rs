@@ -22,7 +22,6 @@
 #![allow(
     dead_code,
     unused_imports,
-    unreachable_patterns,
     reason = "PIC build path-mounts modules/sdk/* via include!/mod, so each module's compile sees the full ABI surface; consumers use a subset"
 )]
 

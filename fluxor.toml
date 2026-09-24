@@ -51,6 +51,27 @@ max_inline_lines    = 80
 
 # Per-file exemptions live as [[ci.hygiene.exemption]] tables. None today.
 
+# Crate-root `#![allow(dead_code, unused_imports)]` on the PIC modules.
+#
+# The cause is not in these files: the build `include!`s and `#[path]`-mounts
+# the fluxor SDK wholesale, so every module's compile sees the entire ABI
+# surface — provider, telemetry, device_access, net, storage, fmp — and a
+# given module calls a handful of it. The unused items are in
+# `target/fluxor/fluxor-abi/sdk/**`, which this project does not own and has
+# no item to attach an attribute to.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/app/"
+reason = """PIC modules mount the fluxor SDK wholesale via include!/#[path], so each compile sees the entire ABI surface and uses a subset; the unused items live in target/fluxor/fluxor-abi/sdk/**, not here."""
+
+# The same shape one layer in: `wire.rs`, `types.rs` and `authority.rs` are
+# single definitions `#[path]`-mounted into every consumer, and each consumer
+# uses a different subset of the constants and codecs. An `#[expect]` per item
+# cannot work — an item unused by one module is used by the next, and
+# `#[expect]` is an error wherever the lint does not fire.
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/common/"
+reason = """Shared definitions #[path]-mounted into every consumer; each uses a different subset, so no item is dead in all of them and none can carry #[expect]."""
+
 [ci.test]
 # Shadow-checkout hard-fail guard:
 # tests/ and examples/ are shadow-tracked in .git-shadow/, so a checkout
