@@ -60,3 +60,4 @@ test-mqtt-suite:
 	bash tests/integration/module_graph_mqtt_quic.sh
 	bash tests/integration/session_handoff.sh
 	bash tests/integration/session_handoff_peer.sh
+	bash tests/integration/mqtt_quic_migration.sh

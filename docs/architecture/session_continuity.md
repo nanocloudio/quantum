@@ -254,6 +254,26 @@ same front door with `tls` as the anchor, and a bench driver that holds
 a QoS 2 subscription across a real cut. The widening is a declaration
 and a composition, not a second implementation.
 
+Over QUIC the class has a second mechanism, one the wire carries itself.
+`examples/linux/quic.yaml` declares, beneath the `edge_anchored` entry:
+
+```yaml
+  - id: quantum_quic_path
+    class: transport_migratable
+    mechanism: native_primitive          # RFC 9000 §9 connection migration
+    anchor: quic                         # transport.mux.quic + transport.anchor.mux
+```
+
+A client that changes address — a NAT rebinding, or an active migration
+onto the server's spare connection ID — keeps its one QUIC connection,
+and the MQTT session riding it never sees a reconnect. The serving host
+does not move, so there is no directory, fence, reservation or failover
+budget, and the validator refuses those terms here. The anchor must be
+the module carrying the mux in server mode with migration enabled, so
+it is admitted on a hosted target as well as on bare metal. It is a
+different guarantee from `platform_replicated_state`: the client moves,
+not the server.
+
 ## Gates
 
 - `tools/core_tests/src/session_identity_tests.rs` — the identity rule:
@@ -273,9 +293,15 @@ and a composition, not a second implementation.
 - `tests/integration/session_handoff_peer.sh` — the independent peer:
   mosquitto on both ends of a QoS 2 burst while the anchor swaps the
   sessions repeatedly inside it. Exactly once, in order, one connection.
+- `tests/integration/mqtt_quic_migration.sh` — the `native_primitive`
+  evidence: one aioquic connection (an independent QUIC stack) carrying
+  one MQTT session that publishes and subscribes at QoS 2, moved through
+  a rebinding and an active migration with publishes in flight. Exactly
+  once, in order, no DUP; the server challenges each new path and stops
+  sending to the old one; one handshake, one CONNACK.
 
-Both run under `make test-mqtt-suite`, sequentially with the other
-broker smokes, because each boots a broker on port 9090. That keeps
+All three run under `make test-mqtt-suite`, sequentially with the other
+broker smokes, because each boots a broker on a fixed port. That keeps
 them out of `fluxor ci`, which builds and lints but boots nothing.
 
 ## Parameters
