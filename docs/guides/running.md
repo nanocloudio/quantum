@@ -114,19 +114,17 @@ wiring:
     to: consensus.ack
 
   # Diagnostic/admin HTTP surface: wave http shares the linux_net
-  # instance (its own port via CMD_BIND) and exchanges
-  # HttpRequest/HttpResponse envelopes with operations. Mailbox mode
-  # (`buffer_group`) is REQUIRED on both envelope edges.
+  # instance (its own port via CMD_BIND) and asks operations each
+  # request as an exchange: http is the requester, operations the
+  # provider.
   - from: linux_net.net_out
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  - from: http.req_out
-    to: operations.request
-    buffer_group: 1
-  - from: operations.response
-    to: http.resp_in
-    buffer_group: 2
+  - from: http.request_out
+    to: operations.request_in
+  - from: operations.response_out
+    to: http.response_in
 
   # Client responses fan in at the transport
   - from: protocol.frames_out

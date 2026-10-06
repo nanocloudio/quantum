@@ -97,6 +97,20 @@ pub mod session_identity {
 #[path = "../../../modules/common/authority.rs"]
 pub mod authority;
 
+/// The provider half of a PUBLISH exchange: request collection and
+/// judgement, the in-flight window, the owed-record queue and LINK, as
+/// every broker sink answers through it. `#[path]`-mounted for the same
+/// reason as `authority`: its own mount of the SDK exchange contract.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC helper verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+#[path = "../../../modules/common/publish_exchange.rs"]
+pub mod publish_exchange;
+
 #[cfg(test)]
 mod authority_tests;
 #[cfg(test)]
@@ -109,5 +123,7 @@ mod kafka_idem_tests;
 mod kafka_log_tests;
 #[cfg(test)]
 mod kafka_metadata_tests;
+#[cfg(test)]
+mod publish_exchange_tests;
 #[cfg(test)]
 mod session_identity_tests;

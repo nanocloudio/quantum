@@ -4,45 +4,41 @@ timer_class      = "wall_clock"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# amqp_sink — AMQP 0-9-1 PUBLISHER exposing the generic
-# `stream.ordered_ack` surface: ordered publishes in, durable acks
-# + link-state signals out. Sibling of mqtt_sink/kafka_sink; any
-# producer graph composes it by deployment pin. Wire fragment for the
-# surface is currently owned by lattice `modules/common/cdc_wire.rs`
-# (frames inlined byte-for-byte; that owner's conformance vectors are
-# the cross-repo check).
+# amqp_sink — AMQP 0-9-1 PUBLISHER, a PROVIDER of the exchange contract
+# (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Sibling of
+# mqtt_sink/kafka_sink; any graph that publishes durably composes it by
+# deployment pin.
 #
-# Contract mapping (the surface's terms):
-#   term 1  ack = durable acceptance → PUBLISHER CONFIRMS
-#           (confirm.select; basic.ack), which this broker gates on
-#           Clustor quorum durability — a confirm is a durable accept.
-#   term 2  per-key order in a connection → one channel, serialized
-#           publishes: confirm tags are sequential in publish order.
-#   term 3  no silent drops → every publish is confirmed, nacked
-#           (typed refusal), or invalidated by LINK_DOWN.
-#   term 4  backpressure by channel → publish_in drained only while
-#           connected with confirm-window room (the broker allows at
-#           most 8 pending publishes per connection).
-#   term 5  broadcast → one queue is ONE ordering unit, so
-#           FLAG_BROADCAST degenerates to a plain publish.
+# Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
+# body = the record, published as the message body byte for byte to the
+# default exchange with the configured `topic` as routing key; flags
+# MORE and BROADCAST only. Anything else is answered 400.
 #
-# Payload ceiling: this broker caps an AMQP publish body at 1800 bytes;
-# larger payloads get the typed OVERSIZE refusal (never truncation).
-
-# `stream.ordered_ack` is the CDC session protocol (replay on LINK_DOWN,
-# contiguous acknowledged prefix); `stream.publish` is the substitutable
-# fire-and-collect surface a consumer binds by pin. This module offers both.
+# Answer: 200 with an empty body on the broker's Basic.Ack; 502 on a
+# Basic.Nack (the broker would not take the record — quantum's own
+# broker nacks a body over its 1800-byte cap); 413 for a record past the
+# bounds; 503 when every collecting slot is taken. Losing the broker
+# connection writes LINK DOWN; the next Confirm.SelectOk writes LINK UP,
+# and the requester re-issues every exchange it held open.
+#
+# Delivery terms (`stream.ordered_ack`):
+#   ack       — 200 is durable acceptance: PUBLISHER CONFIRMS
+#               (confirm.select; basic.ack), which quantum's broker
+#               gates on Clustor quorum durability.
+#   ordering  — one channel, serialized publishes: confirm tags are
+#               sequential in request order.
+#   no silent drops — every exchange is confirmed, nacked, refused, or
+#               invalidated by LINK DOWN.
+#   backpressure — `request_in` is read only while connected with
+#               confirm-window room (the broker allows at most 8
+#               pending publishes per connection).
+#   broadcast — one queue is ONE ordering unit, so BROADCAST is a plain
+#               publish.
 capabilities = ["stream.ordered_ack.sink"]
 
-# The terms this module offers `stream.publish` on. `max_payload` is the
-# protocol ceiling, which is NOT the same as `publish_in`'s max_record: the
-# port sizes the channel ring, this sizes what the broker will actually
-# accept. A producer declaring a larger max_record now fails the build
-# instead of collecting typed OVERSIZE refusals at runtime.
-#
-# AMQP 0-9-1 publisher confirms are the durable accept. One queue is ONE
-# ordering unit, so broadcast degenerates to a plain publish. This broker
-# caps a publish body at 1800 bytes.
+# `max_payload` is the largest record this module carries: the contract's
+# collected-body ceiling, sent as body frames within AMQP's minimum
+# frame-max. A broker that caps bodies lower nacks the excess.
 [capability_facts."stream.ordered_ack.sink"]
 ack        = "durable"
 ordering   = "single"
@@ -64,21 +60,23 @@ content_type = "NetProto"
 buffer_size = 16384
 max_record = 1600
 
-# in[1]: MSG_CDC_PUBLISH `SinkPublish` frames from the producer.
+# in[1]: exchange request records — PUBLISH exchanges to answer.
 [[ports]]
-name = "publish_in"
+name = "request_in"
 index = 1
 direction = "input"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 buffer_size = 32768
-max_record = 8717
+max_record = 8192
 
-# out[1]: MSG_CDC_ACK `SinkAck` frames (replies + link-state).
+# out[1]: exchange response records — one answer per exchange, and LINK.
 [[ports]]
-name = "ack_out"
+name = "response_out"
 index = 1
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
+buffer_size = 4096
+max_record = 8192
 
 [observability]
 exempt = "byte counters ride the shared telemetry ring like mqtt_sink; module-scope metric ids arrive with the metrics port in a later slice"

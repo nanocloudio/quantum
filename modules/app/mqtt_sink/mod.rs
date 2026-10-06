@@ -1,22 +1,20 @@
-// mqtt_sink — MQTT 3.1.1 QoS 1 producer exposing the generic
-// `stream.ordered_ack` surface. See manifest.toml for the
-// contract mapping; the frame layouts below are the surface's wire
-// (currently owned by lattice `modules/common/cdc_wire.rs`) and
-// inlined byte-for-byte — that owner's conformance vectors are the
-// cross-repo drift check.
+// mqtt_sink — MQTT 3.1.1 QoS 1 producer, a PROVIDER of the exchange
+// contract. See manifest.toml for the delivery terms it declares.
 //
-// Structure is a fork of `mqtt_client` (same net_proto handling, same
+// Structure follows `mqtt_client` (same net_proto handling, same
 // reconnect discipline), reduced to a pure QoS-1 PRODUCER:
 //
 //   Init -> Connecting -> WaitConnect -> MqttConnect -> WaitConnack
 //        -> Running -> Reconnect -> Connecting ...
 //
-// Running: drain MSG_PUBLISH frames while the in-flight window
-// has room, one serialized MQTT PUBLISH each (packet-id mapped to the
-// publish corr in a fixed ring); PUBACK answers status 0 on ack_out.
-// Entering Running emits LINK_UP; any connection loss emits LINK_DOWN
-// and clears the in-flight ring — those corrs are exactly the set the
-// producer must re-publish per the surface contract.
+// Running: read `request_in` while the in-flight window has room, one
+// serialized MQTT PUBLISH per collected PUBLISH exchange, its body the
+// payload byte for byte (the packet id maps to the exchange in the
+// window); PUBACK answers 200 with an empty body on `response_out`.
+// A connection lost after CONNACK writes LINK DOWN and clears the
+// window — those exchanges are exactly the set the requester re-issues
+// after the LINK UP that the next CONNACK writes. The exchange
+// mechanics live in `modules/common/publish_exchange.rs`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -34,16 +32,11 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The ordered-ack exchange surface. Mounted from the staged SDK tree so the
-// frame layout and the status vocabulary have ONE definition: these constants
-// were previously hand-copied here, which is a wire contract maintained by
-// comment across three repositories.
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-mod exchange;
-use exchange::{
-    Ack, Publish, ACK_WIRE_LEN, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX, PUBLISH_FRAME_MAX,
-    PUBLISH_OVERHEAD, REFUSE_OVERSIZE, STATUS_LINK_DOWN, STATUS_LINK_UP, STATUS_OK,
-};
+// The exchange contract, through the provider core's own mount of it.
+#[path = "../../common/publish_exchange.rs"]
+mod publish_exchange;
+use publish_exchange::exchange::{status, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::PublishProvider;
 
 // ── Net protocol (same vocabulary as mqtt_client) ────────────────────
 
@@ -65,22 +58,27 @@ use abi::contracts::net::net_proto::{
 mod authority;
 use authority::{Authority, PORT_QUANTUM_BROKER};
 
-// ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
-
 // ── Sizing ───────────────────────────────────────────────────────────
 
-/// One worst-case CDC envelope (lattice CDC_ENVELOPE_MAX = 4478) plus
-/// MQTT topic + headers — the C-1 frame budget.
-const TX_BUF_SIZE: usize = PUBLISH_FRAME_MAX + 4096;
-const RX_BUF_SIZE: usize = 2048;
-const CHAN_BUF_SIZE: usize = PUBLISH_FRAME_MAX;
-const NET_BUF_SIZE: usize = 1600;
 const MAX_CLIENT_ID_LEN: usize = 32;
 const MAX_TOPIC_LEN: usize = 96;
+/// One PUBLISH: fixed header (1 + up to 3 length bytes), the topic with
+/// its length prefix, the packet id, and the largest body the contract
+/// collects — so every collected record fits, and none is refused here.
+const TX_BUF_SIZE: usize = 4 + 2 + MAX_TOPIC_LEN + 2 + PAYLOAD_MAX;
+const RX_BUF_SIZE: usize = 2048;
+const NET_BUF_SIZE: usize = 1600;
 
-/// QoS-1 in-flight window: publishes sent, PUBACK not yet seen. Full
-/// window = stop draining publish_in (backpressure by channel).
+/// QoS-1 in-flight window: publishes sent, PUBACK not yet seen. A full
+/// window stops `request_in` being read (backpressure by channel).
 const INFLIGHT_CAP: usize = 32;
+/// Requests collected at once while their bodies arrive.
+const REQUEST_SLOTS: usize = 2;
+/// Records owed on `response_out`: one per window slot, one per read,
+/// and the LINK pair.
+const OWED_CAP: usize = INFLIGHT_CAP + 3;
+
+type Desk = PublishProvider<REQUEST_SLOTS, PAYLOAD_MAX, INFLIGHT_CAP, OWED_CAP>;
 
 const CONNECT_TIMEOUT_MS: u64 = 10000;
 const BACKOFF_INIT_MS: u64 = 2000;
@@ -113,8 +111,8 @@ struct SinkState {
     syscalls: *const SyscallTable,
     net_in_chan: i32,
     net_out_chan: i32,
-    publish_in_chan: i32,
-    ack_out_chan: i32,
+    request_in_chan: i32,
+    response_out_chan: i32,
 
     authority: Authority,
     keepalive_s: u8,
@@ -136,17 +134,18 @@ struct SinkState {
     tx_len: u16,
     tx_sent: u16,
 
-    // In-flight window: packet_id -> corr. Slot i used when corr != 0.
-    inflight_pkt: [u16; INFLIGHT_CAP],
-    inflight_corr: [u64; INFLIGHT_CAP],
-    inflight_used: u16,
-
     client_id: [u8; MAX_CLIENT_ID_LEN],
     topic: [u8; MAX_TOPIC_LEN],
 
+    /// Requests being collected, publishes awaiting PUBACK (keyed by
+    /// packet id), and the records owed on `response_out`.
+    desk: Desk,
+    outbox: ExchangeOutbox,
+
     tx_buf: [u8; TX_BUF_SIZE],
     rx_buf: [u8; RX_BUF_SIZE],
-    chan_buf: [u8; CHAN_BUF_SIZE],
+    req_buf: [u8; RECORD_MAX],
+    resp_buf: [u8; RECORD_MAX],
     net_buf: [u8; NET_BUF_SIZE],
 }
 
@@ -264,34 +263,23 @@ unsafe fn write_mqtt_string(buf: *mut u8, s: *const u8, len: usize) -> usize {
     2 + len
 }
 
-// ── ack_out emission ─────────────────────────────────────────────────
+// ── response_out ─────────────────────────────────────────────────────
 
-/// Write one `[MSG_ACK][len][corr:u64][status]` envelope.
-unsafe fn send_ack(s: &mut SinkState, corr: u64, status: u8) -> bool {
-    if s.ack_out_chan < 0 {
-        return false;
-    }
+/// Place every record owed on `response_out`, in order, until the port
+/// has no room; the outbox holds the one that did not fit.
+unsafe fn flush_answers(s: &mut SinkState) {
     let sys = &*s.syscalls;
-    let mut buf = [0u8; 3 + 9];
-    buf[0] = MSG_ACK;
-    buf[1] = 9;
-    buf[2] = 0;
-    buf[3..11].copy_from_slice(&corr.to_le_bytes());
-    buf[11] = status;
-    (sys.channel_write)(s.ack_out_chan, buf.as_mut_ptr(), buf.len()) == buf.len() as i32
-}
-
-/// LINK_DOWN: every in-flight corr becomes unknowable — the ring is
-/// cleared, and the signal tells the pump to replay after LINK_UP.
-unsafe fn emit_link_down(s: &mut SinkState) {
-    let mut i = 0;
-    while i < INFLIGHT_CAP {
-        s.inflight_corr[i] = 0;
-        s.inflight_pkt[i] = 0;
-        i += 1;
+    loop {
+        if !s.outbox.flush(sys, s.response_out_chan, &s.resp_buf) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&mut s.resp_buf) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out_chan, &s.resp_buf, n) {
+            return;
+        }
     }
-    s.inflight_used = 0;
-    let _ = send_ack(s, 0, STATUS_LINK_DOWN);
 }
 
 // ── MQTT builders ────────────────────────────────────────────────────
@@ -413,49 +401,54 @@ unsafe fn start_send(s: &mut SinkState, len: usize) -> bool {
     flush_tx(s)
 }
 
-// ── Publish intake (the sink half of the ordered_ack pair) ───────────
+// ── Request intake ───────────────────────────────────────────────────
 
-/// Drain publish frames while connected, TX free, and window room.
-unsafe fn handle_publish_intake(s: &mut SinkState) {
+/// After a LINK DOWN, read and drop request records until the LINK UP
+/// is away: the requester re-issues every exchange it held open.
+unsafe fn discard_requests(s: &mut SinkState) {
+    let sys = &*s.syscalls;
+    while s.desk.discarding() && s.request_in_chan >= 0 {
+        let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+            return;
+        }
+        if (sys.channel_read)(s.request_in_chan, s.req_buf.as_mut_ptr(), RECORD_MAX) <= 0 {
+            return;
+        }
+    }
+}
+
+/// Read request records while connected, TX free, and the desk can take
+/// one; each completed PUBLISH goes to the broker as one QoS-1 PUBLISH.
+unsafe fn handle_requests(s: &mut SinkState) {
     if s.phase != Phase::Running {
-        return; // backpressure by channel (§11 term 4)
+        return; // backpressure by channel
     }
     loop {
         if s.tx_sent < s.tx_len && !flush_tx(s) {
             return;
         }
-        if s.inflight_used as usize >= INFLIGHT_CAP || s.publish_in_chan < 0 {
+        if !s.desk.can_take() || s.request_in_chan < 0 {
             return;
         }
         let sys = &*s.syscalls;
-        let poll = (sys.channel_poll)(s.publish_in_chan, POLL_IN);
+        let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             return;
         }
-        let mut hdr = [0u8; 3];
-        if (sys.channel_read)(s.publish_in_chan, hdr.as_mut_ptr(), 3) < 3 {
+        let n = (sys.channel_read)(s.request_in_chan, s.req_buf.as_mut_ptr(), RECORD_MAX);
+        if n <= 0 {
             return;
         }
-        let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        if len > CHAN_BUF_SIZE {
-            return;
-        }
-        if len > 0
-            && ((sys.channel_read)(s.publish_in_chan, s.chan_buf.as_mut_ptr(), len) as usize) < len
-        {
-            return;
-        }
-        if hdr[0] != MSG_PUBLISH || len < PUBLISH_OVERHEAD {
+        let Some(at) = s.desk.accept(&s.req_buf[..n as usize]) else {
+            flush_answers(s);
             continue;
-        }
-        // One decoder, from the SDK contract: the frame layout is not
-        // this module's to know.
-        let Some(publish) = Publish::decode(&s.chan_buf[..len]) else {
-            continue; // malformed; nothing addressable to refuse
         };
-        let corr = publish.corr;
-        let plen = publish.payload.len();
-        let payload_ptr = publish.payload.as_ptr();
+        // One topic is one ordering unit: the target (the ordering key)
+        // and BROADCAST both name it, so neither changes the PUBLISH.
+        let Some(body) = s.desk.request(at).map(|r| r.body) else {
+            continue;
+        };
 
         // Fresh packet id (1..=65535, never 0).
         s.packet_id = s.packet_id.wrapping_add(1);
@@ -468,34 +461,24 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
             s.topic.as_ptr(),
             s.topic_len as usize,
             s.packet_id,
-            payload_ptr,
-            plen,
+            body.as_ptr(),
+            body.len(),
         );
         if pkt_len == 0 {
-            // Frame budget exceeded: typed refusal, never truncation.
-            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
+            // Past the frame budget: refused, never truncated.
+            s.desk.refuse(at, status::TOO_LARGE);
+            flush_answers(s);
             continue;
         }
-        // Record in-flight BEFORE the send so a PUBACK can never race
-        // an unrecorded corr.
-        let mut slot = usize::MAX;
-        let mut i = 0;
-        while i < INFLIGHT_CAP {
-            if s.inflight_corr[i] == 0 {
-                slot = i;
-                break;
-            }
-            i += 1;
+        // Into the window BEFORE the send, so a PUBACK can never race an
+        // unrecorded packet id.
+        let now = millis(s);
+        if !s.desk.dispatch(at, s.packet_id as u64, now) {
+            return; // window full (ruled out by can_take)
         }
-        if slot == usize::MAX {
-            return; // window full (checked above; defensive)
-        }
-        s.inflight_corr[slot] = corr;
-        s.inflight_pkt[slot] = s.packet_id;
-        s.inflight_used += 1;
         let _ = start_send(s, pkt_len);
         // Serialize: one MQTT packet in TX at a time keeps broker
-        // order = publish order (§11 term 2). Loop re-checks flush.
+        // order = request order. The loop re-checks the flush.
     }
 }
 
@@ -529,9 +512,9 @@ unsafe fn process_rx_packet(s: &mut SinkState) -> usize {
                         s.last_ping_ms = millis(s);
                         s.last_activity_ms = s.last_ping_ms;
                         s.backoff_ms = BACKOFF_INIT_MS;
-                        // (Re)connected and writable: the §11 signal
-                        // the pump gates publishing on.
-                        let _ = send_ack(s, 0, STATUS_LINK_UP);
+                        // (Re)connected and accepting: LINK UP after a
+                        // LINK DOWN.
+                        s.desk.link_up();
                     }
                 } else {
                     log_err(s, b"[mqttsink] connack rejected");
@@ -543,18 +526,7 @@ unsafe fn process_rx_packet(s: &mut SinkState) -> usize {
             // PUBACK: [packet_id:2] — durable acceptance at QoS 1.
             if rem_len >= 2 {
                 let pid = ((*buf.add(var_start) as u16) << 8) | (*buf.add(var_start + 1) as u16);
-                let mut i = 0;
-                while i < INFLIGHT_CAP {
-                    if s.inflight_corr[i] != 0 && s.inflight_pkt[i] == pid {
-                        let corr = s.inflight_corr[i];
-                        s.inflight_corr[i] = 0;
-                        s.inflight_pkt[i] = 0;
-                        s.inflight_used = s.inflight_used.saturating_sub(1);
-                        let _ = send_ack(s, corr, STATUS_OK);
-                        break;
-                    }
-                    i += 1;
-                }
+                let _ = s.desk.settle(pid as u64, status::OK);
             }
             s.last_activity_ms = millis(s);
         }
@@ -660,9 +632,9 @@ unsafe fn handle_keepalive(s: &mut SinkState) {
 }
 
 unsafe fn enter_reconnect(s: &mut SinkState) {
-    // The unacked window is now unknowable: LINK_DOWN first, so the
-    // pump learns before any LINK_UP re-opens publishing.
-    emit_link_down(s);
+    // The unacknowledged window is now unknowable: LINK DOWN first, so
+    // the requester learns before any LINK UP.
+    s.desk.link_down();
     if s.conn_present != 0 && s.net_out_chan >= 0 {
         let sys = &*s.syscalls;
         let mut payload = [0u8; 2];
@@ -739,8 +711,10 @@ pub unsafe extern "C" fn module_new(
         let sys = &*(syscalls as *const SyscallTable);
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
-        s.publish_in_chan = dev_channel_port(sys, 0, 1);
-        s.ack_out_chan = dev_channel_port(sys, 1, 1);
+        s.request_in_chan = dev_channel_port(sys, 0, 1);
+        s.response_out_chan = dev_channel_port(sys, 1, 1);
+        s.desk.reset();
+        s.outbox = ExchangeOutbox::new();
         params_def::parse_tlv(s, params, params_len);
         s.phase = Phase::Init;
         s.packet_id = 0;
@@ -755,6 +729,13 @@ pub unsafe extern "C" fn module_new(
         }
         if s.topic_len == 0 {
             log_err(s, b"[mqttsink] missing topic");
+            return -10;
+        }
+        if s.request_in_chan < 0 || s.response_out_chan < 0 {
+            log_err(
+                s,
+                b"[mqttsink] refusing to construct: request_in and response_out must both be wired",
+            );
             return -10;
         }
         0
@@ -777,6 +758,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys_ptr = s.syscalls;
         let sys = &*sys_ptr;
+
+        // Answers and LINK records leave whatever the phase, and requests
+        // a LINK DOWN invalidated are dropped while the link is away.
+        flush_answers(s);
+        discard_requests(s);
 
         loop {
             match s.phase {
@@ -879,7 +865,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         return 0;
                     }
                     let _ = flush_tx(s);
-                    handle_publish_intake(s);
+                    handle_requests(s);
+                    flush_answers(s);
                     if s.phase != Phase::Running {
                         return 0;
                     }

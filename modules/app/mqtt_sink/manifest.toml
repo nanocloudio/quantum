@@ -4,45 +4,38 @@ timer_class      = "wall_clock"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# mqtt_sink — MQTT 3.1.1 QoS 1 PRODUCER exposing the generic
-# `stream.ordered_ack` surface: ordered publishes in, durable acks
-# + link-state signals out. Any producer graph that speaks the surface
-# can compose it by deployment pin — quantum knows nothing about who
-# publishes (lattice CDC is the first consumer; the wire fragment is
-# currently owned by lattice `modules/common/cdc_wire.rs`, whose
-# conformance vectors are the cross-repo check; frames inlined here
-# byte-for-byte).
+# mqtt_sink — MQTT 3.1.1 QoS 1 PRODUCER, a PROVIDER of the exchange
+# contract (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Any
+# graph that publishes durably composes it by deployment pin; quantum
+# knows nothing about who publishes.
 #
-# Contract mapping (the surface's terms):
-#   term 1  ack = durable acceptance  → PUBACK at QoS 1 (quantum's
-#           broker gates PUBACK on Clustor durability proofs, so a
-#           status-0 ack is a genuinely durable accept).
-#   term 2  per-key order in a connection → one TCP connection, one
-#           topic, serialized sends: publish order IS broker order.
-#   term 3  no silent drops → every corr is PUBACK-answered, refused
-#           (oversize), or invalidated by LINK_DOWN on connection loss.
-#   term 4  backpressure by channel → publish_in is only drained while
-#           connected with in-flight window room.
-#   term 5  broadcast → a single MQTT topic is ONE ordering unit, so
-#           FLAG_BROADCAST degenerates to a plain publish.
+# Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
+# body = the record, published as the MQTT payload byte for byte on the
+# configured `topic`; flags MORE and BROADCAST only. Anything else is
+# answered 400.
 #
-# Frame budget: TX sized for a worst-case 4 KiB payload + framing —
-# the requirement the QoS-0 mqtt_client could not meet.
-
-# `stream.ordered_ack` is the CDC session protocol (replay on LINK_DOWN,
-# contiguous acknowledged prefix); `stream.publish` is the substitutable
-# fire-and-collect surface a consumer binds by pin. This module offers both.
+# Answer: 200 with an empty body once the broker PUBACKs (QoS 1);
+# 413 for a record past the bounds, 503 when every collecting slot is
+# taken. Losing the broker connection writes LINK DOWN; the next CONNACK
+# writes LINK UP, and the requester re-issues every exchange it held
+# open.
+#
+# Delivery terms (`stream.ordered_ack`):
+#   ack       — 200 is durable acceptance: PUBACK at QoS 1, which
+#               quantum's broker gates on Clustor durability proofs.
+#   ordering  — one TCP connection, one topic, serialized sends:
+#               request order IS broker order.
+#   no silent drops — every exchange is PUBACK-answered, refused, or
+#               invalidated by LINK DOWN on connection loss.
+#   backpressure — `request_in` is read only while connected with
+#               in-flight window room.
+#   broadcast — a single MQTT topic is ONE ordering unit, so BROADCAST
+#               is a plain publish.
 capabilities = ["stream.ordered_ack.sink"]
 
-# The terms this module offers `stream.publish` on. `max_payload` is the
-# protocol ceiling, which is NOT the same as `publish_in`'s max_record: the
-# port sizes the channel ring, this sizes what the broker will actually
-# accept. A producer declaring a larger max_record now fails the build
-# instead of collecting typed OVERSIZE refusals at runtime.
-#
-# MQTT 3.1.1 QoS 1: PUBACK is the durable accept. One topic is ONE ordering
-# unit, so broadcast degenerates to a plain publish. TX is sized for a
-# worst-case 4 KiB payload + framing.
+# `max_payload` is the largest record this module carries: the contract's
+# collected-body ceiling, which the PUBLISH buffer is sized to hold. A
+# requester declaring a larger one fails the build.
 [capability_facts."stream.ordered_ack.sink"]
 ack        = "durable"
 ordering   = "single"
@@ -64,21 +57,23 @@ content_type = "NetProto"
 buffer_size = 16384
 max_record = 1600
 
-# in[1]: MSG_CDC_PUBLISH `SinkPublish` frames from the producer.
+# in[1]: exchange request records — PUBLISH exchanges to answer.
 [[ports]]
-name = "publish_in"
+name = "request_in"
 index = 1
 direction = "input"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 buffer_size = 32768
-max_record = 8717
+max_record = 8192
 
-# out[1]: MSG_CDC_ACK `SinkAck` frames (replies + link-state).
+# out[1]: exchange response records — one answer per exchange, and LINK.
 [[ports]]
-name = "ack_out"
+name = "response_out"
 index = 1
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
+buffer_size = 4096
+max_record = 8192
 
 [observability]
 exempt = "byte counters ride the shared telemetry ring like mqtt_client; module-scope metric ids arrive with the metrics port in a later slice"

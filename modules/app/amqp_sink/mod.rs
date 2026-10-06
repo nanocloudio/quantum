@@ -1,7 +1,5 @@
-// amqp_sink — AMQP 0-9-1 publisher exposing the generic
-// `stream.ordered_ack` surface. See manifest.toml for the
-// contract mapping; the surface frames are inlined byte-for-byte from
-// their owner (lattice `modules/common/cdc_wire.rs`).
+// amqp_sink — AMQP 0-9-1 publisher, a PROVIDER of the exchange
+// contract. See manifest.toml for the delivery terms it declares.
 //
 // Structure mirrors mqtt_sink; the protocol half leans on
 // `modules/common/cores/amqp_core.rs` for the connection handshake and
@@ -13,14 +11,15 @@
 //        -> WaitOpenOk -> WaitChanOk -> WaitConfirmOk -> Running
 //        -> Reconnect -> Connecting ...
 //
-// Running: drain MSG_PUBLISH while the confirm window has room
-// (the broker allows at most 8 pending publishes per connection),
-// three frames per publish (method + content header + body), delivery
-// tags sequential from 1 mapped to publish corrs in an ordered ring.
-// Basic.Ack answers status 0; Basic.Nack answers a typed refusal.
-// Entering Running emits LINK_UP; any connection loss emits LINK_DOWN
-// and clears the ring — those corrs are exactly the set the producer
-// must re-publish per the surface contract.
+// Running: read `request_in` while the confirm window has room (the
+// broker allows at most 8 pending publishes per connection), three
+// frames per publish (method + content header + body), delivery tags
+// sequential from 1, each mapped to its exchange in the window.
+// Basic.Ack answers 200 with an empty body; Basic.Nack answers 502.
+// A connection lost after Confirm.SelectOk writes LINK DOWN and clears
+// the window — those exchanges are exactly the set the requester
+// re-issues after the LINK UP the next Confirm.SelectOk writes. The
+// exchange mechanics live in `modules/common/publish_exchange.rs`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -38,17 +37,11 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The ordered-ack exchange surface. Mounted from the staged SDK tree so the
-// frame layout and the status vocabulary have ONE definition: these constants
-// were previously hand-copied here, which is a wire contract maintained by
-// comment across three repositories.
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-mod exchange;
-use exchange::{
-    Ack, Publish, ACK_WIRE_LEN, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX, PUBLISH_FRAME_MAX,
-    PUBLISH_OVERHEAD, REFUSE_OVERSIZE, REFUSE_UNROUTABLE, STATUS_LINK_DOWN, STATUS_LINK_UP,
-    STATUS_OK,
-};
+// The exchange contract, through the provider core's own mount of it.
+#[path = "../../common/publish_exchange.rs"]
+mod publish_exchange;
+use publish_exchange::exchange::{status, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::PublishProvider;
 
 #[path = "../../common/cores/amqp_core.rs"]
 mod amqp_core;
@@ -79,8 +72,6 @@ use abi::contracts::net::net_proto::{
 mod authority;
 use authority::{Authority, PORT_QUANTUM_BROKER};
 
-// ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
-
 // ── AMQP method ids the core does not name ───────────────────────────
 
 const CLASS_BASIC: u16 = 60;
@@ -93,20 +84,32 @@ const CONFIRM_SELECT_OK: u16 = 11;
 
 // ── Sizing ───────────────────────────────────────────────────────────
 
-/// This broker's per-publish body ceiling; larger payloads are refused
-/// with the typed OVERSIZE status before anything hits the wire.
-// The broker's publish-body cap, at the suite ceiling. AMQP frame-max must
-// be negotiated at or above this; the `max_payload` fact carries the number a
-// producer checks against.
+/// The largest publish body: the contract's collected-body ceiling. AMQP
+/// frame-max must be negotiated at or above it; the `max_payload` fact
+/// carries the number a requester checks against.
 const MAX_PUBLISH_BODY: usize = PAYLOAD_MAX;
 /// Confirm window — the broker allows at most 8 pending per conn.
 const INFLIGHT_CAP: usize = 8;
+/// Requests collected at once while their bodies arrive.
+const REQUEST_SLOTS: usize = 2;
+/// Records owed on `response_out`: one per window slot, one per read,
+/// and the LINK pair.
+const OWED_CAP: usize = INFLIGHT_CAP + 3;
 
-const TX_BUF_SIZE: usize = PUBLISH_FRAME_MAX + 4096;
-const RX_BUF_SIZE: usize = 2048;
-const CHAN_BUF_SIZE: usize = PUBLISH_FRAME_MAX;
-const NET_BUF_SIZE: usize = 1600;
 const MAX_TOPIC_LEN: usize = 63;
+/// Largest payload of one body frame: AMQP's minimum frame-max less the
+/// 7-byte frame header and the end octet.
+const BODY_FRAME_MAX: usize = 4096 - 8;
+/// The publish frames: the method frame with the routing key, the
+/// content header, and the body frames holding the largest body.
+const TX_BUF_SIZE: usize = (12 + 5 + MAX_TOPIC_LEN)
+    + 22
+    + MAX_PUBLISH_BODY
+    + 8 * MAX_PUBLISH_BODY.div_ceil(BODY_FRAME_MAX);
+const RX_BUF_SIZE: usize = 2048;
+const NET_BUF_SIZE: usize = 1600;
+
+type Desk = PublishProvider<REQUEST_SLOTS, PAYLOAD_MAX, INFLIGHT_CAP, OWED_CAP>;
 
 const CONNECT_TIMEOUT_MS: u64 = 10000;
 const BACKOFF_INIT_MS: u64 = 2000;
@@ -134,8 +137,8 @@ struct SinkState {
     syscalls: *const SyscallTable,
     net_in_chan: i32,
     net_out_chan: i32,
-    publish_in_chan: i32,
-    ack_out_chan: i32,
+    request_in_chan: i32,
+    response_out_chan: i32,
 
     authority: Authority,
     heartbeat_s: u16,
@@ -158,17 +161,18 @@ struct SinkState {
     tx_len: u16,
     tx_sent: u16,
 
-    // Confirm window: delivery_tag -> corr. Ordered ring (tags are
-    // sequential), so `multiple=1` acks fold every earlier slot too.
-    inflight_tag: [u64; INFLIGHT_CAP],
-    inflight_corr: [u64; INFLIGHT_CAP],
-    inflight_used: u16,
-
     topic: [u8; MAX_TOPIC_LEN],
+
+    /// Requests being collected, publishes awaiting their confirm (keyed
+    /// by delivery tag — sequential, so a `multiple` confirm folds every
+    /// earlier one too), and the records owed on `response_out`.
+    desk: Desk,
+    outbox: ExchangeOutbox,
 
     tx_buf: [u8; TX_BUF_SIZE],
     rx_buf: [u8; RX_BUF_SIZE],
-    chan_buf: [u8; CHAN_BUF_SIZE],
+    req_buf: [u8; RECORD_MAX],
+    resp_buf: [u8; RECORD_MAX],
     net_buf: [u8; NET_BUF_SIZE],
 }
 
@@ -258,7 +262,7 @@ fn method_frame(
     Some(total)
 }
 
-/// Build the three publish frames (method + content header + body)
+/// Build the publish frames (method + content header + body frames)
 /// contiguously into `out`. Returns total length.
 fn publish_frames(channel: u16, routing_key: &[u8], body: &[u8], out: &mut [u8]) -> Option<usize> {
     if routing_key.is_empty() || routing_key.len() > 63 || body.len() > MAX_PUBLISH_BODY {
@@ -298,18 +302,22 @@ fn publish_frames(channel: u16, routing_key: &[u8], body: &[u8], out: &mut [u8])
     h[hdr_total - 1] = FRAME_END;
     p += hdr_total;
 
-    // Body frame (single — 1800 fits well inside frame-max 8192).
-    let body_total = 7 + body.len() + 1;
-    if p + body_total > out.len() {
-        return None;
+    // Body frames, each within AMQP's minimum frame-max (4096 bytes,
+    // frame header and end octet included), so no negotiated frame-max
+    // can refuse one. An empty body sends none.
+    for chunk in body.chunks(BODY_FRAME_MAX) {
+        let body_total = 7 + chunk.len() + 1;
+        if p + body_total > out.len() {
+            return None;
+        }
+        let b = &mut out[p..];
+        b[0] = FRAME_BODY;
+        b[1..3].copy_from_slice(&channel.to_be_bytes());
+        b[3..7].copy_from_slice(&(chunk.len() as u32).to_be_bytes());
+        b[7..7 + chunk.len()].copy_from_slice(chunk);
+        b[body_total - 1] = FRAME_END;
+        p += body_total;
     }
-    let b = &mut out[p..];
-    b[0] = FRAME_BODY;
-    b[1..3].copy_from_slice(&channel.to_be_bytes());
-    b[3..7].copy_from_slice(&(body.len() as u32).to_be_bytes());
-    b[7..7 + body.len()].copy_from_slice(body);
-    b[body_total - 1] = FRAME_END;
-    p += body_total;
     Some(p)
 }
 
@@ -324,31 +332,23 @@ fn heartbeat_frame(out: &mut [u8]) -> Option<usize> {
     Some(8)
 }
 
-// ── ack_out emission ─────────────────────────────────────────────────
+// ── response_out ─────────────────────────────────────────────────────
 
-unsafe fn send_ack(s: &mut SinkState, corr: u64, status: u8) -> bool {
-    if s.ack_out_chan < 0 {
-        return false;
-    }
+/// Place every record owed on `response_out`, in order, until the port
+/// has no room; the outbox holds the one that did not fit.
+unsafe fn flush_answers(s: &mut SinkState) {
     let sys = &*s.syscalls;
-    let mut buf = [0u8; 3 + 9];
-    buf[0] = MSG_ACK;
-    buf[1] = 9;
-    buf[2] = 0;
-    buf[3..11].copy_from_slice(&corr.to_le_bytes());
-    buf[11] = status;
-    (sys.channel_write)(s.ack_out_chan, buf.as_mut_ptr(), buf.len()) == buf.len() as i32
-}
-
-unsafe fn emit_link_down(s: &mut SinkState) {
-    let mut i = 0;
-    while i < INFLIGHT_CAP {
-        s.inflight_tag[i] = 0;
-        s.inflight_corr[i] = 0;
-        i += 1;
+    loop {
+        if !s.outbox.flush(sys, s.response_out_chan, &s.resp_buf) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&mut s.resp_buf) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out_chan, &s.resp_buf, n) {
+            return;
+        }
     }
-    s.inflight_used = 0;
-    let _ = send_ack(s, 0, STATUS_LINK_DOWN);
 }
 
 // ── TX ───────────────────────────────────────────────────────────────
@@ -402,9 +402,26 @@ unsafe fn start_send(s: &mut SinkState, len: usize) -> bool {
     flush_tx(s)
 }
 
-// ── Publish intake ───────────────────────────────────────────────────
+// ── Request intake ───────────────────────────────────────────────────
 
-unsafe fn handle_publish_intake(s: &mut SinkState) {
+/// After a LINK DOWN, read and drop request records until the LINK UP
+/// is away: the requester re-issues every exchange it held open.
+unsafe fn discard_requests(s: &mut SinkState) {
+    let sys = &*s.syscalls;
+    while s.desk.discarding() && s.request_in_chan >= 0 {
+        let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+            return;
+        }
+        if (sys.channel_read)(s.request_in_chan, s.req_buf.as_mut_ptr(), RECORD_MAX) <= 0 {
+            return;
+        }
+    }
+}
+
+/// Read request records while connected, TX free, and the desk can take
+/// one; each completed PUBLISH goes to the broker as one Basic.Publish.
+unsafe fn handle_requests(s: &mut SinkState) {
     if s.phase != Phase::Running {
         return; // backpressure by channel
     }
@@ -412,93 +429,63 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
         if s.tx_sent < s.tx_len && !flush_tx(s) {
             return;
         }
-        if s.inflight_used as usize >= INFLIGHT_CAP || s.publish_in_chan < 0 {
+        if !s.desk.can_take() || s.request_in_chan < 0 {
             return;
         }
         let sys = &*s.syscalls;
-        let poll = (sys.channel_poll)(s.publish_in_chan, POLL_IN);
+        let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             return;
         }
-        let mut hdr = [0u8; 3];
-        if (sys.channel_read)(s.publish_in_chan, hdr.as_mut_ptr(), 3) < 3 {
+        let n = (sys.channel_read)(s.request_in_chan, s.req_buf.as_mut_ptr(), RECORD_MAX);
+        if n <= 0 {
             return;
         }
-        let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        if len > CHAN_BUF_SIZE {
-            return;
-        }
-        if len > 0
-            && ((sys.channel_read)(s.publish_in_chan, s.chan_buf.as_mut_ptr(), len) as usize) < len
-        {
-            return;
-        }
-        if hdr[0] != MSG_PUBLISH || len < PUBLISH_OVERHEAD {
-            continue;
-        }
-        // One decoder, from the SDK contract: the frame layout is not
-        // this module's to know.
-        let Some(publish) = Publish::decode(&s.chan_buf[..len]) else {
+        let Some(at) = s.desk.accept(&s.req_buf[..n as usize]) else {
+            flush_answers(s);
             continue;
         };
-        let corr = publish.corr;
-        let plen = publish.payload.len();
-        if plen > MAX_PUBLISH_BODY {
-            // Broker body ceiling: typed refusal, never truncation.
-            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
+        // One queue is one ordering unit: the target (the ordering key)
+        // and BROADCAST both name it, so neither changes the publish.
+        let Some(body) = s.desk.request(at).map(|r| r.body) else {
             continue;
-        }
-        let body = publish.payload;
+        };
         let topic = &s.topic[..s.topic_len as usize];
-        let mut frames = [0u8; TX_BUF_SIZE];
-        let Some(flen) = publish_frames(CHANNEL, topic, body, &mut frames) else {
-            let _ = send_ack(s, corr, REFUSE_UNROUTABLE);
+        let built = publish_frames(CHANNEL, topic, body, &mut s.tx_buf);
+        let Some(flen) = built else {
+            // Past the frame budget: refused, never truncated.
+            s.desk.refuse(at, status::TOO_LARGE);
+            flush_answers(s);
             continue;
         };
-        // Record the confirm slot BEFORE the send: the broker's tag
-        // for this publish is `next_tag`.
-        let mut slot = usize::MAX;
-        let mut i = 0;
-        while i < INFLIGHT_CAP {
-            if s.inflight_corr[i] == 0 {
-                slot = i;
-                break;
-            }
-            i += 1;
+        // Into the window BEFORE the send: the broker's tag for this
+        // publish is `next_tag`.
+        if !s.desk.dispatch(at, s.next_tag, millis(s)) {
+            return; // window full (ruled out by can_take)
         }
-        if slot == usize::MAX {
-            return;
-        }
-        s.inflight_tag[slot] = s.next_tag;
-        s.inflight_corr[slot] = corr;
-        s.inflight_used += 1;
         s.next_tag = s.next_tag.wrapping_add(1);
-        s.tx_buf[..flen].copy_from_slice(&frames[..flen]);
         let _ = start_send(s, flen);
-        // Serialize: publishes hit the broker in intake order, so
-        // confirm tags stay sequential with the ring.
+        // Serialize: publishes reach the broker in request order, so
+        // confirm tags stay sequential with the window.
     }
 }
 
 // ── RX ───────────────────────────────────────────────────────────────
 
-/// Fold a Basic.Ack / Basic.Nack. This broker always sends
+/// Fold a Basic.Ack / Basic.Nack: 200 for an ack, 502 for a nack (the
+/// broker would not take the record). This broker always sends
 /// `multiple = 0`, but `multiple = 1` is folded correctly anyway (tags
-/// are sequential, so it covers every slot at or below `tag`).
+/// are sequential, so it covers every publish at or below `tag`).
 unsafe fn fold_confirm(s: &mut SinkState, tag: u64, multiple: bool, nack: bool) {
-    let mut i = 0;
-    while i < INFLIGHT_CAP {
-        if s.inflight_corr[i] != 0
-            && (s.inflight_tag[i] == tag || (multiple && s.inflight_tag[i] <= tag))
-        {
-            let corr = s.inflight_corr[i];
-            s.inflight_corr[i] = 0;
-            s.inflight_tag[i] = 0;
-            s.inflight_used = s.inflight_used.saturating_sub(1);
-            let status = if nack { REFUSE_UNROUTABLE } else { STATUS_OK };
-            let _ = send_ack(s, corr, status);
-        }
-        i += 1;
+    let verdict = if nack {
+        status::BAD_GATEWAY
+    } else {
+        status::OK
+    };
+    if multiple {
+        let _ = s.desk.settle_through(tag, verdict);
+    } else {
+        let _ = s.desk.settle(tag, verdict);
     }
 }
 
@@ -569,7 +556,7 @@ unsafe fn process_frames(s: &mut SinkState) {
                     s.next_tag = 1;
                     s.backoff_ms = BACKOFF_INIT_MS;
                     s.last_hb_ms = millis(s);
-                    let _ = send_ack(s, 0, STATUS_LINK_UP);
+                    s.desk.link_up();
                 }
                 (CLASS_BASIC, BASIC_ACK) | (CLASS_BASIC, BASIC_NACK)
                     if payload_end - args_at >= 9 =>
@@ -682,7 +669,7 @@ unsafe fn handle_heartbeat(s: &mut SinkState) {
 }
 
 unsafe fn enter_reconnect(s: &mut SinkState) {
-    emit_link_down(s);
+    s.desk.link_down();
     if s.conn_present != 0 && s.net_out_chan >= 0 {
         let sys = &*s.syscalls;
         let mut payload = [0u8; 2];
@@ -759,8 +746,10 @@ pub unsafe extern "C" fn module_new(
         let sys = &*(syscalls as *const SyscallTable);
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
-        s.publish_in_chan = dev_channel_port(sys, 0, 1);
-        s.ack_out_chan = dev_channel_port(sys, 1, 1);
+        s.request_in_chan = dev_channel_port(sys, 0, 1);
+        s.response_out_chan = dev_channel_port(sys, 1, 1);
+        s.desk.reset();
+        s.outbox = ExchangeOutbox::new();
         params_def::parse_tlv(s, params, params_len);
         s.phase = Phase::Init;
         s.next_tag = 1;
@@ -775,6 +764,13 @@ pub unsafe extern "C" fn module_new(
         }
         if s.topic_len == 0 {
             log_err(s, b"[amqpsink] missing topic");
+            return -10;
+        }
+        if s.request_in_chan < 0 || s.response_out_chan < 0 {
+            log_err(
+                s,
+                b"[amqpsink] refusing to construct: request_in and response_out must both be wired",
+            );
             return -10;
         }
         0
@@ -797,6 +793,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys_ptr = s.syscalls;
         let sys = &*sys_ptr;
+
+        // Answers and LINK records leave whatever the phase, and requests
+        // a LINK DOWN invalidated are dropped while the link is away.
+        flush_answers(s);
+        discard_requests(s);
 
         loop {
             match s.phase {
@@ -904,7 +905,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         return 0;
                     }
                     let _ = flush_tx(s);
-                    handle_publish_intake(s);
+                    handle_requests(s);
+                    flush_answers(s);
                     if s.phase != Phase::Running {
                         return 0;
                     }

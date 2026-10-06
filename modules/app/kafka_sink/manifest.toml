@@ -4,53 +4,50 @@ timer_class      = "wall_clock"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# kafka_sink — Kafka PRODUCER exposing the generic
-# `stream.ordered_ack` surface: ordered publishes in, durable acks
-# + link-state signals out. Sibling of mqtt_sink/amqp_sink; any
-# producer graph composes it by deployment pin. Wire fragment for the
-# surface is currently owned by lattice `modules/common/cdc_wire.rs`
-# (frames inlined byte-for-byte; that owner's conformance vectors are
-# the cross-repo check).
+# kafka_sink — Kafka PRODUCER, a PROVIDER of the exchange contract
+# (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Sibling of
+# mqtt_sink/amqp_sink; any graph that publishes durably composes it by
+# deployment pin.
 #
-# Contract mapping (the surface's terms):
-#   term 1  ack = durable acceptance → Produce with acks=-1; this
-#           broker emits the ProduceResponse only after quorum
-#           durability of every partition in the request.
-#   term 2  per-key order in a connection → the message key selects
-#           the partition (FNV-1a % partition count) and publishes are
-#           serialized, so same-key events land one partition in
-#           publish order.
-#   term 3  no silent drops → every publish is answered (per-partition
-#           error mapped to a typed refusal) or invalidated by
-#           LINK_DOWN.
-#   term 4  backpressure by channel → publish_in drained only while
-#           connected with produce-window room.
-#   term 5  broadcast → ONE Produce request naming EVERY partition;
-#           the broker acks it only after the SLOWEST partition is
-#           durable, which is exactly the surface's broadcast ack.
+# Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX),
+# produced as the Kafka record key; body = the record, produced as the
+# record value byte for byte to the configured `topic`; flags MORE and
+# BROADCAST only. Anything else is answered 400.
+#
+# Answer: 200 with an empty body once the ProduceResponse reports every
+# named partition durable; 413 for a record past the bounds or one the
+# broker reports MESSAGE_TOO_LARGE; 502 for any other partition error;
+# 503 when every collecting slot is taken. Losing the broker connection
+# (or a produce unanswered for 15 s) writes LINK DOWN; the next Metadata
+# round trip writes LINK UP, and the requester re-issues every exchange
+# it held open.
+#
+# Delivery terms (`stream.ordered_ack`):
+#   ack       — 200 is durable acceptance: Produce with acks=-1; this
+#               broker emits the ProduceResponse only after quorum
+#               durability of every partition in the request.
+#   ordering  — per key: the ordering key selects the partition
+#               (FNV-1a % partition count) and produces are serialized,
+#               so same-key records land on one partition in request
+#               order.
+#   no silent drops — every exchange is answered or invalidated by
+#               LINK DOWN.
+#   backpressure — `request_in` is read only while connected with
+#               produce-window room.
+#   broadcast — ONE Produce request naming EVERY partition; the broker
+#               acks it only after the SLOWEST partition is durable,
+#               which is exactly the contract's broadcast answer. A
+#               broadcast whose batches do not fit one Produce request
+#               (about 12 KiB) is refused with 413.
 #
 # This is the partitioned-backend validation vehicle: unlike MQTT/AMQP
-# (single ordering unit), Kafka genuinely exercises the msg_key
+# (single ordering unit), Kafka genuinely exercises the ordering-key
 # partition mapping and the broadcast fan-out.
-#
-# Payload ceiling: this broker caps a partition's records blob at 1900
-# bytes; larger payloads get the typed OVERSIZE refusal.
-
-# `stream.ordered_ack` is the CDC session protocol (replay on LINK_DOWN,
-# contiguous acknowledged prefix); `stream.publish` is the substitutable
-# fire-and-collect surface a consumer binds by pin. This module offers both.
 capabilities = ["stream.ordered_ack.sink"]
 
-# The terms this module offers `stream.publish` on. `max_payload` is the
-# protocol ceiling, which is NOT the same as `publish_in`'s max_record: the
-# port sizes the channel ring, this sizes what the broker will actually
-# accept. A producer declaring a larger max_record now fails the build
-# instead of collecting typed OVERSIZE refusals at runtime.
-#
-# Kafka acks=-1: the ProduceResponse follows quorum durability. The message
-# key selects the partition, so same-key records are ordered; a broadcast is
-# ONE Produce naming every partition. This broker caps a partition's records
-# blob at 1900 bytes.
+# `max_payload` is the largest record value this module carries: the
+# contract's collected-body ceiling. The broker's `message.max.bytes`
+# must admit one batch of that value with a KEY_MAX key.
 [capability_facts."stream.ordered_ack.sink"]
 ack        = "durable"
 ordering   = "per_key"
@@ -72,21 +69,23 @@ content_type = "NetProto"
 buffer_size = 16384
 max_record = 1600
 
-# in[1]: MSG_CDC_PUBLISH `SinkPublish` frames from the producer.
+# in[1]: exchange request records — PUBLISH exchanges to answer.
 [[ports]]
-name = "publish_in"
+name = "request_in"
 index = 1
 direction = "input"
-content_type = "OctetStream"
+content_type = "ExchangeRequest"
 buffer_size = 32768
-max_record = 8717
+max_record = 8192
 
-# out[1]: MSG_CDC_ACK `SinkAck` frames (replies + link-state).
+# out[1]: exchange response records — one answer per exchange, and LINK.
 [[ports]]
-name = "ack_out"
+name = "response_out"
 index = 1
 direction = "output"
-content_type = "OctetStream"
+content_type = "ExchangeResponse"
+buffer_size = 4096
+max_record = 8192
 
 [observability]
 exempt = "byte counters ride the shared telemetry ring like mqtt_sink; module-scope metric ids arrive with the metrics port in a later slice"

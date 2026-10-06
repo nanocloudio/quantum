@@ -11,13 +11,16 @@ direction    = "input"
 content_type = "NetProto"
 buffer_size  = 2048
 
-# Reserved for fetch/produce requests; membership needs no input.
+# in[1]: exchange request records. In producer mode (`produce_topic` set)
+# each PUBLISH exchange is produced to the topic and answered on
+# `response_out`; a consumer answers every request 400.
 [[ports]]
-name         = "publish_in"
+name         = "request_in"
 index        = 1
 direction    = "input"
-content_type = "OctetStream"
-buffer_size  = 2048
+content_type = "ExchangeRequest"
+buffer_size  = 16384
+max_record   = 8192
 
 [[ports]]
 name         = "net_out"
@@ -26,13 +29,27 @@ content_type = "NetProto"
 buffer_size  = 2048
 max_record   = 1600
 
-# Membership transitions (joined / stable / lost).
+# Membership and produce transitions (joined / stable / lost / produced),
+# as human-readable lines.
 [[ports]]
 name         = "status_out"
 index        = 1
 direction    = "output"
 content_type = "TextPlain"
 buffer_size  = 2048
+
+# out[2]: exchange response records — one answer per exchange: 200 with an
+# empty body when the partition leader took the record (acks = leader), 413
+# for a value past 480 bytes or MESSAGE_TOO_LARGE, 502 for another partition
+# error, 400 from a consumer; and LINK DOWN / UP as the broker connection
+# drops and returns.
+[[ports]]
+name         = "response_out"
+index        = 2
+direction    = "output"
+content_type = "ExchangeResponse"
+buffer_size  = 4096
+max_record   = 8192
 
 [[resources]]
 requires_contract = "channel"

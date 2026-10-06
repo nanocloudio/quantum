@@ -15,10 +15,23 @@
 //! The protocol logic lives in the host-tested `kafka_core.rs`; this file is the
 //! I/O pump mapping its actions onto net_proto frames.
 //!
-//! Ports:  net_in/net_out (transport), publish_in (unused; reserved for fetch/
-//!         produce), status_out (membership transitions).
+//! Producer mode (`produce_topic` set) skips the group and is a PROVIDER of
+//! the exchange contract: each PUBLISH exchange on `request_in` is produced to
+//! partition 0 of the topic (acks = leader), its body the record value byte for
+//! byte, and answered on `response_out` — 200 with an empty body when the leader
+//! reports no error, 413 for MESSAGE_TOO_LARGE or a value past
+//! [`PRODUCE_VALUE_MAX`], 502 for any other partition error. One produce is in
+//! flight at a time; a second exchange collected meanwhile waits in the
+//! channel. Losing the connection with the link up writes LINK DOWN, and the
+//! reconnect writes LINK UP. The `target` (ordering key) is not produced: one
+//! partition is one ordering unit, and BROADCAST names the same one. A consumer
+//! answers every request 400 — it has no topic to produce to.
+//!
+//! Ports:  net_in/net_out (transport), request_in/response_out (PUBLISH
+//!         exchanges, producer mode), status_out (membership and produce
+//!         transitions as text).
 //! Params: `authority` (`host[:port]`, port 9092 when omitted), `group_id`,
-//!         `client_id`, `session_timeout_ms`, `heartbeat_ms`.
+//!         `client_id`, `session_timeout_ms`, `heartbeat_ms`, `produce_topic`.
 //!
 //! Scope: single-broker. The coordinator returned by FindCoordinator is assumed
 //! reachable at the configured authority; reconnecting to a different coordinator
@@ -66,6 +79,21 @@ use abi::contracts::net::net_proto::{
 mod authority;
 use authority::{Authority, PORT_KAFKA};
 
+// The exchange contract, through the provider core's own mount of it.
+#[path = "../../common/publish_exchange.rs"]
+mod publish_exchange;
+use publish_exchange::exchange::{status, RECORD_MAX};
+use publish_exchange::PublishProvider;
+
+/// Kafka error code for a record batch past the broker's limit.
+const ERR_MESSAGE_TOO_LARGE: i16 = 10;
+
+/// The largest record value a produce carries: what the core's one-record
+/// batch scratch holds with its framing. A larger body is refused 413.
+const PRODUCE_VALUE_MAX: usize = 480;
+/// One produce in flight; one request collected at once.
+type Desk = PublishProvider<1, PRODUCE_VALUE_MAX, 1, 4>;
+
 /// True when a `net_proto` frame's leading `[conn_id: u16 LE]` names
 /// `want`. Stated once because every inbound frame carries it, and a
 /// conn-id read of the wrong WIDTH matches nothing while looking
@@ -87,8 +115,9 @@ struct KafkaState {
     syscalls: *const SyscallTable,
     net_in: i32,
     net_out: i32,
-    publish_in: i32,
+    request_in: i32,
     status_out: i32,
+    response_out: i32,
 
     authority: Authority,
     group_id: [u8; NAME_BUF],
@@ -116,7 +145,7 @@ struct KafkaState {
     generation_id: i32,
 
     // PRODUCER mode: when `produce_topic` is set the module skips the
-    // consumer-group dance and produces each `publish_in` message to the topic.
+    // consumer-group dance and produces each PUBLISH exchange to the topic.
     produce_topic: [u8; NAME_BUF],
     produce_topic_len: u16,
     producing: u8,
@@ -129,6 +158,15 @@ struct KafkaState {
     acc_len: u32,
 
     nbuf: [u8; NET_BUF],
+
+    /// The exchange being collected, the produce awaiting its response
+    /// (keyed by Kafka correlation id), and the records owed on
+    /// `response_out`.
+    desk: Desk,
+    outbox: ExchangeOutbox,
+    req_rec: [u8; RECORD_MAX],
+    resp_rec: [u8; RECORD_MAX],
+
     joins: u32,
     heartbeats: u32,
     rebalances: u32,
@@ -244,8 +282,11 @@ pub unsafe extern "C" fn module_new(
         s.syscalls = sys;
         s.net_in = in_chan;
         s.net_out = out_chan;
-        s.publish_in = dev_channel_port(sys, 0, 1);
+        s.request_in = dev_channel_port(sys, 0, 1);
         s.status_out = dev_channel_port(sys, 1, 1);
+        s.response_out = dev_channel_port(sys, 1, 2);
+        s.desk.reset();
+        s.outbox = ExchangeOutbox::new();
         s.authority.clear();
         s.group_id_len = 0;
         s.client_id_len = 0;
@@ -338,9 +379,10 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
     let (action, next) = kafka_transition(s.phase, ev);
     // Producer mode skips consumer-group membership: once the TCP connection is
     // up (the transition would otherwise send ApiVersions), go straight to
-    // ProduceIdle and wait for messages on publish_in.
+    // ProduceIdle and wait for exchanges on request_in.
     if s.producing != 0 && matches!(action, KAct::SendApiVersions) {
         s.phase = KPhase::ProduceIdle;
+        s.desk.link_up();
         return;
     }
     let gid_len = s.group_id_len as usize;
@@ -426,6 +468,8 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
             s.member_id_len = 0;
             s.generation_id = -1;
             s.errors = s.errors.wrapping_add(1);
+            // A produce in flight is now unknowable.
+            s.desk.link_down();
             emit_status(s, b"kafka: membership lost\n");
         }
         KAct::None => {}
@@ -446,7 +490,19 @@ unsafe fn on_response(s: &mut KafkaState, body: &[u8], now: u64) {
     // Producer: the Produce ack drives the produce cursor directly — the
     // consumer-group transition table isn't involved.
     if s.phase == KPhase::ProduceWait {
-        match kafka_parse_produce_response(body) {
+        let parsed = kafka_parse_produce_response(body);
+        // The produce's exchange is answered from the leader's error code; a
+        // response that does not parse fails the connection, and the LINK
+        // DOWN that follows invalidates it instead.
+        if let Some((code, _)) = parsed {
+            let verdict = match code {
+                0 => status::OK,
+                ERR_MESSAGE_TOO_LARGE => status::TOO_LARGE,
+                _ => status::BAD_GATEWAY,
+            };
+            let _ = s.desk.settle(s.corr as u64, verdict);
+        }
+        match parsed {
             Some((0, _offset)) => {
                 s.produced = s.produced.wrapping_add(1);
                 emit_status(s, b"kafka: produced\n");
@@ -501,6 +557,82 @@ unsafe fn on_response(s: &mut KafkaState, body: &[u8], now: u64) {
     feed(s, sys, ev, now);
 }
 
+/// Place every record owed on `response_out`, in order, until the port has
+/// no room; the outbox holds the one that did not fit.
+unsafe fn flush_answers(s: &mut KafkaState) {
+    let sys = &*s.syscalls;
+    loop {
+        if !s.outbox.flush(sys, s.response_out, &s.resp_rec) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&mut s.resp_rec) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out, &s.resp_rec, n) {
+            return;
+        }
+    }
+}
+
+/// After a LINK DOWN, read and drop request records until the LINK UP is
+/// away: the requester re-issues every exchange it held open.
+unsafe fn discard_requests(s: &mut KafkaState) {
+    let sys = &*s.syscalls;
+    while s.desk.discarding() && s.request_in >= 0 {
+        let poll = (sys.channel_poll)(s.request_in, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            return;
+        }
+        if (sys.channel_read)(s.request_in, s.req_rec.as_mut_ptr(), RECORD_MAX) <= 0 {
+            return;
+        }
+    }
+}
+
+/// Read one request record. A PUBLISH it completes is produced (producer)
+/// or refused 400 (consumer).
+unsafe fn take_request(s: &mut KafkaState, sys: &SyscallTable, now: u64) {
+    if s.request_in < 0 {
+        return;
+    }
+    let poll = (sys.channel_poll)(s.request_in, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return;
+    }
+    let n = (sys.channel_read)(s.request_in, s.req_rec.as_mut_ptr(), RECORD_MAX);
+    if n <= 0 {
+        return;
+    }
+    let Some(at) = s.desk.accept(&s.req_rec[..n as usize]) else {
+        return;
+    };
+    if s.producing == 0 {
+        s.desk.refuse(at, status::BAD_REQUEST);
+        return;
+    }
+    let tl = s.produce_topic_len as usize;
+    let mut topic = [0u8; NAME_BUF];
+    topic[..tl].copy_from_slice(&s.produce_topic[..tl]);
+    let ts = dev_unix_millis(sys) as i64;
+    let mut body = [0u8; REQ_BUF];
+    let built = match s.desk.request(at) {
+        Some(r) => kafka_produce_body(&topic[..tl], r.body, ts, &mut body),
+        None => None,
+    };
+    let Some(bn) = built else {
+        // Past what one produce request holds: refused, never truncated.
+        s.desk.refuse(at, status::TOO_LARGE);
+        return;
+    };
+    send_request_v(s, api::PRODUCE, 7, &body[..bn], now);
+    if s.req_len == 0 {
+        s.desk.refuse(at, status::TOO_LARGE);
+        return;
+    }
+    let _ = s.desk.dispatch(at, s.corr as u64, now);
+    s.phase = KPhase::ProduceWait;
+}
+
 /// PIC module ABI entry: run one scheduler step against this instance.
 ///
 /// # Safety
@@ -546,28 +678,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             feed(s, sys, KEv::Start, now);
         }
 
-        // 1b. Producer: pull one message off publish_in and produce it to the
-        //     configured topic (partition 0). One in flight at a time.
-        if s.producing != 0 && s.phase == KPhase::ProduceIdle && s.publish_in >= 0 {
-            let poll = (sys.channel_poll)(s.publish_in, 0x01);
-            if poll > 0 && (poll as u32 & 0x01) != 0 {
-                let mut msg = [0u8; 512];
-                let n = (sys.channel_read)(s.publish_in, msg.as_mut_ptr(), msg.len());
-                if n > 0 {
-                    let tl = s.produce_topic_len as usize;
-                    let mut topic = [0u8; NAME_BUF];
-                    topic[..tl].copy_from_slice(&s.produce_topic[..tl]);
-                    let ts = dev_unix_millis(sys) as i64;
-                    let mut body = [0u8; REQ_BUF];
-                    if let Some(bn) =
-                        kafka_produce_body(&topic[..tl], &msg[..n as usize], ts, &mut body)
-                    {
-                        send_request_v(s, api::PRODUCE, 7, &body[..bn], now);
-                        s.phase = KPhase::ProduceWait;
-                    }
-                }
-            }
+        // 1b. Exchanges: answers owed leave first; requests a LINK DOWN
+        //     invalidated are dropped until the LINK UP is away.
+        flush_answers(s);
+        discard_requests(s);
+        // A producer takes one PUBLISH exchange while idle and produces it to
+        // the configured topic (partition 0). A consumer refuses every one.
+        if (s.producing == 0 || s.phase == KPhase::ProduceIdle) && s.desk.can_take() {
+            take_request(s, sys, now);
         }
+        flush_answers(s);
 
         // 2. Membership upkeep: the heartbeat is TIMER-driven, not request-driven.
         if s.phase == KPhase::Stable && now.wrapping_sub(s.last_hb_ms) >= s.heartbeat_ms as u64 {

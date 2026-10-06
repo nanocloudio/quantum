@@ -1,7 +1,5 @@
-// kafka_sink — Kafka producer exposing the generic
-// `stream.ordered_ack` surface. See manifest.toml for the
-// contract mapping; the surface frames are inlined byte-for-byte from
-// their owner (lattice `modules/common/cdc_wire.rs`).
+// kafka_sink — Kafka producer, a PROVIDER of the exchange contract.
+// See manifest.toml for the delivery terms it declares.
 //
 // Structure mirrors mqtt_sink; the protocol half leans on
 // `modules/common/cores/kafka_core.rs` (request framing, response
@@ -15,12 +13,13 @@
 //        -> Reconnect -> Connecting ...
 //
 // Metadata registers the topic with the broker (auto-create by
-// mention) and reads back the real partition count, which the msg_key
-// hash then addresses. Running drains MSG_PUBLISH while the
-// produce window has room; Kafka correlation ids map to publish corrs
-// in a fixed ring. Entering Running emits LINK_UP; any connection
-// loss emits LINK_DOWN and clears the ring — those corrs are exactly
-// the set the producer must re-publish per the surface contract.
+// mention) and reads back the real partition count, which the
+// ordering-key hash then addresses. Running reads `request_in` while
+// the produce window has room; each Kafka correlation id maps to its
+// exchange in the window. A connection lost after Metadata writes LINK
+// DOWN and clears the window — those exchanges are exactly the set the
+// requester re-issues after the LINK UP the next Metadata writes. The
+// exchange mechanics live in `modules/common/publish_exchange.rs`.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -38,17 +37,11 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-// The ordered-ack exchange surface. Mounted from the staged SDK tree so the
-// frame layout and the status vocabulary have ONE definition: these constants
-// were previously hand-copied here, which is a wire contract maintained by
-// comment across three repositories.
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-mod exchange;
-use exchange::{
-    Ack, Publish, ACK_WIRE_LEN, FLAG_BROADCAST, MSG_ACK, MSG_PUBLISH, PAYLOAD_MAX,
-    PUBLISH_FRAME_MAX, PUBLISH_OVERHEAD, REFUSE_OVERSIZE, REFUSE_UNROUTABLE, STATUS_LINK_DOWN,
-    STATUS_LINK_UP, STATUS_OK,
-};
+// The exchange contract, through the provider core's own mount of it.
+#[path = "../../common/publish_exchange.rs"]
+mod publish_exchange;
+use publish_exchange::exchange::{status, KEY_MAX, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::PublishProvider;
 
 #[path = "../../common/cores/kafka_core.rs"]
 mod kafka_core;
@@ -75,8 +68,6 @@ use abi::contracts::net::net_proto::{
 mod authority;
 use authority::{Authority, PORT_QUANTUM_BROKER};
 
-// ── ordered_ack surface constants (owner: lattice cdc_wire.rs) ───────
-
 // ── Kafka constants ──────────────────────────────────────────────────
 
 const API_PRODUCE: i16 = 0;
@@ -88,26 +79,36 @@ const ERR_MESSAGE_TOO_LARGE: i16 = 10;
 
 // ── Sizing ───────────────────────────────────────────────────────────
 
-/// The broker's per-partition records-blob ceiling. The RecordBatch
-/// overhead is ~70 bytes, so payloads above this are refused with the
-/// typed OVERSIZE status before anything hits the wire.
-// The broker's records-blob cap. Raised to the suite ceiling plus record
-// framing; the broker must be configured to match (`message.max.bytes`), and
-// the `max_payload` capability fact is what tells a producer the real number.
-const MAX_RECORDS_BYTES: usize = PAYLOAD_MAX + RECORD_OVERHEAD;
+/// The largest record value: the contract's collected-body ceiling.
+const MAX_PAYLOAD: usize = PAYLOAD_MAX;
+/// The largest record key: the contract's ordering-key ceiling.
+const MAX_KEY_LEN: usize = KEY_MAX;
+/// RecordBatch framing around one record's key and value.
 const RECORD_OVERHEAD: usize = 96;
-const MAX_PAYLOAD: usize = MAX_RECORDS_BYTES - RECORD_OVERHEAD;
+/// One RecordBatch holding the largest key and value. The broker's
+/// `message.max.bytes` must be at least this; the `max_payload`
+/// capability fact is what tells a requester the value ceiling.
+const MAX_RECORDS_BYTES: usize = MAX_KEY_LEN + MAX_PAYLOAD + RECORD_OVERHEAD;
 /// Produce window: requests sent, response not yet seen.
 const INFLIGHT_CAP: usize = 8;
 /// Partition ceiling (the broker clamps its `partitions` param 1..=16).
 const MAX_PARTS: usize = 16;
+/// Requests collected at once while their bodies arrive.
+const REQUEST_SLOTS: usize = 2;
+/// Records owed on `response_out`: one per window slot, one per read,
+/// and the LINK pair.
+const OWED_CAP: usize = INFLIGHT_CAP + 3;
 
-const TX_BUF_SIZE: usize = PUBLISH_FRAME_MAX + 4096;
+/// One Produce request naming one partition with the largest batch,
+/// plus the request header. A BROADCAST names every partition with the
+/// same batch, so its request grows by a batch per partition; one that
+/// does not fit is refused with 413, never truncated.
+const TX_BUF_SIZE: usize = MAX_RECORDS_BYTES + 4096;
 const RX_BUF_SIZE: usize = 8192;
-const CHAN_BUF_SIZE: usize = PUBLISH_FRAME_MAX;
 const NET_BUF_SIZE: usize = 1600;
 const MAX_TOPIC_LEN: usize = 64;
-const MAX_KEY_LEN: usize = 260;
+
+type Desk = PublishProvider<REQUEST_SLOTS, PAYLOAD_MAX, INFLIGHT_CAP, OWED_CAP>;
 
 const CONNECT_TIMEOUT_MS: u64 = 10000;
 const REPLY_TIMEOUT_MS: u64 = 15000;
@@ -132,8 +133,8 @@ struct SinkState {
     syscalls: *const SyscallTable,
     net_in_chan: i32,
     net_out_chan: i32,
-    publish_in_chan: i32,
-    ack_out_chan: i32,
+    request_in_chan: i32,
+    response_out_chan: i32,
 
     authority: Authority,
     topic_len: u8,
@@ -157,17 +158,17 @@ struct SinkState {
     tx_len: u16,
     tx_sent: u16,
 
-    // Produce window: kafka correlation id -> publish corr.
-    inflight_kcorr: [i32; INFLIGHT_CAP],
-    inflight_corr: [u64; INFLIGHT_CAP],
-    inflight_sent_ms: [u64; INFLIGHT_CAP],
-    inflight_used: u16,
-
     topic: [u8; MAX_TOPIC_LEN],
+
+    /// Requests being collected, produces awaiting their response (keyed
+    /// by Kafka correlation id), and the records owed on `response_out`.
+    desk: Desk,
+    outbox: ExchangeOutbox,
 
     tx_buf: [u8; TX_BUF_SIZE],
     rx_buf: [u8; RX_BUF_SIZE],
-    chan_buf: [u8; CHAN_BUF_SIZE],
+    req_buf: [u8; RECORD_MAX],
+    resp_buf: [u8; RECORD_MAX],
     net_buf: [u8; NET_BUF_SIZE],
 }
 
@@ -354,32 +355,23 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     h
 }
 
-// ── ack_out emission ─────────────────────────────────────────────────
+// ── response_out ─────────────────────────────────────────────────────
 
-unsafe fn send_ack(s: &mut SinkState, corr: u64, status: u8) -> bool {
-    if s.ack_out_chan < 0 {
-        return false;
-    }
+/// Place every record owed on `response_out`, in order, until the port
+/// has no room; the outbox holds the one that did not fit.
+unsafe fn flush_answers(s: &mut SinkState) {
     let sys = &*s.syscalls;
-    let mut buf = [0u8; 3 + 9];
-    buf[0] = MSG_ACK;
-    buf[1] = 9;
-    buf[2] = 0;
-    buf[3..11].copy_from_slice(&corr.to_le_bytes());
-    buf[11] = status;
-    (sys.channel_write)(s.ack_out_chan, buf.as_mut_ptr(), buf.len()) == buf.len() as i32
-}
-
-unsafe fn emit_link_down(s: &mut SinkState) {
-    let mut i = 0;
-    while i < INFLIGHT_CAP {
-        s.inflight_kcorr[i] = 0;
-        s.inflight_corr[i] = 0;
-        s.inflight_sent_ms[i] = 0;
-        i += 1;
+    loop {
+        if !s.outbox.flush(sys, s.response_out_chan, &s.resp_buf) {
+            return;
+        }
+        let Some(n) = s.desk.next_record(&mut s.resp_buf) else {
+            return;
+        };
+        if !s.outbox.send(sys, s.response_out_chan, &s.resp_buf, n) {
+            return;
+        }
     }
-    s.inflight_used = 0;
-    let _ = send_ack(s, 0, STATUS_LINK_DOWN);
 }
 
 // ── TX ───────────────────────────────────────────────────────────────
@@ -433,9 +425,26 @@ unsafe fn start_send(s: &mut SinkState, len: usize) -> bool {
     flush_tx(s)
 }
 
-// ── Publish intake ───────────────────────────────────────────────────
+// ── Request intake ───────────────────────────────────────────────────
 
-unsafe fn handle_publish_intake(s: &mut SinkState) {
+/// After a LINK DOWN, read and drop request records until the LINK UP
+/// is away: the requester re-issues every exchange it held open.
+unsafe fn discard_requests(s: &mut SinkState) {
+    let sys = &*s.syscalls;
+    while s.desk.discarding() && s.request_in_chan >= 0 {
+        let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
+        if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
+            return;
+        }
+        if (sys.channel_read)(s.request_in_chan, s.req_buf.as_mut_ptr(), RECORD_MAX) <= 0 {
+            return;
+        }
+    }
+}
+
+/// Read request records while connected, TX free, and the desk can take
+/// one; each completed PUBLISH goes to the broker as one Produce.
+unsafe fn handle_requests(s: &mut SinkState) {
     if s.phase != Phase::Running {
         return; // backpressure by channel
     }
@@ -443,57 +452,39 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
         if s.tx_sent < s.tx_len && !flush_tx(s) {
             return;
         }
-        if s.inflight_used as usize >= INFLIGHT_CAP || s.publish_in_chan < 0 {
+        if !s.desk.can_take() || s.request_in_chan < 0 {
             return;
         }
         let sys = &*s.syscalls;
-        let poll = (sys.channel_poll)(s.publish_in_chan, POLL_IN);
+        let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
             return;
         }
-        let mut hdr = [0u8; 3];
-        if (sys.channel_read)(s.publish_in_chan, hdr.as_mut_ptr(), 3) < 3 {
+        let n = (sys.channel_read)(s.request_in_chan, s.req_buf.as_mut_ptr(), RECORD_MAX);
+        if n <= 0 {
             return;
         }
-        let len = u16::from_le_bytes([hdr[1], hdr[2]]) as usize;
-        if len > CHAN_BUF_SIZE {
-            return;
-        }
-        if len > 0
-            && ((sys.channel_read)(s.publish_in_chan, s.chan_buf.as_mut_ptr(), len) as usize) < len
-        {
-            return;
-        }
-        if hdr[0] != MSG_PUBLISH || len < PUBLISH_OVERHEAD {
-            continue;
-        }
-        // One decoder, from the SDK contract: the frame layout is not
-        // this module's to know.
-        let Some(publish) = Publish::decode(&s.chan_buf[..len]) else {
+        let Some(at) = s.desk.accept(&s.req_buf[..n as usize]) else {
+            flush_answers(s);
             continue;
         };
-        let corr = publish.corr;
-        let flags = publish.flags;
-        let klen = publish.msg_key.len();
-        let plen = publish.payload.len();
-        if klen > MAX_KEY_LEN {
+        let broadcast = s.desk.broadcast(at);
+        let Some(r) = s.desk.request(at) else {
             continue;
-        }
-        if plen > MAX_PAYLOAD {
-            // Broker records-blob ceiling: typed refusal, never
-            // truncation.
-            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
-            continue;
-        }
-        let msg_key = publish.msg_key;
-        let payload = publish.payload;
+        };
+        // The ordering key is the Kafka record key: it selects the
+        // partition, so same-key records land on one partition in
+        // request order. The collector bounds it at KEY_MAX and the body
+        // at PAYLOAD_MAX, which are this module's own ceilings.
+        let msg_key = r.target;
+        let payload = r.body;
 
-        // Partition addressing (term 2/5): key hash normally; EVERY
-        // partition in one request for broadcast — the broker acks
-        // that request only after the slowest partition is durable.
-        let nparts = s.partitions.max(1).min(MAX_PARTS as u32);
+        // Partition addressing: key hash normally; EVERY partition in
+        // one request for BROADCAST — the broker acks that request only
+        // after the slowest partition is durable.
+        let nparts = s.partitions.clamp(1, MAX_PARTS as u32);
         let mut parts = [0u32; MAX_PARTS];
-        let parts_used: usize = if flags & FLAG_BROADCAST != 0 {
+        let parts_used: usize = if broadcast {
             let mut i = 0usize;
             while i < nparts as usize {
                 parts[i] = i as u32;
@@ -501,21 +492,25 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
             }
             nparts as usize
         } else {
-            parts[0] = (fnv1a64(msg_key) % nparts as u64) as u32;
+            // `nparts` is at least 1; `checked_rem` says so without a
+            // division-by-zero path in the image.
+            parts[0] = fnv1a64(msg_key).checked_rem(nparts as u64).unwrap_or(0) as u32;
             1
         };
 
         let now = millis(s) as i64;
         let mut body = [0u8; TX_BUF_SIZE];
-        let Some(blen) = produce_body(
+        let produced = produce_body(
             &s.topic[..s.topic_len as usize],
             &parts[..parts_used],
             msg_key,
             payload,
             now,
             &mut body,
-        ) else {
-            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
+        );
+        let Some(blen) = produced else {
+            s.desk.refuse(at, status::TOO_LARGE);
+            flush_answers(s);
             continue;
         };
         s.kcorr = s.kcorr.wrapping_add(1);
@@ -531,29 +526,17 @@ unsafe fn handle_publish_intake(s: &mut SinkState) {
             &body[..blen],
             &mut req,
         ) else {
-            let _ = send_ack(s, corr, REFUSE_OVERSIZE);
+            s.desk.refuse(at, status::TOO_LARGE);
+            flush_answers(s);
             continue;
         };
-        // Record in-flight BEFORE the send.
-        let mut slot = usize::MAX;
-        let mut i = 0;
-        while i < INFLIGHT_CAP {
-            if s.inflight_corr[i] == 0 {
-                slot = i;
-                break;
-            }
-            i += 1;
+        // Into the window BEFORE the send.
+        if !s.desk.dispatch(at, s.kcorr as u64, millis(s)) {
+            return; // window full (ruled out by can_take)
         }
-        if slot == usize::MAX {
-            return;
-        }
-        s.inflight_kcorr[slot] = s.kcorr;
-        s.inflight_corr[slot] = corr;
-        s.inflight_sent_ms[slot] = millis(s);
-        s.inflight_used += 1;
         s.tx_buf[..rlen].copy_from_slice(&req[..rlen]);
         let _ = start_send(s, rlen);
-        // Serialize sends: broker order = publish order (term 2).
+        // Serialize sends: broker order = request order.
     }
 }
 
@@ -620,7 +603,7 @@ unsafe fn process_responses(s: &mut SinkState) {
                 s.phase = Phase::Running;
                 s.backoff_ms = BACKOFF_INIT_MS;
                 log_msg(s, b"[kafkasink] metadata ok");
-                let _ = send_ack(s, 0, STATUS_LINK_UP);
+                s.desk.link_up();
             } else {
                 log_err(s, b"[kafkasink] metadata unparseable");
                 enter_reconnect(s);
@@ -629,29 +612,17 @@ unsafe fn process_responses(s: &mut SinkState) {
             continue;
         }
 
-        // Produce response: match the correlation id in the window.
-        let mut i = 0;
-        while i < INFLIGHT_CAP {
-            if s.inflight_corr[i] != 0 && s.inflight_kcorr[i] == corr {
-                let pub_corr = s.inflight_corr[i];
-                s.inflight_corr[i] = 0;
-                s.inflight_kcorr[i] = 0;
-                s.inflight_sent_ms[i] = 0;
-                s.inflight_used = s.inflight_used.saturating_sub(1);
-                match produce_errors(body) {
-                    Some(0) => {
-                        let _ = send_ack(s, pub_corr, STATUS_OK);
-                    }
-                    Some(ERR_MESSAGE_TOO_LARGE) => {
-                        let _ = send_ack(s, pub_corr, REFUSE_OVERSIZE);
-                    }
-                    _ => {
-                        let _ = send_ack(s, pub_corr, REFUSE_UNROUTABLE);
-                    }
-                }
-                break;
-            }
-            i += 1;
+        // Produce response: the correlation id names the exchange. Every
+        // partition durable is 200; the broker's over-budget refusal is
+        // 413; any other partition error, or a response that does not
+        // parse, means the broker would not take the record: 502.
+        let verdict = match produce_errors(body) {
+            Some(0) => status::OK,
+            Some(ERR_MESSAGE_TOO_LARGE) => status::TOO_LARGE,
+            _ => status::BAD_GATEWAY,
+        };
+        if corr > 0 {
+            let _ = s.desk.settle(corr as u64, verdict);
         }
     }
 }
@@ -741,23 +712,20 @@ unsafe fn handle_rx(s: &mut SinkState) {
 }
 
 /// A produce that never got a response past the reply timeout means
-/// the stream is wedged — reconnect (LINK_DOWN invalidates the
-/// window, the producer replays).
+/// the stream is wedged — reconnect (LINK DOWN invalidates the window,
+/// and the requester re-issues it).
 unsafe fn sweep_stale(s: &mut SinkState) {
     let now = millis(s);
-    let mut i = 0;
-    while i < INFLIGHT_CAP {
-        if s.inflight_corr[i] != 0 && now.wrapping_sub(s.inflight_sent_ms[i]) >= REPLY_TIMEOUT_MS {
+    if let Some(sent) = s.desk.oldest_sent_ms() {
+        if now.wrapping_sub(sent) >= REPLY_TIMEOUT_MS {
             log_err(s, b"[kafkasink] produce timeout");
             enter_reconnect(s);
-            return;
         }
-        i += 1;
     }
 }
 
 unsafe fn enter_reconnect(s: &mut SinkState) {
-    emit_link_down(s);
+    s.desk.link_down();
     if s.conn_present != 0 && s.net_out_chan >= 0 {
         let sys = &*s.syscalls;
         let mut payload = [0u8; 2];
@@ -834,8 +802,10 @@ pub unsafe extern "C" fn module_new(
         let sys = &*(syscalls as *const SyscallTable);
         s.net_in_chan = in_chan;
         s.net_out_chan = out_chan;
-        s.publish_in_chan = dev_channel_port(sys, 0, 1);
-        s.ack_out_chan = dev_channel_port(sys, 1, 1);
+        s.request_in_chan = dev_channel_port(sys, 0, 1);
+        s.response_out_chan = dev_channel_port(sys, 1, 1);
+        s.desk.reset();
+        s.outbox = ExchangeOutbox::new();
         params_def::parse_tlv(s, params, params_len);
         s.phase = Phase::Init;
         s.kcorr = 0;
@@ -851,6 +821,13 @@ pub unsafe extern "C" fn module_new(
         }
         if s.topic_len == 0 {
             log_err(s, b"[kafkasink] missing topic");
+            return -10;
+        }
+        if s.request_in_chan < 0 || s.response_out_chan < 0 {
+            log_err(
+                s,
+                b"[kafkasink] refusing to construct: request_in and response_out must both be wired",
+            );
             return -10;
         }
         0
@@ -873,6 +850,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
         let sys_ptr = s.syscalls;
         let sys = &*sys_ptr;
+
+        // Answers and LINK records leave whatever the phase, and requests
+        // a LINK DOWN invalidated are dropped while the link is away.
+        flush_answers(s);
+        discard_requests(s);
 
         loop {
             match s.phase {
@@ -1002,7 +984,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         return 0;
                     }
                     let _ = flush_tx(s);
-                    handle_publish_intake(s);
+                    handle_requests(s);
+                    flush_answers(s);
                     if s.phase != Phase::Running {
                         return 0;
                     }

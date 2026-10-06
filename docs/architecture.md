@@ -195,8 +195,8 @@ shipped behaviour on the other.
 
 | Module | Status |
 |--------|--------|
-| `mqtt_sink`, `kafka_sink`, `amqp_sink` | Outbound message sinks exposing the generic `stream.ordered_ack` surface: a producer hands each message a correlation id, and the sink acknowledges only on durable acceptance by the remote broker (MQTT PUBACK, Kafka `acks=-1` ProduceResponse, AMQP publisher confirm). Per-key order is preserved by serialised sends; connection loss invalidates the in-flight window and signals exactly the set the producer must re-publish. Built for change-data-capture pipelines; not yet wired into a deployment graph. |
-| `mqtt_client`, `kafka_client`, `amqp_client`, `nats_client` | Outbound connectors to *external* brokers — the mirror of the inbound broker surface, letting a quantum graph bridge to a foreign endpoint. Their protocol cores live at `modules/common/cores/`, reached the same way as `modules/common/wire.rs`; keeping them out of the fluxor SDK source avoids invalidating the ABI source pin. Kafka, AMQP, and NATS connectivity is owned here outright; MQTT is deliberately split, with fluxor keeping a thin reachability client and quantum keeping the broker. |
+| `mqtt_sink`, `kafka_sink`, `amqp_sink` | Outbound message sinks, each a provider of fluxor's exchange contract on `request_in`/`response_out`: a `PUBLISH` exchange's body is the record, its `target` the ordering key, and the sink answers 200 with an empty body only on durable acceptance by the remote broker (MQTT PUBACK, Kafka `acks=-1` ProduceResponse, AMQP publisher confirm). Per-key order is preserved by serialised sends; losing the broker writes `LINK DOWN`, invalidating exactly the exchanges the requester re-issues after `LINK UP`. Composed by the graphs of the projects that publish — a chronicle pipeline, a lattice change feed — not by quantum's own deployment graphs. The shared provider logic is `modules/common/publish_exchange.rs`. |
+| `mqtt_client`, `kafka_client`, `amqp_client`, `nats_client` | Outbound connectors to *external* brokers — the mirror of the inbound broker surface, letting a quantum graph bridge to a foreign endpoint. Their protocol cores live at `modules/common/cores/`, reached the same way as `modules/common/wire.rs`; keeping them out of the fluxor SDK source avoids invalidating the ABI source pin. Kafka, AMQP, and NATS connectivity is owned here outright; MQTT is deliberately split, with fluxor keeping a thin reachability client and quantum keeping the broker. `kafka_client` in producer mode is a provider of the exchange contract on `request_in`/`response_out` — each `PUBLISH` exchange produced and answered once; the others publish one way (`mqtt_client.app_in` at QoS 0, `nats_client.publish_in` as core NATS `PUB`, neither of which the server answers) or only report status. Subscribed streams leave on `app_out` / `message_out`. |
 | `capability_registry` | Advertises this node's `(StorageSurface, FenceKind)` offering on `local_ad` and consumes peers' on `peer_ad`, so a deployment-time matcher can refuse a consumer whose fence requirement outranks what the node offers. Making it real needs a multi-node design decision: who consumes the advertisements, and when the match is enforced. |
 
 ## Message graph
@@ -271,7 +271,7 @@ graph TB
 
     %% peer_router → protocol (cross-core: network → ingest)
     peer_router ==>|"client cleartext"| protocol
-    http ==>|"HttpRequest / HttpResponse"| operations
+    http ==>|"exchange request / response"| operations
     consensus ==>|RPC out| peer_router
     peer_router ==>|peer RPC| consensus
 
