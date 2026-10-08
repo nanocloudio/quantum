@@ -2,7 +2,7 @@ version          = "0.1.0"
 type             = "Protocol"
 timer_class      = "wall_clock"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # mqtt_sink — MQTT 3.1.1 QoS 1 PRODUCER, a PROVIDER of the exchange
 # contract (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Any

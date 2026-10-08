@@ -1,7 +1,7 @@
 version = "0.1.0"
 type             = "Transformer"
 entry            = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # MQTT-over-QUIC adapter. Bridges fluxor's `quic` foundation module to
 # quantum's `protocol` module without modifying either side.

@@ -3,7 +3,7 @@ type             = "Transformer"
 entry            = "mod.rs"
 # timer_class: keepalive/reconnect timers read wall-clock (dev_millis).
 timer_class = "wall_clock"
-hardware_targets = ["rp2350", "bcm2712"]
+hardware_targets = ["rp2350", "bcm2712", "linux"]
 
 # mqtt_client — minimal MQTT 3.1.1 edge client (QoS 0). Connects to a broker,
 # subscribes to one topic, publishes application events fed on `app_in`, and

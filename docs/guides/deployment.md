@@ -28,7 +28,7 @@ Outputs:
 | Path | What |
 |---|---|
 | `target/aarch64-unknown-linux-gnu/release/fluxor` / `fluxor-linux` | Host CLI and userspace runtime (materialised by `fluxor sync`) |
-| `target/fluxor/bcm2712/modules/*.fmod` | Module artefacts — quantum's own builds plus the store-resolved clustor and foundation modules |
+| `target/fluxor/aarch64/modules/*.fmod` | Module artefacts — quantum's own builds plus the store-resolved clustor and foundation modules |
 
 Module artefacts are keyed by silicon: `bcm2712` is the sole module
 target (`aarch64-unknown-none`).

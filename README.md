@@ -91,7 +91,7 @@ the lockfile. `fluxor workspace status` reports the active mode.
 ## Build and run
 
 ```sh
-fluxor modules build --target bcm2712   # module artefacts → target/fluxor/bcm2712/modules/*.fmod
+fluxor modules build --target bcm2712   # module artefacts → target/fluxor/aarch64/modules/*.fmod
 fluxor build --check <graph.yaml>       # validate a graph against the module manifests
 fluxor run <graph.yaml>                 # validate, pack, exec fluxor-linux
 fluxor run - <<'EOF' … EOF              # same, config from stdin

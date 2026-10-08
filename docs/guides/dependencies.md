@@ -37,7 +37,7 @@ fluxor update    # advance pins to the latest published digests
 - `fluxor-abi` source under `target/fluxor/fluxor-abi/` —
   `#[path]`-included by quantum's PIC modules;
 - foundation and substrate `.fmod` artefacts under
-  `target/fluxor/bcm2712/modules/`;
+  `target/fluxor/aarch64/modules/`;
 - the `fluxor-linux` runtime binary under
   `target/aarch64-unknown-linux-gnu/release/`.
 

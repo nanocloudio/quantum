@@ -45,7 +45,7 @@ install -m 0755 "${FLUXOR_ROOT}/target/aarch64-unknown-linux-gnu/release/fluxor-
     "${PREFIX}/bin/fluxor-linux"
 
 echo "==> installing .fmod artifacts"
-cp "${FLUXOR_ROOT}/target/fluxor/bcm2712/modules/"*.fmod "${PREFIX}/modules/"
+cp "${FLUXOR_ROOT}/target/fluxor/aarch64/modules/"*.fmod "${PREFIX}/modules/"
 chown -R "${USER_NAME}:${USER_NAME}" "${PREFIX}/modules"
 
 echo "==> setting up target/ symlinks"
