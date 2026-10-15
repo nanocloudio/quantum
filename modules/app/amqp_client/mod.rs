@@ -98,7 +98,7 @@ struct AmqpState {
     /// matches, and the handshake never starts — the socket opens and
     /// not one byte is ever sent.
     conn_id: u16,
-    tag: u8,
+    tag: abi::contracts::net::net_proto::RequesterTag,
     started_ms: u64,
     /// Earliest wall clock for the next connect attempt.
     ///
@@ -420,7 +420,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 let payload = s.nbuf.as_ptr().add(NET_FRAME_HDR);
                 match msg {
-                    // `[conn_id: u16 LE][requester_tag: u8]`
+                    // `[conn_id: u16 LE][requester_tag: u16 LE]`
                     NET_MSG_CONNECTED if s.phase == APhase::Connecting => {
                         let pl = core::slice::from_raw_parts(payload, plen);
                         if plen >= CONN_ID_LEN {
@@ -453,7 +453,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     NET_MSG_ERROR => {
-                        // `[conn_id: u16 LE][errno: i8][requester_tag: u8?]`
+                        // `[conn_id: u16 LE][errno: i8][requester_tag: u16 LE?]`
                         // — on a connect-phase failure the conn_id is
                         // meaningless and the trailing tag is the only
                         // way to know the failure is ours.

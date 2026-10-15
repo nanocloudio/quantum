@@ -9,15 +9,17 @@
 //! the wrong offset is a dial to a different peer, not a type error.
 
 use super::authority::net_proto::{
-    AF_INET, AF_INET6, AF_NAME, CONNECT_TO_HEAD, CONNECT_TO_MAX, SOCK_TYPE_STREAM,
+    RequesterTag, AF_INET, AF_INET6, AF_NAME, CONNECT_TO_HEAD, CONNECT_TO_MAX, REQUESTER_TAG_LEN,
+    SOCK_TYPE_STREAM,
 };
 use super::authority::{
     Authority, PORT_AMQP, PORT_KAFKA, PORT_MQTT, PORT_NATS, PORT_QUANTUM_BROKER,
 };
 
 /// A requester tag stands in for `dev_requester_tag(sys)`, which is the
-/// instance's module index at run time.
-const TAG: u8 = 9;
+/// instance's module index plus one at run time. Above 255, so a record
+/// that carried only one of the tag's two bytes fails the assertions.
+const TAG: RequesterTag = 0x0109;
 
 /// Compose one connector's record, or `None` when the authority is
 /// refused.
@@ -40,6 +42,12 @@ fn head(rec: &[u8]) -> (u8, u8, u16) {
     (rec[0], rec[1], u16::from_le_bytes([rec[2], rec[3]]))
 }
 
+/// The requester tag every record ends with, little-endian.
+fn tag(rec: &[u8]) -> RequesterTag {
+    let at = rec.len() - REQUESTER_TAG_LEN;
+    RequesterTag::from_le_bytes([rec[at], rec[at + 1]])
+}
+
 /// A named target dials `AF_NAME` at `port`, carrying `name` as
 /// `[len][name]` and the requester tag last.
 fn assert_named(rec: &[u8], name: &str, port: u16) {
@@ -52,8 +60,11 @@ fn assert_named(rec: &[u8], name: &str, port: u16) {
         &rec[CONNECT_TO_HEAD + 1..CONNECT_TO_HEAD + 1 + name.len()],
         name.as_bytes()
     );
-    assert_eq!(rec.len(), CONNECT_TO_HEAD + 1 + name.len() + 1);
-    assert_eq!(rec[rec.len() - 1], TAG);
+    assert_eq!(
+        rec.len(),
+        CONNECT_TO_HEAD + 1 + name.len() + REQUESTER_TAG_LEN
+    );
+    assert_eq!(tag(rec), TAG);
 }
 
 /// A dotted quad dials `AF_INET` at `port`, carrying four bytes in
@@ -64,8 +75,8 @@ fn assert_literal(rec: &[u8], addr: [u8; 4], port: u16) {
     assert_eq!(af, AF_INET);
     assert_eq!(p, port);
     assert_eq!(&rec[CONNECT_TO_HEAD..CONNECT_TO_HEAD + 4], &addr);
-    assert_eq!(rec.len(), CONNECT_TO_HEAD + 4 + 1);
-    assert_eq!(rec[rec.len() - 1], TAG);
+    assert_eq!(rec.len(), CONNECT_TO_HEAD + 4 + REQUESTER_TAG_LEN);
+    assert_eq!(tag(rec), TAG);
 }
 
 // ── One test per dialler, at its own default port ───────────────────────────
@@ -221,5 +232,6 @@ fn a_bracketed_v6_literal_dials_by_address() {
     let mut expect = [0u8; 16];
     expect[15] = 1;
     assert_eq!(&rec[CONNECT_TO_HEAD..CONNECT_TO_HEAD + 16], &expect);
-    assert_eq!(rec[rec.len() - 1], TAG);
+    assert_eq!(rec.len(), CONNECT_TO_HEAD + 16 + REQUESTER_TAG_LEN);
+    assert_eq!(tag(&rec), TAG);
 }

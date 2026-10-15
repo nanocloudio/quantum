@@ -426,8 +426,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // net-frame: payload `[session_id:4 LE][stream_id:4 LE][data]`, where
         // session_id is the provider connection index (== cid widened) and
         // stream_id is the handle learned for that session. quic reads app_in
-        // with net_read_frame_aligned, so the net_write_frame header is
-        // exactly what it expects.
+        // as whole net_proto frames, so the net_write_frame header is exactly
+        // what it expects.
         if s.frames_in >= 0 && s.quic_out >= 0 {
             for _ in 0..8 {
                 let poll = (sys.channel_poll)(s.frames_in, 0x01);

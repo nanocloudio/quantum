@@ -562,7 +562,7 @@ unsafe fn handle_rx(s: &mut SinkState) {
     }
     let nbuf = s.net_buf.as_mut_ptr();
     let (msg_type, payload_len, full) =
-        net_read_frame_aligned(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+        net_read_frame_sized(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
         && payload_len >= 2
         && u16::from_le_bytes([*nbuf.add(NET_FRAME_HDR), *nbuf.add(NET_FRAME_HDR + 1)]) != s.conn_id

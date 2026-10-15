@@ -714,11 +714,11 @@ unsafe fn handle_rx(s: &mut MqttState) {
     }
 
     let nbuf = s.net_buf.as_mut_ptr();
-    // Alignment-safe: net_in may be fanned to other consumers whose frames can
-    // exceed our scratch; the reader drains the tail to keep the FIFO aligned and
-    // reports the FULL payload length so we can detect a truncated segment.
+    // A frame larger than our scratch is dropped whole, so the channel stays
+    // frame-aligned, and its full payload length is reported so a truncated
+    // segment is detected rather than parsed.
     let (msg_type, payload_len, full) =
-        net_read_frame_aligned(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
+        net_read_frame_sized(sys, s.net_in_chan, nbuf, NET_BUF_SIZE);
 
     // Established-stream isolation: only act on frames for OUR connection.
     if matches!(msg_type, NET_MSG_DATA | NET_MSG_CLOSED | NET_MSG_ERROR)
@@ -736,8 +736,8 @@ unsafe fn handle_rx(s: &mut MqttState) {
 
     if msg_type == NET_MSG_DATA && payload_len > 2 {
         // Payload: [conn_id: u16 LE][data...]. A net-level truncation
-        // (`full > payload_len`,
-        // frame bigger than our scratch) means the byte stream is unrecoverable.
+        // (`full > payload_len`, a frame bigger than our scratch) means the
+        // byte stream is unrecoverable.
         if full > payload_len {
             log_err(s, b"[mqtt] truncated segment; dropping connection");
             enter_reconnect(s);
