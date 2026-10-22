@@ -24,6 +24,7 @@
 //!   in[7]  assigned_in    — MSG_PROPOSAL_ASSIGNED (correlation → wal index)
 //!   in[8]  wal_reply      — WAL records for a cold Kafka Fetch
 //!   in[9]  ctrl_in        — SessionCtrlV1 commands from the anchor
+//!   in[10] front_in       — session envelopes from the in-graph front
 //!   out[0] proposals      — to consensus (fluxor wire envelope)
 //!   out[1] codec_out      — [conn_id:u16 LE][proto][pkt_type][flags][body] responses to codecs
 //!   out[2] topic_out      — publish + subscribe + unsubscribe (wire envelope)
@@ -36,6 +37,12 @@
 //!   out[9] retention_floor — lowest raft index this broker still needs
 //!   out[10] cp_out        — committed entries the control plane owns
 //!   out[11] ctrl_out      — SessionCtrlV1 replies and export frames
+//!   out[12] front_out     — responses to the in-graph front's sessions
+//!
+//! The in-graph front (`broker_front`) speaks the codec envelope on its own
+//! pair, `front_in` / `front_out`, with connection ids from
+//! `wire::FRONT_CONN_BASE` up. Its envelopes take the codec path, and a
+//! response for one of its sessions leaves on `front_out`.
 
 #![no_std]
 #![allow(
@@ -277,10 +284,12 @@ const MAX_PENDING_CORRELATIONS: usize = 1024;
 /// publish was not flagged as duplicate. Bounds the worst-case memory
 /// cost of deferred topic emission to a fixed allocation in module state.
 const STASH_SLOTS: usize = 32;
-const MAX_STASH_ENV: usize = 2048;
-/// Bigger QoS 1+ publishes (rare in MQTT control-plane traffic) overflow
-/// the stash and are dropped, preserving the commit-gating invariant for
-/// the in-budget path.
+/// A QoS 1+ publish whose op body is past it is refused before it is
+/// proposed (`wire::publish_fits`, Packet too large), so every one proposed
+/// fits its stash slot.
+const MAX_STASH_ENV: usize = wire::QOS1_OP_MAX;
+// A publish `wire::publish_fits` admits is built whole in `out_buf`.
+const _: () = assert!(wire::RAFT_ENTRY_MAX <= BUF_SIZE);
 const STASH_DEDUP_PENDING: u8 = 0;
 const STASH_DEDUP_OK: u8 = 1;
 const STASH_DEDUP_DUPLICATE: u8 = 2;
@@ -576,6 +585,16 @@ const CORRELATION_TIMEOUT_MS: u64 = 30_000;
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_codec: i32,
+    /// The in-graph front's session envelopes (in[10]) and their
+    /// responses (out[12]); -1 when the graph wires no front.
+    in_front: i32,
+    out_front: i32,
+    /// Which input the codec drain offers first, alternated per packet so
+    /// neither a busy transport nor a busy front starves the other.
+    codec_turn: u8,
+    /// Envelopes dropped for naming a connection outside their input's
+    /// namespace.
+    codec_namespace_drops: u32,
     in_committed: i32,
     in_flow: i32,
     in_ack: i32,
@@ -840,6 +859,10 @@ struct ModuleState {
     qos2_rel: u32,
     qos2_comp: u32,
     publishes_throttled: u32,
+    /// PUBLISHes refused for their size (`wire::publish_fits`): their Raft
+    /// entry past what Clustor commits, so the publisher's connection was
+    /// ended with Packet too large rather than left without an answer.
+    publishes_too_large: u32,
     deliveries_throttled: u32,
     redeliver_signals: u32,
     /// Count of per-entry MSG_COMMITTED_ENTRY notices observed on
@@ -942,6 +965,11 @@ pub unsafe extern "C" fn module_new(
         s.in_deliver = dev_channel_port(sys, 0, 6);
         s.in_assigned = dev_channel_port(sys, 0, 7);
         s.out_codec = dev_channel_port(sys, 1, 1);
+        // Declared after ctrl_in / ctrl_out: in[10] / out[12].
+        s.in_front = dev_channel_port(sys, 0, 10);
+        s.out_front = dev_channel_port(sys, 1, 12);
+        s.codec_turn = 0;
+        s.codec_namespace_drops = 0;
         s.out_topic = dev_channel_port(sys, 1, 2);
         s.out_messaging = dev_channel_port(sys, 1, 3);
         s.out_forward = dev_channel_port(sys, 1, 4);
@@ -1061,7 +1089,7 @@ unsafe fn emit_codec_response(
     flags: u8,
     body: &[u8],
 ) -> bool {
-    let chan = s.out_codec;
+    let chan = codec_chan(s.out_codec, s.out_front, conn_id);
     if chan < 0 {
         return false;
     }
@@ -1080,6 +1108,41 @@ unsafe fn emit_codec_response(
         );
     }
     ok
+}
+
+/// The next codec input with an envelope waiting: the transport's
+/// `codec_in` and the front's `front_in`, offered first in turn.
+///
+/// # Safety
+/// `sys` is the kernel's live syscall table.
+unsafe fn next_codec_input(s: &mut ModuleState, sys: &SyscallTable) -> Option<i32> {
+    let order = if s.codec_turn == 0 {
+        [s.in_codec, s.in_front]
+    } else {
+        [s.in_front, s.in_codec]
+    };
+    s.codec_turn ^= 1;
+    for chan in order {
+        if chan < 0 {
+            continue;
+        }
+        let poll = (sys.channel_poll)(chan, 0x01);
+        if poll > 0 && (poll as u32 & 0x01) != 0 {
+            return Some(chan);
+        }
+    }
+    None
+}
+
+/// The channel a response to `conn_id` leaves on: `front_out` for an
+/// in-graph front session, `codec_out` for a transport connection.
+#[inline]
+fn codec_chan(out_codec: i32, out_front: i32, conn_id: u16) -> i32 {
+    if wire::is_front_conn(conn_id) {
+        out_front
+    } else {
+        out_codec
+    }
 }
 
 /// `emit_codec_response` without the worker bookkeeping, for the one
@@ -5742,7 +5805,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // envelope length prefix is what lets the consumer demarcate each
         // message when several writers fan in or one writer bursts multiple
         // packets within a tick.
-        if s.in_codec >= 0 {
+        if s.in_codec >= 0 || s.in_front >= 0 {
             // 32 packets/tick: at the apply domain's 250 µs tick this admits
             // ~128k requests/s before the codec_in drain — not the session
             // engine — becomes the pipeline's rate limiter. A smaller quota
@@ -5786,16 +5849,24 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     break;
                 }
-                let poll = (sys.channel_poll)(s.in_codec, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                let Some(chan) = next_codec_input(s, sys) else {
                     break;
-                }
+                };
 
                 let (mt, plen) = {
                     worked += 1;
                     s.hb_codec = s.hb_codec.wrapping_add(1);
-                    wire::channel_read_msg(sys, s.in_codec, &mut s.in_buf)
+                    wire::channel_read_msg(sys, chan, &mut s.in_buf)
                 };
+                // Each input speaks for its own namespace only: a front
+                // envelope naming a transport connection, or a codec
+                // envelope naming a front session, would act on a session
+                // that is not its sender's.
+                if plen >= 2 && wire::is_front_conn(env_conn_id(&s.in_buf)) != (chan == s.in_front)
+                {
+                    s.codec_namespace_drops = s.codec_namespace_drops.wrapping_add(1);
+                    continue;
+                }
                 // Delivery cursor: every envelope for the attachment,
                 // header included, whatever it carries. A frozen
                 // attachment (exported, not yet detached) consumes
@@ -6348,6 +6419,37 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 let payload_off = up_off + up_len;
                                 let payload_len = body.len() - payload_off;
 
+                                // A publish Clustor would never commit is
+                                // refused before anything is spent on it:
+                                // proposed, it would be dropped on the way to
+                                // the log, and its publisher would hear
+                                // nothing — no PUBACK, no error. MQTT says
+                                // so with Packet too large (0x95), on a
+                                // DISCONNECT: the codec sends it to an MQTT 5
+                                // client, and closes an MQTT 3.1.1 one, which
+                                // has no server DISCONNECT.
+                                if !wire::publish_fits(qos, topic_len, up_len, payload_len) {
+                                    s.publishes_too_large = s.publishes_too_large.wrapping_add(1);
+                                    if s.publishes_too_large & 0x1F == 1 {
+                                        dev_log(
+                                            sys,
+                                            1,
+                                            b"[sess] publish past the raft entry - packet too large".as_ptr(),
+                                            53,
+                                        );
+                                    }
+                                    emit_codec_response(
+                                        s,
+                                        sys,
+                                        conn_id,
+                                        PROTO_MQTT,
+                                        PKT_DISCONNECT,
+                                        0,
+                                        &[wire::MQTT_REASON_PACKET_TOO_LARGE],
+                                    );
+                                    continue;
+                                }
+
                                 let session_idx = sessions::find_by_conn(&s.sessions, conn_id);
                                 let tenant = session_idx
                                     .map(|i| sessions::tenant(&s.sessions, i))
@@ -6489,28 +6591,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 } else {
                                     wire::QPROP_UNTAGGED_HDR_LEN + qbody_len
                                 };
-                                // Apply-side stashes QoS 1+ envelopes in
-                                // stash_env (MAX_STASH_ENV bytes). Reject
-                                // here if the op-body wouldn't fit; QoS 0
-                                // skips the stash so only the proposal-size
-                                // bound applies.
-                                let stash_oversize = qos > 0 && qbody_len > MAX_STASH_ENV;
-                                if prop_total > s.out_buf.len() || stash_oversize {
-                                    if qos > 0 {
-                                        if let Some(si) = session_idx {
-                                            if let Some(ii) = sessions::inflight_find(
-                                                &s.sessions,
-                                                si,
-                                                packet_id,
-                                                INFLIGHT_PUB,
-                                            ) {
-                                                sessions::inflight_release(&mut s.sessions, si, ii);
-                                            }
-                                        }
-                                    }
-                                    s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
-                                    continue;
-                                }
+                                // `publish_fits` held above: the proposal is
+                                // within the Raft entry, so within `out_buf`
+                                // (`BUF_SIZE`), and a QoS 1+ op body within
+                                // the apply side's stash (MAX_STASH_ENV).
 
                                 let cid: u64 = if qos > 0 {
                                     let Some(cid) = correlate::allocate(
@@ -8184,6 +8268,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // `s.sessions` is mutably borrowed for the sweep.
                         let out_messaging = s.out_messaging;
                         let out_codec = s.out_codec;
+                        let out_front = s.out_front;
                         let released = sessions::release_foreign(
                             &mut s.sessions,
                             |sh| view.is_local(sh),
@@ -8204,7 +8289,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 if let Some(conn_id) = conn {
                                     emit_codec_response_raw(
                                         sys,
-                                        out_codec,
+                                        codec_chan(out_codec, out_front, conn_id),
                                         conn_id,
                                         PROTO_MQTT,
                                         PKT_DISCONNECT,
@@ -8398,7 +8483,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // applied — plus the refusals and holds along the way.
         if now.wrapping_sub(s.last_hb_ms) >= 1000 {
             s.last_hb_ms = now;
-            let mut line = [0u8; 288];
+            // Every label below with ten digits after it.
+            let mut line = [0u8; 544];
             let mut pos = 0usize;
             for (label, v) in [
                 (&b"[sess] hb codec="[..], s.hb_codec),
@@ -8409,6 +8495,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" commit="[..], s.hb_commit),
                 (&b" refused="[..], s.proposals_refused),
                 (&b" throttled="[..], s.publishes_throttled),
+                (&b" toolarge="[..], s.publishes_too_large),
                 (&b" gated="[..], s.codec_gated),
                 (&b" ostall="[..], s.apply_output_stalls),
                 (&b" conn="[..], s.connects),
@@ -8428,6 +8515,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" hres="[..], s.worker.resumed),
                 (&b" href="[..], s.worker.refused),
                 (&b" hfull="[..], s.worker.busy_overflow),
+                (&b" nsdrop="[..], s.codec_namespace_drops),
             ] {
                 for &b in label {
                     line[pos] = b;

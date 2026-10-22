@@ -310,6 +310,12 @@ pub const MSG_OFFLINE_RELEASE: u8 = 0xB6;
 pub const MQTT_REASON_MOVED: u8 = 0xFF;
 pub const MQTT_REASON_TRY_ELSEWHERE: u8 = 0xFE;
 
+/// MQTT 5 reason code 0x95, Packet too large: what the broker's DISCONNECT
+/// says of a packet it will not process for its size (MQTT 5 §3.14.2.1).
+/// The codec carries it to an MQTT 5 client as written; an MQTT 3.1.1
+/// client, which has no server DISCONNECT, has its connection closed.
+pub const MQTT_REASON_PACKET_TOO_LARGE: u8 = 0x95;
+
 /// Apply-pipeline reset fan-out from `session_processor` to every
 /// apply-derived module. Body: `[reset_index:u64 LE]`. Fires when the
 /// substrate signals a snapshot install or leader-driven log
@@ -385,6 +391,20 @@ pub const MSG_METRICS_ROLLUP: u8 = 0xE8;
 /// `u16 LE` everywhere it crosses an edge — the client-frame family
 /// below and the session envelope on `codec_in` / `codec_out`.
 pub type ConnId = u16;
+
+/// First [`ConnId`] of the in-graph front namespace. `broker_front` opens
+/// its broker sessions on ids from here up, and `session_processor` answers
+/// a session on this side of the line on `front_out` rather than
+/// `codec_out`. Transport connections never reach it: `peer_router`'s slot
+/// index stays below its 16384-entry table.
+pub const FRONT_CONN_BASE: ConnId = 0xF000;
+
+/// Whether `conn_id` names an in-graph front session rather than a
+/// transport connection.
+#[inline]
+pub const fn is_front_conn(conn_id: ConnId) -> bool {
+    conn_id >= FRONT_CONN_BASE
+}
 
 /// Client-facing frame on the `codec → protocol → peer_router.client_resp`
 /// chain. Payload is `[conn_id:u16 LE][protocol bytes]`. Carries an
@@ -969,6 +989,88 @@ pub const QOP_DISCONNECT: u8 = 0x02;
 /// oversized inputs at propose time so apply / topic_engine never
 /// see runaway sizes.
 pub const QOP_PUBLISH: u8 = 0x03;
+
+/// The largest QOP_PUBLISH op body a QoS 1+ publish may carry: the apply
+/// side holds each one, commit-gated, in a stash slot of this size
+/// (`session_processor`'s stash), and a publish whose op body passes it is
+/// not proposed.
+pub const QOS1_OP_MAX: usize = 2048;
+
+/// The largest Raft entry body Clustor stores (`wal_frame::MAX_ENTRY_BODY`):
+/// a proposal past it is never committed.
+pub const RAFT_ENTRY_MAX: usize = 2048;
+
+/// The fixed part of a QOP_PUBLISH op body with no user properties:
+/// `[pub_qos][packet_id][stream_hash][session_generation][retain][topic_len]`
+/// and the zero user-property count.
+pub const QOP_PUBLISH_FIXED: usize = 1 + 2 + 8 + 4 + 1 + 2 + 1;
+
+/// What a QoS 1+ publish's Raft entry carries besides its topic and
+/// payload: the keyed-proposal header, the correlation tag, the QPROP
+/// header and the op body's fixed part.
+pub const QOS1_ENTRY_FIXED: usize =
+    KEYED_PROPOSAL_HDR + TAGGED_PROPOSAL_HDR + QPROP_HEADER_LEN + QOP_PUBLISH_FIXED;
+
+/// The largest payload a QoS 1+ publish without user properties carries on
+/// `topic_len` bytes of topic: its Raft entry within [`RAFT_ENTRY_MAX`], and
+/// its op body within [`QOS1_OP_MAX`].
+pub const fn qos1_payload_room(topic_len: usize) -> usize {
+    let entry = RAFT_ENTRY_MAX.saturating_sub(QOS1_ENTRY_FIXED + topic_len);
+    let op = QOS1_OP_MAX.saturating_sub(QOP_PUBLISH_FIXED + topic_len);
+    if entry < op {
+        entry
+    } else {
+        op
+    }
+}
+
+/// The Raft entry a PUBLISH of `qos` proposes for `topic_len` bytes of
+/// topic, a user-property block of `props_len` bytes (its count byte
+/// included: 1 with none) and `payload_len` bytes of payload: the keyed
+/// header, the correlation tag of a QoS 1+ publish, the QPROP header, then
+/// the op body.
+pub const fn publish_entry_len(
+    qos: u8,
+    topic_len: usize,
+    props_len: usize,
+    payload_len: usize,
+) -> usize {
+    let hdr = if qos > 0 {
+        QPROP_TAGGED_HDR_LEN
+    } else {
+        QPROP_UNTAGGED_HDR_LEN
+    };
+    KEYED_PROPOSAL_HDR + hdr + publish_op_len(topic_len, props_len, payload_len)
+}
+
+/// The QOP_PUBLISH op body of the same publish.
+pub const fn publish_op_len(topic_len: usize, props_len: usize, payload_len: usize) -> usize {
+    (QOP_PUBLISH_FIXED - 1) + topic_len + props_len + payload_len
+}
+
+/// Whether the broker can commit that publish: its Raft entry within
+/// [`RAFT_ENTRY_MAX`] and, at QoS 1+, its op body within the stash's
+/// [`QOS1_OP_MAX`]. One that cannot is refused with
+/// [`MQTT_REASON_PACKET_TOO_LARGE`], never proposed: Clustor would never
+/// commit it, so the publisher would hear nothing.
+pub const fn publish_fits(qos: u8, topic_len: usize, props_len: usize, payload_len: usize) -> bool {
+    publish_entry_len(qos, topic_len, props_len, payload_len) <= RAFT_ENTRY_MAX
+        && (qos == 0 || publish_op_len(topic_len, props_len, payload_len) <= QOS1_OP_MAX)
+}
+
+/// The fewest bytes MQTT 5 frames a QoS 1+ PUBLISH's topic, user properties
+/// and payload with: the fixed header's type byte and one remaining-length
+/// byte, the topic length, the packet id and one property-length byte. A
+/// User Property costs the wire a byte more than the op body's user-property
+/// block (its 0x26 identifier), and no other property reaches the entry.
+pub const MQTT5_PUBLISH_FRAMING_MIN: usize = 1 + 1 + 2 + 2 + 1;
+
+/// The Maximum Packet Size the broker's MQTT 5 CONNACK advertises
+/// (MQTT 5 §3.2.2.3.6): the largest packet whose PUBLISH, at any QoS, the
+/// broker can always commit — its entry is at most this plus
+/// [`QOS1_ENTRY_FIXED`] less [`MQTT5_PUBLISH_FRAMING_MIN`], which is
+/// [`RAFT_ENTRY_MAX`].
+pub const MQTT5_MAX_PACKET: usize = RAFT_ENTRY_MAX - QOS1_ENTRY_FIXED + MQTT5_PUBLISH_FRAMING_MIN;
 
 /// SUBSCRIBE: add a subscription for the session identified by
 /// `stream_hash` to `topic`. Apply-side handlers look up the local

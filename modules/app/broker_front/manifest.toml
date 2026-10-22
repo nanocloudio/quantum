@@ -1,0 +1,119 @@
+version          = "0.1.0"
+type             = "Protocol"
+entry            = "mod.rs"
+timer_class      = "wall_clock"
+hardware_targets = ["bcm2712", "linux"]
+
+# broker_front — quantum's broker as exchange PROVIDERS in the application's
+# own graph: no MQTT bytes, no socket. It speaks the codec envelope to
+# `session_processor` on its `front_in` / `front_out` pair, as a broker
+# session of its own, and serves two fronts
+# (`docs/architecture/broker_front.md`):
+#
+# PUBLISH front (`publish_in` / `publish_out`) — the conventions of
+# `mqtt_sink`, exactly, so a graph swaps one for the other by wiring alone.
+#   Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
+#   body = the record, published as the MQTT payload byte for byte on the
+#   configured `topic`; flags MORE and BROADCAST only. Anything else is
+#   answered 400.
+#   Answer: 200 with an empty body once the broker acknowledges the QoS 1
+#   publish, which quantum gates on Clustor durability; 413 for a record
+#   past the bounds, 503 when every collecting slot is taken. Losing the
+#   broker session (an acknowledgement overdue past `ack_timeout_ms`, or the
+#   broker ending it) writes LINK DOWN; the next CONNACK writes LINK UP, and
+#   the requester re-issues every exchange it held open.
+#
+# SUBSCRIPTION front (`subscribe_in` / `subscribe_out`) — held exchanges.
+#   Request: GET, no flags; `target` = an MQTT topic filter; optional header
+#   `session: <name>` names a durable session to create or resume.
+#   Answer: once the broker has taken the subscription, a HEAD 200 flagged
+#   HOLD|MORE (content type `application/vnd.quantum.message`; a durable
+#   subscription adds `session-present: 0|1`), then one BODY per message,
+#   `[topic_len u16 BE][topic][payload_len u32 BE][payload]`, never past
+#   the response credit.
+#   Refusals: 400 (method, flags, filter or session name), 413 (filter or
+#   session name past its bound), 409 (the durable session is already
+#   subscribed), 503 (every subscription slot taken), 502 (the broker
+#   refused the session or the filter), 504 (the broker did not take it in
+#   `ack_timeout_ms`). The requester's ABORT ends the subscription; the
+#   provider ABORTs it FAILED when the broker ends the session, STALLED when
+#   a QoS 0 stream outruns the held messages, TOO_LARGE for a message no
+#   BODY carries.
+#
+# Delivery terms of the publish front (`stream.ordered_ack`), as mqtt_sink's:
+#   ack       — 200 is durable acceptance: the QoS 1 acknowledgement, gated
+#               on Clustor durability proofs.
+#   ordering  — one broker session, one topic, publishes written in request
+#               order: request order IS broker order.
+#   no silent drops — every exchange is acknowledged, refused, or
+#               invalidated by LINK DOWN.
+#   backpressure — `publish_in` is read only while the session is up with
+#               in-flight window room.
+#   broadcast — a single topic is ONE ordering unit, so BROADCAST is a plain
+#               publish.
+capabilities = ["stream.ordered_ack.sink"]
+
+# `max_payload`: the largest record the publish front takes on the longest
+# topic (255 bytes) — bound by the broker's QoS 1 publish, whose Raft entry
+# Clustor holds to `wire::RAFT_ENTRY_MAX` bytes, and within what one session
+# envelope and one subscription BODY carry (`record_room(TOPIC_MAX)` in
+# mod.rs). A shorter topic leaves more room: `2007 - topic_len` bytes. A
+# requester declaring a larger fact fails the build.
+[capability_facts."stream.ordered_ack.sink"]
+ack         = "durable"
+ordering    = "single"
+broadcast   = "degenerate"
+max_payload = 1752
+
+# in[0] / out[0]: session envelopes with `session_processor`
+# (`front_out` -> `session_in`, `session_out` -> `front_in`).
+[[ports]]
+name = "session_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8192
+
+[[ports]]
+name = "session_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8192
+
+# in[1] / out[1]: the publish front.
+[[ports]]
+name = "publish_in"
+index = 1
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 32768
+max_record = 8192
+
+[[ports]]
+name = "publish_out"
+index = 1
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 4096
+max_record = 8192
+
+# in[2] / out[2]: the subscription front.
+[[ports]]
+name = "subscribe_in"
+index = 2
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 8192
+max_record = 8192
+
+[[ports]]
+name = "subscribe_out"
+index = 2
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 32768
+max_record = 8192
+
+[observability]
+exempt = "exchange outcomes are the requesters' own accounting (statuses, LINK, ABORT reasons); the broker session it drives is counted by session_processor's heartbeat"

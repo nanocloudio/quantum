@@ -13,6 +13,11 @@
 use super::abi::SyscallTable;
 use super::{dev_channel_port, dev_log, dev_millis, wire};
 
+/// MQTT 5 property identifier: Maximum Packet Size (four-byte integer).
+const PROP_MAXIMUM_PACKET_SIZE: u8 = 0x27;
+/// The CONNACK's properties: Maximum Packet Size, its identifier and value.
+const CONNACK_PROPS_LEN: usize = 1 + 4;
+
 // MQTT packet types
 const PKT_CONNECT: u8 = 1;
 const PKT_CONNACK: u8 = 2;
@@ -179,6 +184,11 @@ pub struct Mqtt {
     /// Frames `out_frames` refused where nothing retries them
     /// (PINGRESP, a close request, a server DISCONNECT). Steady state 0.
     frames_refused: u32,
+    /// Connections ended for a packet too large to process: past
+    /// `MAX_PACKET` here, or a PUBLISH `session_processor` cannot commit
+    /// (`wire::publish_fits`) — DISCONNECT with Packet too large to an
+    /// MQTT 5 client, then closed.
+    packets_too_large: u32,
     /// Records dropped because a partial packet outgrew `REASS_INLINE`
     /// while every `big_pool` page was held. Steady state 0.
     reass_pool_full: u32,
@@ -899,7 +909,22 @@ fn splice_mqtt5_ack(out: &mut [u8], pkt_type: u8, body: &[u8]) -> usize {
     if body.len() < 2 {
         return 0;
     }
-    // Common splice for CONNACK / SUBACK: insert `0x00` (props varint)
+    if pkt_type == PKT_CONNACK {
+        // `[ack_flags][reason]`, then the properties: Maximum Packet Size
+        // (0x27, MQTT 5 §3.2.2.3.6) — the largest packet whose PUBLISH the
+        // broker can always commit (`wire::MQTT5_MAX_PACKET`). A larger one
+        // is answered Packet too large.
+        let total = 2 + 1 + CONNACK_PROPS_LEN;
+        if total > out.len() {
+            return 0;
+        }
+        out[0..2].copy_from_slice(&body[..2]);
+        out[2] = CONNACK_PROPS_LEN as u8;
+        out[3] = PROP_MAXIMUM_PACKET_SIZE;
+        out[4..8].copy_from_slice(&(wire::MQTT5_MAX_PACKET as u32).to_be_bytes());
+        return total;
+    }
+    // SUBACK / UNSUBACK: insert `0x00` (props varint)
     // at body offset 2, shift the rest right.
     let total = body.len() + 1;
     if total + 1 > out.len() {
@@ -1332,8 +1357,11 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire:
             }
             let pkt_size = 1 + vlen_probe + rem_len_probe as usize;
             if pkt_size > MAX_PACKET {
-                s.parse_errors += 1;
+                // A packet this codec will not take whole: the client is
+                // told (Packet too large) and the connection ends — the
+                // bytes still to come are that packet's, not the next one's.
                 s.reass_reset(ci);
+                refuse_too_large(s, sys, ci, conn_id);
                 break;
             }
             if pkt_size > avail {
@@ -1811,6 +1839,12 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
             if body.is_empty() {
                 return true;
             }
+            if body[0] == wire::MQTT_REASON_PACKET_TOO_LARGE {
+                // A PUBLISH the broker cannot commit: refused for its size,
+                // in either version.
+                refuse_too_large(s, sys, ci_resp, conn_id);
+                return true;
+            }
             if proto_v < 5 {
                 // 3.1.1 has no server DISCONNECT, so the only way to
                 // tell this client its session moved is to close the
@@ -1913,6 +1947,47 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
         dev_log(sys, 3, b"[mqtt] resp -> peer".as_ptr(), 19);
         s.packets_encoded += 1;
         true
+    }
+}
+
+/// End connection `conn_id` (slot `ci`) for a packet too large to process.
+/// An MQTT 5 client is sent DISCONNECT with Packet too large (0x95) first
+/// (MQTT 5 §3.14.2.1); then the connection is closed, as a server closes
+/// after its DISCONNECT (§3.14.4) — and closing is all MQTT 3.1.1, which has
+/// no server DISCONNECT, offers for a packet the server will not process.
+/// Counted, and said at most once per 32.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn refuse_too_large(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire::ConnId) {
+    s.packets_too_large = s.packets_too_large.wrapping_add(1);
+    if s.packets_too_large & 0x1F == 1 {
+        dev_log(
+            sys,
+            1,
+            b"[mqtt] packet too large - connection ended".as_ptr(),
+            42,
+        );
+    }
+    if s.conns[ci].protocol_version >= 5 {
+        let n = encode_mqtt_frame(
+            &mut s.frame,
+            PKT_DISCONNECT,
+            0,
+            &[wire::MQTT_REASON_PACKET_TOO_LARGE],
+        );
+        if n > 0 && !write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..n]) {
+            s.frames_refused = s.frames_refused.wrapping_add(1);
+        }
+    }
+    if !write_conn_frame_with_mtype(
+        sys,
+        s.out_frames,
+        conn_id,
+        wire::MSG_CONN_CLOSE_REQUEST,
+        &[],
+    ) {
+        s.frames_refused = s.frames_refused.wrapping_add(1);
     }
 }
 

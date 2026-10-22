@@ -47,7 +47,7 @@ features = ["mqtt", "amqp"]
 # The index is the ABI — a graph binds a port by position — so a port is
 # only ever appended, never inserted or reordered.
 #
-# Inputs (10):
+# Inputs (11):
 #   [0] codec_in         — MQTT/Kafka/AMQP proposals (demux by PROTO_* byte)
 #   [1] committed_in     — applied entries from consensus
 #   [2] flow_in          — PID credits + backpressure + prefetch (demux by msg_type)
@@ -58,8 +58,9 @@ features = ["mqtt", "amqp"]
 #   [7] assigned_in      — MSG_PROPOSAL_ASSIGNED from consensus (correlation_id → wal_index)
 #   [8] wal_reply        — WAL records answering a cold Kafka Fetch
 #   [9] ctrl_in          — SessionCtrlV1 commands from the anchor
+#   [10] front_in        — session envelopes from the in-graph front
 #
-# Outputs (12):
+# Outputs (13):
 #   [0] proposals         — untagged proposals to consensus (CONNECT/DISCONNECT/etc)
 #   [1] codec_out         — responses to codecs (tag by PROTO_*)
 #   [2] topic_out         — publish + subscribe + unsubscribe to topic_engine
@@ -72,6 +73,7 @@ features = ["mqtt", "amqp"]
 #   [9] retention_floor   — lowest raft index this broker still needs
 #   [10] cp_out           — committed entries belonging to the control plane
 #   [11] ctrl_out         — SessionCtrlV1 replies + export frames to the anchor
+#   [12] front_out        — responses to the in-graph front's sessions
 
 [[ports]]
 name = "codec_in"
@@ -240,3 +242,24 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 32768
 max_record = 1027
+
+# The in-graph front's session envelopes (`broker_front.session_out`): the
+# codec envelope `codec_in` carries, from connection ids at
+# `wire::FRONT_CONN_BASE` and above, on a pair of its own so neither side
+# shares a fan with the transport codecs. Unwired, the module serves the
+# transport codecs alone. Declared last: the port index is the ABI.
+[[ports]]
+name = "front_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8195
+
+# Responses to the front's sessions (`broker_front.session_in`): every
+# `codec_out` record whose connection id is in the front namespace.
+[[ports]]
+name = "front_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 8195
