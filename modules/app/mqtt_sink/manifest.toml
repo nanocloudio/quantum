@@ -4,21 +4,39 @@ timer_class      = "wall_clock"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 
-# mqtt_sink — MQTT 3.1.1 QoS 1 PRODUCER, a PROVIDER of the exchange
-# contract (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Any
-# graph that publishes durably composes it by deployment pin; quantum
-# knows nothing about who publishes.
+# mqtt_sink — MQTT 5 QoS 1 PRODUCER (MQTT 3.1.1 to a broker that refuses
+# version 5), a PROVIDER of the exchange contract
+# (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Any graph that
+# publishes durably composes it by deployment pin; quantum knows nothing
+# about who publishes. The broker is any MQTT broker: quantum's own, or a
+# foreign one (mosquitto, …).
 #
 # Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
 # body = the record, published as the MQTT payload byte for byte on the
 # configured `topic`; flags MORE and BROADCAST only. Anything else is
 # answered 400.
 #
-# Answer: 200 with an empty body once the broker PUBACKs (QoS 1);
-# 413 for a record past the bounds, 503 when every collecting slot is
-# taken. Losing the broker connection writes LINK DOWN; the next CONNACK
-# writes LINK UP, and the requester re-issues every exchange it held
-# open.
+# Answer: 200 with an empty body once the broker PUBACKs (QoS 1); 503
+# when every collecting slot is taken, or when an MQTT 5 broker's PUBACK
+# says Quota exceeded; 502 for any other MQTT 5 PUBACK failure reason.
+# Losing the broker connection writes LINK DOWN; the next CONNACK writes
+# LINK UP, and the requester re-issues every exchange it held open.
+#
+# Size is bounded by the broker connected to, not by this module. 413
+# answers a record
+#   - past `max_payload`, what the contract collects;
+#   - whose PUBLISH would pass the Maximum Packet Size the broker
+#     advertised in its MQTT 5 CONNACK — refused before it is sent
+#     (quantum's broker advertises what one Raft entry commits);
+#   - the broker ended the connection for: the largest publish awaiting
+#     PUBACK when an MQTT 5 broker sends DISCONNECT with Packet too large
+#     (0x95); or, from a broker that only closes (all MQTT 3.1.1 offers),
+#     a record larger than any PUBACKed on the connection that the
+#     connection closes on twice — the first close is a LINK DOWN, and
+#     the second, on its re-issue, is taken as the broker's refusal.
+# Every other publish awaiting PUBACK is invalidated by the LINK DOWN
+# and re-issued after the LINK UP. A broker that advertises no maximum is
+# sent records up to `max_payload`.
 #
 # Delivery terms (`stream.ordered_ack`):
 #   ack       — 200 is durable acceptance: PUBACK at QoS 1, which
@@ -35,7 +53,8 @@ capabilities = ["stream.ordered_ack.sink"]
 
 # `max_payload` is the largest record this module carries: the contract's
 # collected-body ceiling, which the PUBLISH buffer is sized to hold. A
-# requester declaring a larger one fails the build.
+# requester declaring a larger one fails the build. The broker connected
+# to may take less (above), which only it can say, at run time.
 [capability_facts."stream.ordered_ack.sink"]
 ack        = "durable"
 ordering   = "single"

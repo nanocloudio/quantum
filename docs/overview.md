@@ -37,6 +37,8 @@ concern each.
 - [architecture/mqtt_adapter.md](architecture/mqtt_adapter.md) — connection lifecycle, QoS 0/1/2 semantics, shared subscriptions, offline delivery
 - [architecture/kafka_adapter.md](architecture/kafka_adapter.md) — topics, partitions, produce semantics, consumer groups
 - [architecture/amqp_adapter.md](architecture/amqp_adapter.md) — addressing, delivery semantics, flow control
+- [architecture/broker_front.md](architecture/broker_front.md) — the broker's in-graph exchange fronts (publish with `mqtt_sink`'s conventions, subscriptions as held exchanges) and the `quantum_broker` stack
+- [architecture/limit_register.md](architecture/limit_register.md) — the deliberate ceilings of the broker's exchange surfaces
 - [architecture/control_plane.md](architecture/control_plane.md) — the control-plane consumption contract, cache states, embedded design
 - [architecture/multi_tenancy.md](architecture/multi_tenancy.md) — namespaces, quotas, noisy-neighbour enforcement, tenancy status
 - [architecture/flow_control.md](architecture/flow_control.md) — credits, backpressure translation, prefetch

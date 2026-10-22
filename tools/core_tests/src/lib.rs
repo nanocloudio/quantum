@@ -111,10 +111,37 @@ pub mod authority;
 #[path = "../../../modules/common/publish_exchange.rs"]
 pub mod publish_exchange;
 
+/// The held-exchange provider of the broker's subscription front:
+/// request judgement, subscription phases, credit, held messages and the
+/// records owed. `#[path]`-mounted for its own mount of the SDK contract.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC helper verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+#[path = "../../../modules/common/subscribe_exchange.rs"]
+pub mod subscribe_exchange;
+
+/// The broker front's side of the codec envelope: the session envelopes it
+/// writes to `session_processor` and the answers it reads back.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC helper verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+#[path = "../../../modules/common/front_session.rs"]
+pub mod front_session;
+
 #[cfg(test)]
 mod authority_tests;
 #[cfg(test)]
 mod edge_routing_tests;
+#[cfg(test)]
+mod front_session_tests;
 #[cfg(test)]
 mod kafka_group_tests;
 #[cfg(test)]
@@ -127,3 +154,5 @@ mod kafka_metadata_tests;
 mod publish_exchange_tests;
 #[cfg(test)]
 mod session_identity_tests;
+#[cfg(test)]
+mod subscribe_exchange_tests;

@@ -1,5 +1,6 @@
-// mqtt_sink — MQTT 3.1.1 QoS 1 producer, a PROVIDER of the exchange
-// contract. See manifest.toml for the delivery terms it declares.
+// mqtt_sink — MQTT 5 QoS 1 producer (MQTT 3.1.1 with a broker that
+// refuses version 5), a PROVIDER of the exchange contract. See
+// manifest.toml for the delivery terms it declares.
 //
 // Structure follows `mqtt_client` (same net_proto handling, same
 // reconnect discipline), reduced to a pure QoS-1 PRODUCER:
@@ -15,6 +16,25 @@
 // window — those exchanges are exactly the set the requester re-issues
 // after the LINK UP that the next CONNACK writes. The exchange
 // mechanics live in `modules/common/publish_exchange.rs`.
+//
+// Size is the connected broker's to bound, not this module's: the
+// largest packet is what the broker's MQTT 5 CONNACK advertises
+// (Maximum Packet Size), and a publish past it is answered 413 before
+// it is sent. A broker that advertises none is sent records up to the
+// contract's `PAYLOAD_MAX`, and one it then will not take is found by
+// what the broker does with it:
+//
+//   - MQTT 5 DISCONNECT with Packet too large (0x95): the largest
+//     publish awaiting PUBACK is answered 413.
+//   - The connection closed with publishes awaiting PUBACK (all MQTT
+//     3.1.1 offers): the largest of them, if no publish as large was
+//     PUBACKed on the connection, is the suspect. The close is a LINK
+//     DOWN like any other, and the requester re-issues it; if the
+//     connection closes on that same record again, it is answered 413.
+//     One close is not proof (a broker restarts), two on one record are.
+//
+// Every other publish awaiting PUBACK is invalidated by the LINK DOWN
+// and re-issued by the requester after the LINK UP.
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -63,9 +83,13 @@ use authority::{Authority, PORT_QUANTUM_BROKER};
 const MAX_CLIENT_ID_LEN: usize = 32;
 const MAX_TOPIC_LEN: usize = 96;
 /// One PUBLISH: fixed header (1 + up to 3 length bytes), the topic with
-/// its length prefix, the packet id, and the largest body the contract
-/// collects — so every collected record fits, and none is refused here.
-const TX_BUF_SIZE: usize = 4 + 2 + MAX_TOPIC_LEN + 2 + PAYLOAD_MAX;
+/// its length prefix, the packet id, the MQTT 5 property length, and the
+/// largest body the contract collects — so every collected record fits,
+/// and none is refused here.
+const TX_BUF_SIZE: usize = 4 + 2 + MAX_TOPIC_LEN + 2 + 1 + PAYLOAD_MAX;
+/// The largest packet taken from the broker, advertised as this client's
+/// Maximum Packet Size in the MQTT 5 CONNECT: a broker sends acks, and
+/// drops a reason string or user property that would pass it.
 const RX_BUF_SIZE: usize = 2048;
 const NET_BUF_SIZE: usize = 1600;
 
@@ -84,6 +108,10 @@ const CONNECT_TIMEOUT_MS: u64 = 10000;
 const BACKOFF_INIT_MS: u64 = 2000;
 const BACKOFF_MAX_MS: u64 = 60000;
 
+// MQTT protocol levels: MQTT 5, and MQTT 3.1.1 for a broker that refuses 5.
+const MQTT_V5: u8 = 5;
+const MQTT_V311: u8 = 4;
+
 // MQTT packets.
 const MQTT_CONNECT: u8 = 0x10;
 const MQTT_CONNACK: u8 = 0x20;
@@ -92,6 +120,23 @@ const MQTT_PUBLISH_QOS1: u8 = 0x32;
 const MQTT_PUBACK: u8 = 0x40;
 const MQTT_PINGREQ: u8 = 0xC0;
 const MQTT_PINGRESP: u8 = 0xD0;
+const MQTT_DISCONNECT: u8 = 0xE0;
+
+// MQTT 5 property identifiers this module reads or writes (§2.2.2.2).
+const PROP_SERVER_KEEP_ALIVE: u8 = 0x13;
+const PROP_RECEIVE_MAXIMUM: u8 = 0x21;
+const PROP_MAXIMUM_PACKET_SIZE: u8 = 0x27;
+
+// MQTT reason codes this module acts on.
+/// CONNACK: the broker does not speak the requested protocol level —
+/// MQTT 3.1.1's "unacceptable protocol version" (0x01), which a 3.1.1
+/// broker answers a version 5 CONNECT with, and MQTT 5's 0x84.
+const RC_V311_BAD_VERSION: u8 = 0x01;
+const RC_UNSUPPORTED_VERSION: u8 = 0x84;
+/// PUBACK: Quota exceeded — the broker may take the publish later.
+const RC_QUOTA_EXCEEDED: u8 = 0x97;
+/// DISCONNECT: Packet too large.
+const RC_PACKET_TOO_LARGE: u8 = 0x95;
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
@@ -104,6 +149,26 @@ enum Phase {
     Running = 5,
     Reconnect = 6,
     Error = 255,
+}
+
+/// A publish awaiting PUBACK, as the broker saw it: what a close that
+/// follows it is judged by.
+#[derive(Clone, Copy)]
+struct Sent {
+    /// MQTT packet id; 0 = empty.
+    packet_id: u16,
+    /// The whole PUBLISH packet, bytes.
+    packet_len: u32,
+    /// FNV-1a of the record, which identifies its re-issue.
+    print: u32,
+}
+
+impl Sent {
+    const EMPTY: Sent = Sent {
+        packet_id: 0,
+        packet_len: 0,
+        print: 0,
+    };
 }
 
 #[repr(C)]
@@ -123,6 +188,27 @@ struct SinkState {
 
     phase: Phase,
     packet_id: u16,
+
+    /// The protocol level CONNECT asks for: MQTT 5 until a broker refuses
+    /// it, then MQTT 3.1.1.
+    proto_level: u8,
+    /// The broker's Maximum Packet Size from its CONNACK; 0 = none
+    /// advertised (MQTT 3.1.1 never advertises one).
+    max_packet: u32,
+    /// Publishes the broker takes awaiting PUBACK (its Receive Maximum),
+    /// at most `INFLIGHT_CAP`.
+    recv_max: u16,
+    /// The keep-alive in force: the broker's Server Keep Alive if its
+    /// CONNACK sets one, else `keepalive_s`.
+    keepalive_eff: u16,
+    /// The largest PUBLISH the broker PUBACKed on this connection.
+    acked_max: u32,
+    /// The publish a close followed, not yet PUBACKed (`suspect_len` 0 =
+    /// none): if the connection closes on its re-issue too, it is 413.
+    suspect_len: u32,
+    suspect_print: u32,
+    /// Publishes awaiting PUBACK, by packet id.
+    sent: [Sent; INFLIGHT_CAP],
 
     state_start_ms: u64,
     last_ping_ms: u64,
@@ -284,22 +370,34 @@ unsafe fn flush_answers(s: &mut SinkState) {
 
 // ── MQTT builders ────────────────────────────────────────────────────
 
+/// The MQTT 5 CONNECT's properties: this client's Maximum Packet Size.
+const CONNECT_PROPS_LEN: usize = 1 + 4;
+
 unsafe fn build_connect(s: &mut SinkState) -> usize {
     let buf = s.tx_buf.as_mut_ptr();
+    let v5 = s.proto_level == MQTT_V5;
     let payload_len = 2 + s.client_id_len as usize;
-    let remaining = 10 + payload_len;
+    let props = if v5 { 1 + CONNECT_PROPS_LEN } else { 0 };
+    let remaining = 10 + props + payload_len;
     let mut offset = 0;
     *buf.add(offset) = MQTT_CONNECT;
     offset += 1;
     offset += encode_remaining_length(buf.add(offset), remaining);
     offset += write_mqtt_string(buf.add(offset), b"MQTT".as_ptr(), 4);
-    *buf.add(offset) = 4; // 3.1.1
+    *buf.add(offset) = s.proto_level;
     offset += 1;
-    *buf.add(offset) = 0x02; // clean session
+    *buf.add(offset) = 0x02; // clean session / clean start
     offset += 1;
     *buf.add(offset) = 0;
     *buf.add(offset + 1) = s.keepalive_s;
     offset += 2;
+    if v5 {
+        *buf.add(offset) = CONNECT_PROPS_LEN as u8;
+        *buf.add(offset + 1) = PROP_MAXIMUM_PACKET_SIZE;
+        let max = (RX_BUF_SIZE as u32).to_be_bytes();
+        ptr_copy(buf.add(offset + 2), max.as_ptr(), 4);
+        offset += 1 + CONNECT_PROPS_LEN;
+    }
     offset += write_mqtt_string(
         buf.add(offset),
         s.client_id.as_ptr(),
@@ -308,17 +406,11 @@ unsafe fn build_connect(s: &mut SinkState) -> usize {
     offset
 }
 
-/// QoS-1 PUBLISH with packet id. Returns total length, 0 = won't fit.
-unsafe fn build_publish_qos1(
-    buf: *mut u8,
-    buf_size: usize,
-    topic: *const u8,
-    topic_len: usize,
-    packet_id: u16,
-    payload: *const u8,
-    payload_len: usize,
-) -> usize {
-    let remaining = 2 + topic_len + 2 + payload_len;
+/// The whole QoS-1 PUBLISH packet for `payload_len` bytes on `topic_len`
+/// bytes of topic: fixed header, topic, packet id, the empty MQTT 5
+/// property block, payload.
+fn publish_len(v5: bool, topic_len: usize, payload_len: usize) -> usize {
+    let remaining = 2 + topic_len + 2 + v5 as usize + payload_len;
     let rl_bytes = if remaining < 128 {
         1
     } else if remaining < 16384 {
@@ -326,7 +418,26 @@ unsafe fn build_publish_qos1(
     } else {
         3
     };
-    let total = 1 + rl_bytes + remaining;
+    1 + rl_bytes + remaining
+}
+
+/// QoS-1 PUBLISH with packet id. Returns total length, 0 = won't fit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a raw-pointer packet builder: each argument is one field of the packet"
+)]
+unsafe fn build_publish_qos1(
+    buf: *mut u8,
+    buf_size: usize,
+    v5: bool,
+    topic: *const u8,
+    topic_len: usize,
+    packet_id: u16,
+    payload: *const u8,
+    payload_len: usize,
+) -> usize {
+    let remaining = 2 + topic_len + 2 + v5 as usize + payload_len;
+    let total = publish_len(v5, topic_len, payload_len);
     if total > buf_size {
         return 0;
     }
@@ -338,6 +449,10 @@ unsafe fn build_publish_qos1(
     *buf.add(offset) = (packet_id >> 8) as u8;
     *buf.add(offset + 1) = (packet_id & 0xFF) as u8;
     offset += 2;
+    if v5 {
+        *buf.add(offset) = 0; // no properties
+        offset += 1;
+    }
     ptr_copy(buf.add(offset), payload, payload_len);
     offset += payload_len;
     offset
@@ -431,6 +546,9 @@ unsafe fn handle_requests(s: &mut SinkState) {
         if !s.desk.can_take() || s.request_in_chan < 0 {
             return;
         }
+        if s.desk.in_flight() >= s.recv_max as usize {
+            return; // the broker's Receive Maximum
+        }
         let sys = &*s.syscalls;
         let poll = (sys.channel_poll)(s.request_in_chan, POLL_IN);
         if poll <= 0 || ((poll as u32) & POLL_IN) == 0 {
@@ -449,6 +567,18 @@ unsafe fn handle_requests(s: &mut SinkState) {
         let Some(body) = s.desk.request(at).map(|r| r.body) else {
             continue;
         };
+        let v5 = s.proto_level == MQTT_V5;
+        let packet_len = publish_len(v5, s.topic_len as usize, body.len());
+        if s.max_packet != 0 && packet_len > s.max_packet as usize {
+            // Past the Maximum Packet Size the broker advertised: refused
+            // here, never sent — the broker would end the connection for
+            // it (MQTT 5 §3.1.2.11.4).
+            s.desk.refuse(at, status::TOO_LARGE);
+            flush_answers(s);
+            continue;
+        }
+        // FNV-1a (the runtime's): the record's identity across its re-issue.
+        let print = fnv1a(body);
 
         // Fresh packet id (1..=65535, never 0).
         s.packet_id = s.packet_id.wrapping_add(1);
@@ -458,6 +588,7 @@ unsafe fn handle_requests(s: &mut SinkState) {
         let pkt_len = build_publish_qos1(
             s.tx_buf.as_mut_ptr(),
             TX_BUF_SIZE,
+            v5,
             s.topic.as_ptr(),
             s.topic_len as usize,
             s.packet_id,
@@ -475,6 +606,13 @@ unsafe fn handle_requests(s: &mut SinkState) {
         let now = millis(s);
         if !s.desk.dispatch(at, s.packet_id as u64, now) {
             return; // window full (ruled out by can_take)
+        }
+        if let Some(slot) = s.sent.iter_mut().find(|e| e.packet_id == 0) {
+            *slot = Sent {
+                packet_id: s.packet_id,
+                packet_len: pkt_len as u32,
+                print,
+            };
         }
         let _ = start_send(s, pkt_len);
         // Serialize: one MQTT packet in TX at a time keeps broker
@@ -500,42 +638,224 @@ unsafe fn process_rx_packet(s: &mut SinkState) -> usize {
         return 0;
     }
     let var_start = 1 + rl_bytes;
+    let body = core::slice::from_raw_parts(buf.add(var_start), rem_len);
     match pkt_type {
-        0x20 => {
-            // CONNACK
-            if rem_len >= 2 {
-                let rc = *buf.add(var_start + 1);
-                if rc == 0 {
-                    log_msg(s, b"[mqttsink] connack ok");
-                    if s.phase == Phase::WaitConnack {
-                        s.phase = Phase::Running;
-                        s.last_ping_ms = millis(s);
-                        s.last_activity_ms = s.last_ping_ms;
-                        s.backoff_ms = BACKOFF_INIT_MS;
-                        // (Re)connected and accepting: LINK UP after a
-                        // LINK DOWN.
-                        s.desk.link_up();
-                    }
+        MQTT_CONNACK => on_connack(s, body),
+        MQTT_PUBACK => {
+            // PUBACK: [packet_id:2] and, in MQTT 5, [reason][properties]
+            // — durable acceptance at QoS 1 unless the reason is a failure.
+            if body.len() >= 2 {
+                let pid = u16::from_be_bytes([body[0], body[1]]);
+                let reason = if s.proto_level == MQTT_V5 && body.len() >= 3 {
+                    body[2]
                 } else {
-                    log_err(s, b"[mqttsink] connack rejected");
-                    enter_reconnect(s);
+                    0
+                };
+                on_puback(s, pid, reason);
+            }
+            s.last_activity_ms = millis(s);
+        }
+        MQTT_PINGRESP => {
+            s.last_activity_ms = millis(s);
+        }
+        MQTT_DISCONNECT => {
+            // MQTT 5 server DISCONNECT: [reason][properties]; no reason
+            // byte is a normal disconnection.
+            let reason = body.first().copied().unwrap_or(0);
+            if reason == RC_PACKET_TOO_LARGE {
+                log_err(s, b"[mqttsink] broker: packet too large");
+                if let Some(at) = largest_in_flight(s, 0) {
+                    let pid = s.sent[at].packet_id;
+                    forget_sent(s, pid);
+                    let _ = s.desk.settle(pid as u64, status::TOO_LARGE);
                 }
+                enter_reconnect(s);
+            } else {
+                log_err(s, b"[mqttsink] broker disconnected");
+                broker_closed(s);
             }
-        }
-        0x40 => {
-            // PUBACK: [packet_id:2] — durable acceptance at QoS 1.
-            if rem_len >= 2 {
-                let pid = ((*buf.add(var_start) as u16) << 8) | (*buf.add(var_start + 1) as u16);
-                let _ = s.desk.settle(pid as u64, status::OK);
-            }
-            s.last_activity_ms = millis(s);
-        }
-        0xD0 => {
-            s.last_activity_ms = millis(s);
+            return 0;
         }
         _ => {}
     }
+    if s.phase == Phase::Reconnect {
+        return 0; // the connection is gone, and its bytes with it
+    }
     total
+}
+
+/// CONNACK: `[ack_flags][reason]`, then in MQTT 5 the properties.
+unsafe fn on_connack(s: &mut SinkState, body: &[u8]) {
+    if body.len() < 2 {
+        return;
+    }
+    let rc = body[1];
+    if (rc == RC_V311_BAD_VERSION || rc == RC_UNSUPPORTED_VERSION) && s.proto_level == MQTT_V5 {
+        // A broker without MQTT 5: speak 3.1.1 to it from now on, at once
+        // rather than after a backoff.
+        log_msg(s, b"[mqttsink] broker refuses MQTT 5, using 3.1.1");
+        s.proto_level = MQTT_V311;
+        enter_reconnect(s);
+        s.reconnect_at_ms = millis(s);
+        s.backoff_ms = BACKOFF_INIT_MS;
+        return;
+    }
+    if rc != 0 {
+        log_err(s, b"[mqttsink] connack rejected");
+        enter_reconnect(s);
+        return;
+    }
+    s.max_packet = 0;
+    s.recv_max = INFLIGHT_CAP as u16;
+    s.keepalive_eff = s.keepalive_s as u16;
+    s.acked_max = 0;
+    if s.proto_level == MQTT_V5 && body.len() > 2 {
+        read_connack_props(s, &body[2..]);
+    }
+    log_msg(s, b"[mqttsink] connack ok");
+    if s.phase == Phase::WaitConnack {
+        s.phase = Phase::Running;
+        s.last_ping_ms = millis(s);
+        s.last_activity_ms = s.last_ping_ms;
+        s.backoff_ms = BACKOFF_INIT_MS;
+        // (Re)connected and accepting: LINK UP after a LINK DOWN.
+        s.desk.link_up();
+    }
+}
+
+/// The CONNACK properties this module honours: Maximum Packet Size,
+/// Receive Maximum and Server Keep Alive. The rest are walked past.
+unsafe fn read_connack_props(s: &mut SinkState, b: &[u8]) {
+    let (len, n) = decode_remaining_length(b.as_ptr(), b.len());
+    if n == 0 || n + len > b.len() {
+        return;
+    }
+    let props = &b[n..n + len];
+    let mut at = 0;
+    while at < props.len() {
+        let id = props[at];
+        at += 1;
+        let Some(size) = prop_size(id, &props[at..]) else {
+            return; // an unknown property: the rest cannot be walked
+        };
+        if at + size > props.len() {
+            return;
+        }
+        let v = &props[at..at + size];
+        match id {
+            PROP_MAXIMUM_PACKET_SIZE => {
+                s.max_packet = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+            }
+            PROP_RECEIVE_MAXIMUM => {
+                let m = u16::from_be_bytes([v[0], v[1]]);
+                if m != 0 && (m as usize) < INFLIGHT_CAP {
+                    s.recv_max = m;
+                }
+            }
+            PROP_SERVER_KEEP_ALIVE => {
+                s.keepalive_eff = u16::from_be_bytes([v[0], v[1]]);
+            }
+            _ => {}
+        }
+        at += size;
+    }
+}
+
+/// The value bytes of MQTT 5 property `id` at the head of `rest`; `None`
+/// for an identifier MQTT 5 does not define.
+fn prop_size(id: u8, rest: &[u8]) -> Option<usize> {
+    let two = |at: usize| -> Option<usize> {
+        Some(u16::from_be_bytes([*rest.get(at)?, *rest.get(at + 1)?]) as usize)
+    };
+    match id {
+        // Byte.
+        0x01 | 0x17 | 0x19 | 0x24 | 0x25 | 0x28 | 0x29 | 0x2A => Some(1),
+        // Two-byte integer.
+        0x13 | 0x21 | 0x22 | 0x23 => Some(2),
+        // Four-byte integer.
+        0x02 | 0x11 | 0x18 | 0x27 => Some(4),
+        // Variable byte integer.
+        0x0B => {
+            let n = rest.iter().take(4).position(|b| b & 0x80 == 0)?;
+            Some(n + 1)
+        }
+        // UTF-8 string or binary data.
+        0x03 | 0x08 | 0x09 | 0x12 | 0x15 | 0x16 | 0x1A | 0x1C | 0x1F => Some(2 + two(0)?),
+        // UTF-8 string pair.
+        0x26 => {
+            let k = two(0)?;
+            Some(2 + k + 2 + two(2 + k)?)
+        }
+        _ => None,
+    }
+}
+
+/// The broker's verdict on publish `pid`: an MQTT 5 reason below 0x80 is
+/// durable acceptance; Quota exceeded may be repeated (503); any other
+/// failure is the broker refusing it (502).
+unsafe fn on_puback(s: &mut SinkState, pid: u16, reason: u8) {
+    if let Some(e) = s.sent.iter().find(|e| e.packet_id == pid && pid != 0) {
+        if reason < 0x80 {
+            if e.packet_len > s.acked_max {
+                s.acked_max = e.packet_len;
+            }
+            if e.packet_len == s.suspect_len && e.print == s.suspect_print {
+                s.suspect_len = 0;
+            }
+        }
+    }
+    forget_sent(s, pid);
+    let answer = match reason {
+        0x00..=0x7F => status::OK,
+        RC_QUOTA_EXCEEDED => status::BUSY,
+        _ => status::BAD_GATEWAY,
+    };
+    let _ = s.desk.settle(pid as u64, answer);
+}
+
+/// The publish awaiting PUBACK with the largest packet past `floor` bytes.
+fn largest_in_flight(s: &SinkState, floor: u32) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (i, e) in s.sent.iter().enumerate() {
+        if e.packet_id != 0
+            && e.packet_len > floor
+            && best.is_none_or(|b| e.packet_len > s.sent[b].packet_len)
+        {
+            best = Some(i);
+        }
+    }
+    best
+}
+
+fn forget_sent(s: &mut SinkState, pid: u16) {
+    if let Some(e) = s.sent.iter_mut().find(|e| e.packet_id == pid && pid != 0) {
+        *e = Sent::EMPTY;
+    }
+}
+
+/// The broker ended the connection with no reason that names a publish:
+/// a close, or an MQTT 5 DISCONNECT for anything but size. The largest
+/// publish awaiting PUBACK that is larger than any the broker PUBACKed on
+/// the connection is the suspect. The second close on the same record is
+/// taken as the broker refusing it, and it is answered 413; the first is
+/// a LINK DOWN like any other, which the requester re-issues it after.
+unsafe fn broker_closed(s: &mut SinkState) {
+    if let Some(at) = largest_in_flight(s, s.acked_max) {
+        let e = s.sent[at];
+        if s.suspect_len != 0 && e.packet_len == s.suspect_len && e.print == s.suspect_print {
+            log_err(
+                s,
+                b"[mqttsink] broker closed on the same publish twice: 413",
+            );
+            s.suspect_len = 0;
+            forget_sent(s, e.packet_id);
+            let _ = s.desk.settle(e.packet_id as u64, status::TOO_LARGE);
+        } else {
+            s.suspect_len = e.packet_len;
+            s.suspect_print = e.print;
+        }
+    }
+    enter_reconnect(s);
 }
 
 unsafe fn compact_rx(s: &mut SinkState, consumed: usize) {
@@ -571,7 +891,7 @@ unsafe fn handle_rx(s: &mut SinkState) {
     }
     if msg_type == NET_MSG_CLOSED || msg_type == NET_MSG_ERROR {
         log_err(s, b"[mqttsink] connection lost");
-        enter_reconnect(s);
+        broker_closed(s);
         return;
     }
     if msg_type == NET_MSG_DATA && payload_len > 2 {
@@ -587,6 +907,9 @@ unsafe fn handle_rx(s: &mut SinkState) {
                 break;
             }
             compact_rx(s, consumed);
+        }
+        if s.phase == Phase::Reconnect {
+            return; // the broker ended the connection
         }
         let space = RX_BUF_SIZE - s.rx_have as usize;
         if data_len > space {
@@ -614,11 +937,11 @@ unsafe fn handle_rx(s: &mut SinkState) {
 }
 
 unsafe fn handle_keepalive(s: &mut SinkState) {
-    if s.keepalive_s == 0 {
+    if s.keepalive_eff == 0 {
         return;
     }
     let now = millis(s);
-    let interval_ms = (s.keepalive_s as u64) * 1000;
+    let interval_ms = (s.keepalive_eff as u64) * 1000;
     let ping_interval = interval_ms * 3 / 4;
     if now.wrapping_sub(s.last_ping_ms) >= ping_interval && s.tx_sent >= s.tx_len {
         let len = build_pingreq(s.tx_buf.as_mut_ptr());
@@ -651,6 +974,7 @@ unsafe fn enter_reconnect(s: &mut SinkState) {
         s.conn_id = 0;
         s.conn_present = 0;
     }
+    s.sent = [Sent::EMPTY; INFLIGHT_CAP];
     s.rx_have = 0;
     s.tx_len = 0;
     s.tx_sent = 0;
@@ -718,6 +1042,8 @@ pub unsafe extern "C" fn module_new(
         params_def::parse_tlv(s, params, params_len);
         s.phase = Phase::Init;
         s.packet_id = 0;
+        s.proto_level = MQTT_V5;
+        s.recv_max = INFLIGHT_CAP as u16;
         s.backoff_ms = BACKOFF_INIT_MS;
         log_msg(s, b"[mqttsink] init");
         if !s.authority.adopt(PORT_QUANTUM_BROKER) {

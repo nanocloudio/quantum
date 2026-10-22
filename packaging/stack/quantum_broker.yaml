@@ -1,0 +1,175 @@
+# quantum's broker as a published stack: the single-node MQTT broker (Clustor
+# substrate + quantum's protocol stack) with its two in-graph exchange fronts.
+# An application includes it and wires the fronts like any provider; the
+# broker's internals stay private. See docs/architecture/broker_front.md.
+#
+#   include:
+#     - stack: quantum_broker            # or a path to this file
+#       as: broker
+#       params: { publish_topic: orders }
+#   wiring:
+#     - { from: app.request_out,  to: broker.publish_in }    # PUBLISH, as to mqtt_sink
+#     - { from: broker.publish_out, to: app.response_in }
+#     - { from: http.request_out, to: broker.subscribe_in }  # GET <filter>, held
+#     - { from: broker.subscribe_out, to: http.response_in }
+#     - { from: linux_net.net_out, to: broker.net_in }       # optional: MQTT listener
+#     - { from: broker.net_out, to: linux_net.net_in }
+#
+# Exports:
+#   publish_in / publish_out      the publish front: mqtt_sink's conventions
+#                                 (METHOD_PUBLISH, target = ordering key, body =
+#                                 the record, 200 on durable acceptance), every
+#                                 record on `publish_topic`
+#   subscribe_in / subscribe_out  the subscription front: GET <topic filter>,
+#                                 answered HEAD 200 HOLD|MORE then one BODY per
+#                                 message under the requester's credit
+#   net_in / net_out              the MQTT listener (`peer_router`), for
+#                                 foreign clients over TCP; wire both to the
+#                                 platform's network, or neither
+#
+# The graph that includes it owns what a stack cannot carry: `target`,
+# `platform: { net: {} }` when the listener is wired, `scheduler:
+# { accept_cycles: true }` (the request/answer edges make the graph cyclic),
+# and a `continuity:` block if it wants the session anchor declared.
+stack: quantum_broker
+version: 0.1.0
+description: >-
+  quantum's single-node MQTT broker with in-graph exchange fronts: a publish
+  front with mqtt_sink's conventions and a subscription front of held
+  exchanges, plus the MQTT listener for foreign clients.
+
+params:
+  publish_topic:
+    type: string
+    default: ""
+    description: >-
+      The topic every publish lands on (mqtt_sink's `topic`); the request's
+      target is its ordering key. Required when publish_in is wired.
+  client_id:
+    type: string
+    default: quantum-front
+    description: >-
+      The publish session's MQTT client id; live-only subscriptions present
+      `<client_id>-s<hex>`. At most 58 bytes.
+  ack_timeout_ms:
+    type: integer
+    default: 10000
+    min: 1
+    max: 3600000
+    description: >-
+      How long the broker may take to acknowledge a publish (then LINK DOWN)
+      or to take a subscription (then 504).
+  session_expiry_s:
+    type: integer
+    default: 3600
+    min: 0
+    max: 4294967295
+    description: How long a durable subscription's session outlives its exchange.
+  listen_port:
+    type: integer
+    default: 9090
+    min: 1
+    max: 65535
+    description: The MQTT listener's TCP port, when net_in / net_out are wired.
+
+exports:
+  publish_in: front.publish_in
+  publish_out: front.publish_out
+  subscribe_in: front.subscribe_in
+  subscribe_out: front.subscribe_out
+  net_in: peer_router.net_in
+  net_out: peer_router.net_out
+
+modules:
+  # ── Clustor substrate ───────────────────────────────────
+  - name: peer_router
+    listen_port: ${param:listen_port}
+  - name: partition_router
+  - name: consensus
+    # 1 ms proposal batching: the default 10 ms put a ~100 batch/s pacing
+    # floor under every durable acknowledgement.
+    proposal_batch_timeout_ms: 1
+  - name: durability
+    fsync_mode: 1
+    group_window_ms: 0
+    group_max_pending: 8
+    fence_depth: 8
+    segment_bytes: 4194304
+  - name: control_plane
+  - name: admission
+  - name: gateway
+
+  # ── quantum protocol stack (MQTT) ───────────────────────
+  - name: protocol
+    variant: mqtt
+  - name: session_processor
+    variant: mqtt
+  - name: flow
+  - name: topic_engine
+  - name: messaging
+
+  # ── The in-graph fronts ─────────────────────────────────
+  - name: front
+    type: broker_front
+    topic: ${param:publish_topic}
+    client_id: ${param:client_id}
+    ack_timeout_ms: ${param:ack_timeout_ms}
+    session_expiry_s: ${param:session_expiry_s}
+
+wiring:
+  # The fronts reach the broker as a codec does, on their own pair.
+  - { from: front.session_out, to: session_processor.front_in, buffer_bytes: 65536 }
+  - { from: session_processor.front_out, to: front.session_in, buffer_bytes: 65536 }
+
+  # Foreign clients: peer_router -> protocol (the MQTT codec) and back.
+  - { from: peer_router.cleartext, to: protocol.raw_in, buffer_bytes: 65536 }
+  - { from: protocol.frames_out, to: peer_router.client_resp, buffer_bytes: 65536 }
+  - { from: protocol.proposals_out, to: session_processor.codec_in, buffer_bytes: 65536 }
+  - { from: session_processor.codec_out, to: protocol.responses_in, buffer_bytes: 65536 }
+
+  # Proposals through the partition router to Raft (untagged and tagged).
+  - { from: session_processor.proposals, to: partition_router.proposals }
+  - { from: partition_router.proposals_p0, to: consensus.proposals_partitioned }
+  - { from: session_processor.proposals_tagged, to: partition_router.proposals_tagged }
+  - { from: partition_router.proposals_tagged_p0, to: consensus.proposals_partitioned_tagged }
+  - { from: consensus.proposal_assigned, to: session_processor.assigned_in }
+  - { from: peer_router.peer_rx, to: consensus.ack, buffer_bytes: 65536 }
+  - { from: consensus.net_out, to: peer_router.peer_tx, buffer_bytes: 65536 }
+  - { from: consensus.rpc_out, to: peer_router.peer_tx, buffer_bytes: 65536 }
+
+  # Persistence.
+  - { from: consensus.log_append, to: durability.entries, rate: transaction }
+  - { from: consensus.log_maintenance, to: durability.compact_before, rate: transaction }
+  - { from: consensus.entry_request, to: durability.entry_request, buffer_bytes: 8192 }
+  - { from: durability.entry_reply, to: consensus.entry_reply, buffer_bytes: 8192 }
+  - { from: session_processor.retention_floor, to: durability.retention_floor }
+  - { from: durability.replay_complete, to: consensus.wal_replay_complete, rate: transaction }
+  - { from: durability.flushed, to: consensus.wal_flushed }
+  - { from: consensus.cross_durability_ack, to: durability.ack }
+  - { from: durability.quorum_durable, to: consensus.durable }
+
+  # Commit -> apply.
+  - { from: consensus.committed_entries, to: session_processor.committed_in }
+
+  # Flow: acknowledgement, backpressure, prefetch.
+  - { from: consensus.durable_horizon, to: flow.durability_in }
+  - { from: session_processor.forward_out, to: flow.forward_in }
+  - { from: flow.ack_out, to: session_processor.ack_in }
+
+  # Admission credits.
+  - { from: admission.credits, to: gateway.credit_supply }
+  - { from: admission.credits, to: session_processor.flow_in }
+  - { from: consensus.lag_signal, to: admission.lag }
+  - { from: gateway.rejected, to: flow.rejected_in }
+  - { from: flow.flow_out, to: session_processor.flow_in }
+
+  # Topic engine and messaging composite.
+  - { from: session_processor.topic_out, to: topic_engine.op_in }
+  - { from: topic_engine.deliver_out, to: session_processor.deliver_in }
+  - { from: session_processor.messaging_out, to: messaging.op_in }
+  - { from: messaging.result_out, to: session_processor.messaging_in }
+
+  # Control plane.
+  - { from: control_plane.proof, to: admission.proof }
+  - { from: admission.cache_state, to: consensus.cp_state }
+  - { from: admission.strict_fallback, to: consensus.cp_state }
