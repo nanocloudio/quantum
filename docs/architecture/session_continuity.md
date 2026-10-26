@@ -1,6 +1,8 @@
-# Session continuity: `protocol` as the anchor, `session_processor` as the worker
+# Session continuity: the anchor and `session_processor` as the worker
 
-Source: `modules/app/protocol/anchor.rs` (the anchor),
+Source: `modules/app/quantum_mqtt_anchor/anchor.rs` (the anchor, used by
+`quantum_mqtt_anchor` and mounted by `protocol`; see
+[mqtt_anchor.md](mqtt_anchor.md)),
 `modules/app/session_processor/worker.rs` (the worker),
 `modules/common/cores/session_identity_core.rs` (the identity rule),
 `examples/linux/handoff.yaml` (the pair that moves),
@@ -29,9 +31,10 @@ worker must guarantee if another worker is to pick the session up.
 
 The other half is the client's attachment, and it cannot live in the
 worker: a connection keyed by `conn_id` inside the module being
-replaced disappears with it. So the attachment is the anchor's, in
-`protocol` — the module that already owns the socket, the codec state
-and the response multiplexing, none of which moves. The worker behind
+replaced disappears with it. So the attachment is the anchor's: in
+`quantum_mqtt_anchor` for an MQTT front door, or in `protocol` for the
+multi-protocol one, the module that already owns the socket, the codec
+state and the response multiplexing, none of which moves. The worker behind
 it can then be replaced while the connection stays open.
 
 ## Two identities, two counters
@@ -90,8 +93,10 @@ the activation.
 
 Every codec hands its decoded envelopes to `anchor::forward_env`
 instead of writing the proposal edge itself. The anchor forwards to the
-worker the connection is bound to, or holds the envelope while the
-attachment is not live.
+worker the connection is bound to, wrapped in `MSG_ANCHOR_DELIVERY`
+with the session, epoch and delivery id it was decided under (see
+[mqtt_anchor.md](mqtt_anchor.md#the-delivery-envelope)), or holds the
+envelope while the attachment is not live.
 
 **Delivery cursors.** Per connection, in envelope bytes (header
 included) — the anchor's transfer unit at this seam, which is what the
@@ -104,25 +109,33 @@ and `codec_out` writes. `EXPORT_BEGIN` carries the worker's pair; the
 anchor admits it with `cursors_admit` or refuses the handoff.
 
 **The hold.** Envelopes for a connection whose attachment is not live
-— attaching, or mid-swap — are held in one bounded FIFO and released
-in order when it is. The buffer and its overflow policy are declared
-configuration on `protocol`: `hold_bytes` (default 64 KiB) and
-`hold_overflow`, which CLOSES the connection by default because a
-silently dropped publish is a QoS promise broken; `1` drops the
-envelope and counts it.
+— attaching, or mid-swap — are held in one bounded FIFO with their
+delivery ids and released in order when it is. The buffer and its
+overflow policy are declared configuration on the anchor: `hold_bytes`
+(default 64 KiB) and `hold_overflow`, which CLOSES the connection by
+default because a silently dropped publish is a QoS promise broken;
+`1` drops the envelope and counts it. Reading from the transport stops
+at `hold_high_water_pct` of the hold, so the client's TCP window closes
+before the hold can overflow.
 
-**Ordering across the seam.** Each worker's response bus is drained
+**Ordering across the seam.** A client that goes away is reported to
+its bound worker in band, as a `MSG_CONN_CLOSED` delivery behind the
+client's last frames, so nothing the client sent is overtaken by the
+end of its binding. Each worker's response bus is drained
 before its control channel, and a worker's control channel is read
 only when its response bus polls empty, so everything the worker
 emitted before `DRAINED` has been counted before its export is read.
 
 ## The swap
 
-`handoff_after_records` on the anchor (0 = never; the gates' trigger,
-capped by `handoff_max_swaps`) moves every connection bound to the
-current default worker to the other one, and new connections attach
-there from that moment. A deployment drives swaps from its control
-plane through the same path. Per connection:
+A swap moves every connection bound to the current default worker to
+the other one, and new connections attach there from that moment. An
+operator or control plane starts it with `MSG_ANCHOR_SWAP`: a `QASW`
+record proposed through the log (`POST /propose`) and forwarded by the
+workers that apply it, or a command on the anchor's `cmd_in`
+([mqtt_anchor.md](mqtt_anchor.md#starting-a-handoff)).
+`handoff_after_records` (0 = never, capped by `handoff_max_swaps`) is
+the gates' record-count trigger for the same swap. Per connection:
 
 1. `DRAIN` to the bound worker.
 2. The worker drains to quiescent — no proposal of the session awaits
@@ -150,24 +163,88 @@ here it constrains admission, not just configuration.
 
 ## What moves
 
-The record `sessions::export_record` builds (`QSR1`): identity,
-generation, the slot index, negotiated parameters (protocol version,
+The record `sessions::export_record` builds (`QSR2`): identity,
+generation, the slot index, the session's placement shard, negotiated
+parameters (protocol version,
 clean start, keep-alive, expiry, receive maximum), the Will, the flow
 windows and the QoS in-flight ledger (packet id, QoS, phase,
 direction, generation, wal index, raft partition, correlation, and
-whether the PUBREC went out). It is what the importing worker needs
-that the committed log does not hand it. It is bounded by
-`RECORD_MAX`; an oversize record is refused at `EXPORT_BEGIN`, never
-truncated.
+whether the PUBREC went out), the worker's book of the session's
+subscriptions (the source of a site export, [anchor_continuity.md](anchor_continuity.md#a-session-at-a-surviving-site-qss1)),
+then the handoff tail: the anchor delivery-id high-water the session has
+consumed and the per-partition apply cursor the state reflects. It is
+what the importing worker needs that the committed log does not hand
+it. It is bounded by `RECORD_MAX`; an oversize record is refused at
+`EXPORT_BEGIN`, never truncated, and a record whose tail cannot be read
+is refused as corrupt.
 
-Subscriptions are deliberately absent: they live in `topic_engine`,
-keyed by the slot index the session keeps across the move.
+The subscriptions themselves stay in `topic_engine`, keyed by the slot
+index the session keeps across the move; `MSG_TOPIC_MOVE` re-points
+their deliveries to the importing worker.
 
 **Export points are protocol-coherent.** The anchor's per-connection
 reassembly is anchor state, so an export never lands mid-packet by
 construction. A QoS 2 flow between PUBREC and PUBREL is a stable,
 durably recorded point and the record carries it; a flow whose PUBLISH
 or PUBREL is still in Raft is not, and the drain waits for it.
+
+## Exact replay
+
+Source: `modules/common/cores/session_replay_core.rs`, gated by
+`tools/core_tests/src/session_replay_tests.rs`.
+
+**The cursor.** Both workers consume the same committed stream, but
+while the session is the exporter's the importer skips its entries. So
+the importer compares the record's cursor E with its own apply
+position I, per partition:
+
+| Condition | Outcome |
+|---|---|
+| The importer skipped an entry of the session past E | refused `STATUS_CURSOR_MISMATCH`: the entry is in neither the record nor the importer's future; the handoff is refused and the session stays where it is |
+| The importer is behind E on some partition | admitted with a **replay floor**: the session's entries at or below E are already in the record and are skipped (`floorskip=`) until the importer's cursor passes E, so none is applied twice |
+| Neither | admitted |
+
+The importer tracks the most recent entry it skipped per slot, which is
+exact for a session whose entries ride one partition (every
+session-keyed op rides its session shard's partition) and checks only
+the latest skip otherwise. Floors are bounded (`REPLAY_FLOORS`, 64); a
+full table refuses the import `STATUS_NOT_READY` rather than admit one
+that would apply twice. Refusing whenever I > E would be simpler and
+wrong: the two workers routinely sit a few entries apart, so it would
+refuse almost every handoff.
+
+**Delivery ids.** The importer adopts the record's delivery
+high-water, so a frame the anchor retries after the move is refused as
+a duplicate there too ([mqtt_anchor.md](mqtt_anchor.md#the-delivery-envelope)).
+
+**Outbound deliveries are in the log.** What a subscriber is owed does
+not live only in the memory of the worker that sent it, so neither a
+worker crash nor a node restart loses it. The worker logs a QoS 1/2
+PUBLISH as `QOP_DELIVER` (session, generation, packet id, QoS and the
+encoded PUBLISH body) when it is sent, and its progress as
+`QOP_DELIVER_ACK`: released when a QoS 2 subscriber's PUBREC arrives and
+the PUBREL goes out, complete at PUBACK or PUBCOMP. Every worker applies
+both into its outbound ledger, whatever slot the entry names, because
+the ledger has no side effects. A clean-start CONNECT forgets what the
+session was owed.
+
+What a session is owed is therefore rebuilt from the log alone, and a
+resumed session (a `clean_start=0` CONNECT, or an adoption after a
+worker loss) has it resent under its original packet ids, in the order
+it was first sent (`redlv=`; MQTT 3.1.1 and 5.0 §4.4). A delivery the
+subscriber has not answered goes out as a DUP PUBLISH; a QoS 2 receiver
+that already holds it answers PUBREC again (§4.3.3). A QoS 2 delivery
+already released goes out as its PUBREL, never as the PUBLISH: the
+receiver may have handed the message on and forgotten the packet id at
+PUBREL, and a second PUBLISH would then be a second copy.
+
+The bounds are explicit. The ledger holds 256 owed deliveries per worker
+with bodies up to 1920 bytes inline, and resends at most a session's
+in-flight window (16) at a resume. A delivery past either ledger bound is
+not logged and is counted (`dunlog=`, and the ledger's own refusal
+count), so it is not reconstructible; a full ledger refuses rather than
+evicts. Logging costs two proposals per QoS 1 delivery and three per
+QoS 2, and `log_deliveries: 0` turns it off.
 
 ## Two workers on one node
 
@@ -206,6 +283,16 @@ with `flow` on `RESUME`; a QoS 2 flow whose PUBREC already went out is
 not, and a PUBLISH retransmitted with DUP against an in-flight QoS 2
 flow is answered from the ledger rather than started again.
 
+## What is claimed
+
+| Event | Outcome | Mechanism | Gate |
+|---|---|---|---|
+| Planned worker replacement (operator `QASW` record, or the record trigger) | No reconnect; QoS 1/2 exactly once; `MON_SESSION` shows the epoch flip | DRAIN, export, import, RESUME at epoch + 1 | `session_handoff.sh`: `survive`, `qos2_between`, `qos2_across`, `subs_retained`, `planned_restart` |
+| Unexpected worker loss, inside `worker_loss_ms` + adoption < client keep-alive budget | No reconnect for sessions with an acknowledged checkpoint; others are closed and resume by reconnect | checkpoints to the standby, the anchor's replay window, adoption at epoch + 1, ledger redelivery ([mqtt_anchor.md](mqtt_anchor.md#worker-loss)) | `session_handoff.sh`: `worker_loss` |
+| Planned ingress-host maintenance | Stays connected where the transport moves the connection (Fluxor's `TRANSPORT_CONTINUITY` under Wormhole's paired anchors): the anchor re-anchors the session with its worker, quiesced, so exactly | `quantum_mqtt_anchor` `continuity: 1`, `session_processor` seats ([anchor_continuity.md](anchor_continuity.md#in-the-modules)) | `anchor_continuity_tests.rs`, `production_seat_tests.rs` (cores); the module graphs `examples/paired_anchor/quantum_host.yaml` and `quantum_worker.yaml` |
+| **Abrupt ingress-host power loss** | Stays connected when the transport moved the connection under a crash-continuous pairing, with responses in flight or not: the anchor's horizon is the bytes `tls` reports the standby holds, and the replacement writes only what the standby lacks ([anchor_continuity.md](anchor_continuity.md#in-the-modules)). | `quantum_mqtt_anchor` `continuity: 1`, `session_processor` seats | `anchor_continuity_tests.rs`, `production_seat_tests.rs` (cores); the module graphs `examples/paired_anchor/quantum_host.yaml` and `quantum_worker.yaml` |
+| Site loss | Resume at the surviving site from the session's `QSS1` record when one was exported (`MSG_SITE_EXPORT`), admitted by `site_admit`; otherwise reconnect and resume from the surviving site's log | `session_processor` `site_out` ([anchor_continuity.md](anchor_continuity.md#a-session-at-a-surviving-site-qss1)) | `session_site_tests.rs` (cores) |
+
 ## Declaration and validation
 
 Every serving graph declares the class it requires and the config tool
@@ -216,9 +303,12 @@ including that the capability providers are present:
 continuity:
   - id: quantum_edge
     class: edge_anchored
-    anchor: protocol                     # transport.anchor.stream
+    anchor: quantum_mqtt_anchor          # transport.anchor.stream
     workers: [session_processor]         # session.worker, session.handoff
 ```
+
+A multi-protocol graph names `protocol`, which declares the same
+capability over the same anchor.
 
 `examples/linux/handoff.yaml` declares two workers (which requires
 `session.handoff` on both) and clustor's `session_directory` as the
@@ -279,6 +369,13 @@ not the server.
 - `tools/core_tests/src/session_identity_tests.rs` — the identity rule:
   fails if a rebind could move the generation, a CONNECT could move the
   epoch, or a stale epoch could be resumed.
+- `tools/core_tests/src/session_replay_tests.rs` — exact replay: the
+  tail round-trips; a record behind an entry the importer skipped is a
+  cursor mismatch; an importer behind the record replays from the
+  record's cursor and no earlier; the log rebuilds exactly the owed
+  deliveries, oldest first; a released QoS 2 delivery is owed its
+  PUBREL; a replayed delivery replaces rather than duplicates; an ack
+  never completes a newer delivery; a full ledger refuses and counts.
 - `tests/integration/session_handoff.sh` — the gates, each on
   `handoff.yaml` rendered with the swap trigger it needs, driven by
   `session_handoff_test.py` with the broker's `MON_SESSION` log as the
@@ -288,7 +385,9 @@ not the server.
   PUBREL (and a DUP retransmission after the move) and wherever the
   drain lets it land; subscriptions and retained delivery unchanged
   across the move, and a session attached after it; an export whose
-  cursors disagree refused and the session kept; a hosted composition
+  cursors disagree refused and the session kept, with an unacked
+  outbound QoS 1 delivery found in the WAL as `QOP_DELIVER` and its
+  PUBACK as `QOP_DELIVER_ACK`; a hosted composition
   admitted at `edge_anchored` and refused at `transport_migratable`.
 - `tests/integration/session_handoff_peer.sh` — the independent peer:
   mosquitto on both ends of a QoS 2 burst while the anchor swaps the
@@ -306,15 +405,26 @@ them out of `fluxor ci`, which builds and lints but boots nothing.
 
 ## Parameters
 
-`protocol` (the anchor): `anchor_id` (eight bytes on every session id
-and `MON_SESSION` line), `handoff_after_records`, `handoff_max_swaps`,
-`session_drain_ms` (default 500), `hold_bytes` (65536),
-`hold_overflow` (0 = close, 1 = drop), `default_worker`.
+The anchor (`quantum_mqtt_anchor`, or `protocol`): `anchor_id` (eight
+bytes on every session id and `MON_SESSION` line),
+`handoff_after_records`, `handoff_max_swaps`, `session_drain_ms`
+(default 500), `hold_bytes` (65536), `hold_overflow` (0 = close,
+1 = drop), `default_worker`, `liveness_only` (0),
+`hold_high_water_pct` (75), and for worker loss `worker_probe_ms`,
+`worker_loss_ms` and `replay_bytes` (all 0 = off); see
+[mqtt_anchor.md](mqtt_anchor.md#parameters).
 
 `session_processor` (the worker): `worker_id`, `co_located_workers`
 (bitmask of the other worker ids on the node), `slot_base`,
-`slot_count`, and `export_cursor_skew` — test-only fault injection for
-the cursor gate, 0 in every deployment.
+`slot_count`, `export_cursor_skew` — test-only fault injection for
+the cursor gate, 0 in every deployment — `keyed_only` (default 1:
+refuse any proposal that names no routing key; see
+[partitioning.md](partitioning.md#unkeyed-proposals)),
+`log_deliveries` (default 1: log outbound QoS 1/2 deliveries, see
+[Exact replay](#exact-replay)), `checkpoint_ms` (0 = no checkpoints to
+the standby; see [mqtt_anchor.md](mqtt_anchor.md#worker-loss)), and
+`fault_stop_on_ping` — test-only fault injection for the
+`worker_loss` gate, 0 in every deployment.
 
 **Ceilings.** A worker steps at most `MAX_HANDOFFS` (1024) attachments
 that are past `Attached` — draining, mid-import, or settling after a

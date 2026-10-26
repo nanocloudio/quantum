@@ -83,6 +83,66 @@ pub mod session_identity {
     include!("../../../modules/common/cores/session_identity_core.rs");
 }
 
+/// The MQTT anchor: delivery envelopes and their admission, liveness-only
+/// mode, read-pause backpressure and the framed hold/replay FIFO.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod mqtt_anchor {
+    include!("../../../modules/common/cores/mqtt_anchor_core.rs");
+}
+
+/// Session replay across a worker handoff: the QSR2 tail, the import
+/// cursor rule, and the outbound delivery ledger the log rebuilds.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod session_replay {
+    include!("../../../modules/common/cores/session_replay_core.rs");
+}
+
+/// Anchor continuity across an ingress takeover: the production envelope,
+/// the output-horizon gate, the worker's retained productions, the
+/// anchor's `QAC1` record and the re-anchor exchange. Mounted beside the
+/// anchor core it names by bare name, as the modules mount it.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod anchor_continuity {
+    include!("../../../modules/common/cores/mqtt_anchor_core.rs");
+    include!("../../../modules/common/cores/anchor_continuity_core.rs");
+    include!("../../../modules/common/cores/production_seat_core.rs");
+}
+
+/// A session exported to a surviving site and imported there (`QSS1`):
+/// subscriptions, in-flight and owed deliveries, the dedupe and apply
+/// cursors, and the import rule. Mounted beside the replay and identity
+/// cores it names by bare name.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod session_site {
+    include!("../../../modules/common/cores/session_replay_core.rs");
+    include!("../../../modules/common/cores/session_identity_core.rs");
+    include!("../../../modules/common/cores/session_site_core.rs");
+}
+
 /// The dial authority the seven outbound connectors compose their
 /// `CMD_CONNECT_TO` records from. `#[path]`-mounted rather than
 /// `include!`d so its own mount of the SDK contract resolves against
@@ -137,6 +197,8 @@ pub mod subscribe_exchange;
 pub mod front_session;
 
 #[cfg(test)]
+mod anchor_continuity_tests;
+#[cfg(test)]
 mod authority_tests;
 #[cfg(test)]
 mod edge_routing_tests;
@@ -151,8 +213,16 @@ mod kafka_log_tests;
 #[cfg(test)]
 mod kafka_metadata_tests;
 #[cfg(test)]
+mod mqtt_anchor_tests;
+#[cfg(test)]
+mod production_seat_tests;
+#[cfg(test)]
 mod publish_exchange_tests;
 #[cfg(test)]
 mod session_identity_tests;
+#[cfg(test)]
+mod session_replay_tests;
+#[cfg(test)]
+mod session_site_tests;
 #[cfg(test)]
 mod subscribe_exchange_tests;

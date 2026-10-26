@@ -34,9 +34,9 @@ const PKT_PINGREQ: u8 = 12;
 const PKT_PINGRESP: u8 = 13;
 const PKT_DISCONNECT: u8 = 14;
 
-// Raised 4096 -> 8192 for lattice CDC egress (CDC RFC C-1): a CDC
-// envelope carries up to a 4 KiB row image plus identity framing, and
-// the C-1 frame budget is envelope + MAX_VALUE_LEN.
+// Largest MQTT packet this codec frames. Sized for change-data-capture
+// egress: a CDC envelope carries up to a 4 KiB row image plus its
+// identity framing.
 const MAX_PACKET: usize = 8192;
 /// Envelope-sized buffer for response messages from session_processor:
 /// `[conn_id:u16 LE][proto][pkt_type][flags][body]` where body may be a
@@ -140,6 +140,10 @@ struct ConnCtx {
     big: u16,
     protocol_version: u8,
     active: u8,
+    /// The connection's clear bytes received, in the transport's
+    /// numbering: where each packet ends, for the anchor's
+    /// acknowledgements (anchor continuity).
+    in_bytes: u64,
 }
 
 impl ConnCtx {
@@ -155,6 +159,7 @@ impl ConnCtx {
             big: 0,
             protocol_version: 0,
             active: 0,
+            in_bytes: 0,
         }
     }
 }
@@ -166,6 +171,16 @@ pub struct Mqtt {
     /// session worker and holds it across a handoff.
     pub anchor: *mut super::anchor::Anchor,
     pub out_frames: i32,
+    /// Placement of the next response against the transport's output
+    /// horizon (anchor continuity): when `place_on`, the connection's
+    /// output stands at `place_written` bytes and the standby holds
+    /// `place_through`; whatever prefix of the encoded frame the standby
+    /// already holds is not written again. `placed_len` is the encoded
+    /// frame's whole length.
+    pub place_on: bool,
+    pub place_written: u64,
+    pub place_through: u64,
+    pub placed_len: usize,
 
     packets_decoded: u32,
     packets_encoded: u32,
@@ -1270,6 +1285,8 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
             return false;
         }
         let ci = s.find_or_create_conn(conn_id);
+        // Counted as the transport counts them, whatever becomes of them.
+        s.conns[ci].in_bytes = s.conns[ci].in_bytes.wrapping_add(chunk_len as u64);
 
         // Append this chunk to the conn's reassembly buffer, borrowing
         // a pooled page when it outgrows the inline bytes. Bail on
@@ -1301,6 +1318,26 @@ pub unsafe fn on_frame(s: &mut Mqtt, sys: &SyscallTable, mtype: u8, payload: &[u
         // `pkt_bytes` unchanged.
         drain_conn(s, sys, ci, conn_id)
     }
+}
+
+/// A connection the anchor imported (anchor continuity): its CONNECT was
+/// decoded on the host it moved from, so the codec takes its next bytes
+/// — from the connection's byte `in_bytes`, a packet boundary — under the
+/// protocol version the record carried. Inbound and outbound MQTT 5
+/// topic aliases are the old codec's and do not move; a client that
+/// relies on one after a takeover gets a protocol error, honestly.
+/// `false` when the codec has no slot free for it.
+pub fn import_conn(s: &mut Mqtt, conn_id: wire::ConnId, version: u8, in_bytes: u64) -> bool {
+    s.release_conn(conn_id);
+    let ci = s.find_or_create_conn(conn_id);
+    // A full table answers with the shared slot, which is not this
+    // connection's to configure.
+    if s.slot_by_conn[conn_id as usize] == 0 {
+        return false;
+    }
+    s.conns[ci].protocol_version = version;
+    s.conns[ci].in_bytes = in_bytes;
+    true
 }
 
 /// Retry the packet a refused proposal write left at the front of its
@@ -1342,6 +1379,13 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire:
             // it came from without borrowing again.
             s.reass_release_if_empty(ci);
             let avail = s.conns[ci].reass_len as usize;
+            // Every packet before what the buffer holds has its delivery
+            // id (a refused one is back in the buffer, its id untaken).
+            super::anchor::boundary(
+                &mut *s.anchor,
+                conn_id,
+                s.conns[ci].in_bytes.wrapping_sub(avail as u64),
+            );
             if avail < 2 {
                 break;
             }
@@ -1386,7 +1430,7 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire:
             let pkt_start = CID;
             let pkt_bytes = pkt_size;
 
-            // Parse MQTT fixed header (same as legacy single-packet path).
+            // Parse the MQTT fixed header.
             let pkt_type = s.in_buf[pkt_start] >> 4;
             let flags = s.in_buf[pkt_start] & 0x0F;
             let qos = (flags >> 1) & 0x03;
@@ -1425,12 +1469,28 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire:
                 PKT_CONNECT => {
                     let info = parse_connect(body);
                     s.conns[ci].protocol_version = info.protocol_version;
+                    // The anchor owns the connection's identity (version,
+                    // keep-alive, client-id hash) for as long as it holds
+                    // the transport open (docs/architecture/mqtt_anchor.md).
+                    if !s.anchor.is_null() {
+                        super::anchor::note_connect(
+                            &mut *s.anchor,
+                            conn_id,
+                            info.protocol_version,
+                            info.keep_alive,
+                            info.client_id,
+                        );
+                    }
                     // Cap the outbound alias table at both the CONNECT-
                     // advertised TopicAliasMaximum and the per-conn
                     // table size — we never issue more aliases than
                     // the slot count regardless of what the client
                     // asked for.
-                    s.conns[ci].sub_topic_alias_max = if info.protocol_version >= 5 {
+                    // Under anchor continuity no outbound alias is used:
+                    // a production's bytes must be what any anchor
+                    // encodes from it, so a replacement places it exactly.
+                    let continuity = !s.anchor.is_null() && (*s.anchor).continuity != 0;
+                    s.conns[ci].sub_topic_alias_max = if info.protocol_version >= 5 && !continuity {
                         let cap = MAX_TOPIC_ALIASES_PER_CONN as u16;
                         info.props.topic_alias_maximum.min(cap)
                     } else {
@@ -1724,12 +1784,21 @@ unsafe fn drain_conn(s: &mut Mqtt, sys: &SyscallTable, ci: usize, conn_id: wire:
                 }
 
                 PKT_PINGREQ => {
-                    // Synthesize PINGRESP immediately — no session processor involvement
-                    let ping = [(PKT_PINGRESP << 4), 0u8];
-                    if !write_conn_frame(sys, s.out_frames, conn_id, &ping) {
-                        s.frames_refused = s.frames_refused.wrapping_add(1);
+                    // The anchor decides (`anchor::pingreq`): with a worker
+                    // authoritative it is answered here and forwarded as a
+                    // liveness mark, so the worker's keep-alive sweep sees
+                    // a client that only pings; with none it is answered
+                    // only under the route's liveness-only policy, and
+                    // otherwise the PINGRESP is owed until one is.
+                    let answer = s.anchor.is_null()
+                        || super::anchor::pingreq(&mut *s.anchor, sys, dev_millis(sys), conn_id);
+                    if answer {
+                        let ping = [(PKT_PINGRESP << 4), 0u8];
+                        if !write_conn_frame(sys, s.out_frames, conn_id, &ping) {
+                            s.frames_refused = s.frames_refused.wrapping_add(1);
+                        }
+                        s.packets_encoded += 1;
                     }
-                    s.packets_encoded += 1;
                     continue;
                 }
 
@@ -1869,10 +1938,7 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
                 other => other,
             };
             let n = encode_mqtt_frame(&mut s.frame, PKT_DISCONNECT, 0, &[reason]);
-            if n > 0 && !write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..n]) {
-                s.frames_refused = s.frames_refused.wrapping_add(1);
-            }
-            return true;
+            return n == 0 || write_placed(s, sys, conn_id, n);
         }
 
         let mut retarget = [0u8; 2];
@@ -1938,16 +2004,38 @@ pub unsafe fn on_response(s: &mut Mqtt, sys: &SyscallTable, payload: &[u8]) -> b
             return true;
         }
 
-        // A refused frame is NOT consumed: the caller keeps the response
-        // and offers it again next step, so a PUBACK the client is
-        // waiting on is never lost to a full edge.
-        if !write_conn_frame(sys, s.out_frames, conn_id, &s.frame[..frame_len]) {
+        if !write_placed(s, sys, conn_id, frame_len) {
             return false;
         }
         dev_log(sys, 3, b"[mqtt] resp -> peer".as_ptr(), 19);
         s.packets_encoded += 1;
         true
     }
+}
+
+/// Write the encoded response `s.frame[..frame_len]` to `conn_id`. Under
+/// placement (`place_on`) the prefix the transport's standby already holds
+/// is not written again, and `placed_len` records the frame's length. A
+/// refused frame is NOT consumed: the caller keeps the response and offers
+/// it again next step, so a PUBACK the client is waiting on is never lost
+/// to a full edge.
+///
+/// # Safety
+/// `sys` is the kernel's live syscall table.
+unsafe fn write_placed(s: &mut Mqtt, sys: &SyscallTable, conn_id: u16, frame_len: usize) -> bool {
+    let skip = if s.place_on {
+        s.place_through
+            .saturating_sub(s.place_written)
+            .min(frame_len as u64) as usize
+    } else {
+        0
+    };
+    if skip < frame_len && !write_conn_frame(sys, s.out_frames, conn_id, &s.frame[skip..frame_len])
+    {
+        return false;
+    }
+    s.placed_len = frame_len;
+    true
 }
 
 /// End connection `conn_id` (slot `ci`) for a packet too large to process.
@@ -2012,7 +2100,13 @@ unsafe fn write_proposal(
     let mut out = [0u8; PAYLOAD_BUF];
     out[..CID].copy_from_slice(&conn_id.to_le_bytes());
     out[CID..total].copy_from_slice(&s.envelope[..len]);
-    super::anchor::forward_env(&mut *s.anchor, sys, msg_type, &out[..total])
+    super::anchor::forward_env(
+        &mut *s.anchor,
+        sys,
+        dev_millis(sys),
+        msg_type,
+        &out[..total],
+    )
 }
 
 /// Write a framed proposal envelope to session_processor.codec_in.

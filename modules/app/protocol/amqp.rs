@@ -185,7 +185,8 @@ unsafe fn forward(
     mt: u8,
     payload: &[u8],
 ) -> bool {
-    !anchor.is_null() && super::anchor::forward_env(&mut *anchor, sys, mt, payload)
+    !anchor.is_null()
+        && super::anchor::forward_env(&mut *anchor, sys, super::dev_millis(sys), mt, payload)
 }
 
 pub fn init(s: &mut Amqp) {

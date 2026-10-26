@@ -162,6 +162,10 @@ pub struct Session {
     ///
     /// `0` means no pending Will fire.
     pending_will_fire_at_ms: u64,
+    /// The virtual shard this session's state is placed on, derived from
+    /// its identity at CONNECT (`ConnectParams::shard`) and carried in its
+    /// handoff record. See [`shard`].
+    shard: u32,
 }
 
 impl Session {
@@ -194,6 +198,7 @@ impl Session {
             receive_maximum: 0,
             conn_bound: 0,
             pending_will_fire_at_ms: 0,
+            shard: 0,
         }
     }
 
@@ -785,6 +790,17 @@ pub fn generation(s: &Sessions, si: usize) -> SessionGeneration {
     }
 }
 
+/// The virtual shard every proposal of session `si` is keyed with, as
+/// its CONNECT placed it. One value for every emit site and every node,
+/// so a session's ops cannot land on two partitions.
+pub fn shard(s: &Sessions, si: usize) -> u32 {
+    if si < MAX_SESSIONS {
+        s.slots[si].shard
+    } else {
+        0
+    }
+}
+
 pub fn protocol(s: &Sessions, si: usize) -> u8 {
     if si < MAX_SESSIONS {
         s.slots[si].protocol
@@ -895,6 +911,7 @@ pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u1
     let x = &mut s.slots[si];
     x.tenant = p.tenant;
     x.stream_hash = p.stream_hash;
+    x.shard = p.shard;
     x.protocol = p.protocol;
     x.conn_id = conn_id;
     x.conn_bound = 1;
@@ -911,6 +928,11 @@ pub fn open_transient(s: &mut Sessions, si: usize, p: ConnectParams, conn_id: u1
 pub struct ConnectParams {
     pub tenant: TenantId,
     pub stream_hash: StreamHash,
+    /// The session's placement: `wire::shard_mqtt_session(tenant,
+    /// client_id)`, or `wire::shard_mqtt_stream(tenant, stream_hash)` for
+    /// a client that presented no id. A pure function of the CONNECT, so
+    /// the proposing worker and every node applying the entry agree.
+    pub shard: u32,
     pub protocol: u8,
     pub clean_start: bool,
     pub keep_alive_ms: u32,
@@ -926,6 +948,7 @@ pub fn commit_connect(s: &mut Sessions, si: usize, p: ConnectParams) {
     let x = &mut s.slots[si];
     x.tenant = p.tenant;
     x.stream_hash = p.stream_hash;
+    x.shard = p.shard;
     x.session_generation = x.session_generation.wrapping_add(1);
     x.protocol = p.protocol;
     x.clean_start = u8::from(p.clean_start);
@@ -1091,8 +1114,7 @@ pub fn release_foreign(
         if s.slots[si].present == 0 && s.slots[si].active == 0 && s.slots[si].transient == 0 {
             continue;
         }
-        let shard = super::wire::shard_mqtt_stream(s.slots[si].tenant, s.slots[si].stream_hash);
-        if is_local(shard) {
+        if is_local(shard(s, si)) {
             continue;
         }
         let bound = if s.slots[si].conn_bound == 1 {
@@ -1116,11 +1138,14 @@ pub fn release_foreign(
 // the committed log does NOT determine for the importing worker — or
 // what it determines but the importer has not applied, which the import
 // reconciles against (`session_identity_core::reconcile_generation`).
-// Subscriptions are deliberately absent: they live in `topic_engine`,
-// keyed by the slot index the session keeps across the move.
+// The subscriptions themselves live in `topic_engine`, keyed by the slot
+// index the session keeps across the move; what the record carries of
+// them is the worker's own book of the session's subscriptions (the
+// source of a site export, `site.rs`), which the importer has not got.
 //
 // Layout (all LE):
-//   [magic "QSR1":4][tenant:4][stream_hash:8][generation:4][slot:4]
+//   [magic "QSR2":4][tenant:4][stream_hash:8][generation:4][slot:4]
+//   [shard:4]  — the session's placement, as its CONNECT derived it
 //   [protocol:1][clean_start:1][persisted:1][keep_alive_ms:4]
 //   [next_msg_id:4][session_expiry_s:4][receive_maximum:2]
 //   [last_activity_age_ms:4]  — `now - last_activity`, rebased on import
@@ -1130,22 +1155,41 @@ pub fn release_foreign(
 //   [inflight_count:1] then per entry
 //     [packet_id:2][qos:1][phase:1][direction:1][generation:4]
 //     [wal_index:8][correlation_id:8][partition_id:2][rec_sent:1]
+//   [book_len:2][book section]  — `SiteSubBook::export_section`
+//   then the handoff tail (`session_replay_core`): the delivery-id
+//   high-water and the per-partition apply cursor the state reflects
+//     [delivery_hw:8][count:1] count × [partition:2][index:8]
 //
 // `RECORD_MAX` bounds the blob; the worker's import buffer is sized to
 // it, so an oversize record is refused at EXPORT_BEGIN rather than
 // truncated.
 
-const RECORD_MAGIC: [u8; 4] = *b"QSR1";
+const RECORD_MAGIC: [u8; 4] = *b"QSR2";
+/// Bytes up to and including `slot`: what `record_identity` reads.
+const RECORD_IDENTITY: usize = 4 + 4 + 8 + 4 + 4;
 const RECORD_FIXED: usize =
-    4 + 4 + 8 + 4 + 4 + 1 + 1 + 1 + 4 + 4 + 4 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 2 + 2 + 1;
+    RECORD_IDENTITY + 4 + 1 + 1 + 1 + 4 + 4 + 4 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 2 + 2 + 1;
 const INFLIGHT_RECORD: usize = 2 + 1 + 1 + 1 + 4 + 8 + 8 + 2 + 1;
 /// Largest handoff record a session can export.
-pub const RECORD_MAX: usize =
-    RECORD_FIXED + MAX_WILL_TOPIC + MAX_WILL_PAYLOAD + MAX_INFLIGHT_PER_SESSION * INFLIGHT_RECORD;
+pub const RECORD_MAX: usize = RECORD_FIXED
+    + MAX_WILL_TOPIC
+    + MAX_WILL_PAYLOAD
+    + MAX_INFLIGHT_PER_SESSION * INFLIGHT_RECORD
+    + 2
+    + super::site_core::SITE_BOOK_SECTION_MAX
+    + super::replay::TAIL_MAX;
 
-/// Serialise the session at `si` into `out`. Returns the byte count, or
-/// 0 if the slot holds nothing or `out` is too short.
-pub fn export_record(s: &Sessions, si: usize, now: u64, out: &mut [u8]) -> usize {
+/// Serialise the session at `si` into `out`, followed by its encoded book
+/// section `book` and handoff `tail`. Returns the byte count, or 0 if the
+/// slot holds nothing or `out` is too short.
+pub fn export_record(
+    s: &Sessions,
+    si: usize,
+    now: u64,
+    out: &mut [u8],
+    book: &[u8],
+    tail: &[u8],
+) -> usize {
     if !holds(s, si) || out.len() < RECORD_MAX {
         return 0;
     }
@@ -1160,6 +1204,7 @@ pub fn export_record(s: &Sessions, si: usize, now: u64, out: &mut [u8]) -> usize
     put(&x.stream_hash.to_le_bytes(), &mut p);
     put(&x.session_generation.to_le_bytes(), &mut p);
     put(&(si as u32).to_le_bytes(), &mut p);
+    put(&x.shard.to_le_bytes(), &mut p);
     put(&[x.protocol, x.clean_start, x.persisted], &mut p);
     put(&x.keep_alive_ms.to_le_bytes(), &mut p);
     put(&x.next_msg_id.to_le_bytes(), &mut p);
@@ -1195,8 +1240,63 @@ pub fn export_record(s: &Sessions, si: usize, now: u64, out: &mut [u8]) -> usize
         put(&[e.rec_sent], &mut p);
         n += 1;
     }
+    if tail.len() > super::replay::TAIL_MAX || book.len() > super::site_core::SITE_BOOK_SECTION_MAX
+    {
+        return 0;
+    }
+    put(&(book.len() as u16).to_le_bytes(), &mut p);
+    put(book, &mut p);
+    put(tail, &mut p);
     out[count_at] = n;
     p
+}
+
+/// The book section of a record, or `None` for one too short to hold
+/// the section it promises.
+pub fn record_book(blob: &[u8]) -> Option<&[u8]> {
+    let at = record_book_at(blob)?;
+    let n = usize::from(u16::from_le_bytes([*blob.get(at)?, *blob.get(at + 1)?]));
+    blob.get(at + 2..at + 2 + n)
+}
+
+/// The handoff tail of a record, or `None` for one too short to hold
+/// the tail it promises.
+pub fn record_tail(blob: &[u8]) -> Option<&[u8]> {
+    let at = record_book_at(blob)?;
+    let n = usize::from(u16::from_le_bytes([*blob.get(at)?, *blob.get(at + 1)?]));
+    blob.get(at + 2 + n..)
+}
+
+/// Where a record's book section starts: past the fixed part and the
+/// variable Will and in-flight sections.
+fn record_book_at(blob: &[u8]) -> Option<usize> {
+    if blob.len() < RECORD_FIXED || blob[..4] != RECORD_MAGIC {
+        return None;
+    }
+    // Walk the variable sections to the book: the Will topic and payload,
+    // then the in-flight entries. The identity, the shard, the three
+    // flags, keep-alive, next id, expiry, receive maximum, age, prefetch,
+    // outstanding, the Will flags and delay come first: the Will topic
+    // length is at byte 64.
+    let mut p = RECORD_IDENTITY + 4 + 3 + 4 + 4 + 4 + 2 + 4 + 4 + 4 + 3 + 4;
+    let wt = usize::from(u16::from_le_bytes([*blob.get(p)?, *blob.get(p + 1)?]));
+    p += 2 + wt;
+    let wp = usize::from(u16::from_le_bytes([*blob.get(p)?, *blob.get(p + 1)?]));
+    p += 2 + wp;
+    let n = usize::from(*blob.get(p)?);
+    p += 1 + n * INFLIGHT_RECORD;
+    if p > blob.len() {
+        return None;
+    }
+    Some(p)
+}
+
+/// Keep packet id `pid` out of the session's fresh allocations: a
+/// delivery redelivered under it after a resume still owns it.
+pub fn reserve_sub_packet_id(s: &mut Sessions, si: usize, pid: u16) {
+    if si < MAX_SESSIONS && (s.slots[si].next_msg_id as u16) <= pid {
+        s.slots[si].next_msg_id = u32::from(pid) + 1;
+    }
 }
 
 /// The identity a record names, read without importing it:
@@ -1235,7 +1335,7 @@ pub fn import_record(
     if holds(s, si) && (s.slots[si].tenant != tenant || s.slots[si].stream_hash != stream_hash) {
         return false;
     }
-    let mut p = 24usize;
+    let mut p = RECORD_IDENTITY;
     macro_rules! rd {
         ($n:expr) => {{
             if p + $n > blob.len() {
@@ -1250,6 +1350,8 @@ pub fn import_record(
     x.tenant = tenant;
     x.stream_hash = stream_hash;
     x.session_generation = generation;
+    let at = rd!(4);
+    x.shard = u32::from_le_bytes([blob[at], blob[at + 1], blob[at + 2], blob[at + 3]]);
     let at = rd!(3);
     x.protocol = blob[at];
     x.clean_start = blob[at + 1];
@@ -1638,4 +1740,66 @@ pub fn inflight_find(s: &Sessions, si: usize, packet_id: u16, direction: u8) -> 
         return None;
     }
     s.slots[si].find_inflight_dir(packet_id, direction)
+}
+
+/// Fill the identity, placement and in-flight ledger of the session at
+/// `si` into a site record (`QSS1`, `cores/session_site_core.rs`). `false`
+/// when the slot holds nothing or the session has more in-flight flows
+/// than a site record carries — refused whole, never truncated.
+pub fn fill_site(s: &Sessions, si: usize, r: &mut super::site_core::SiteSession) -> bool {
+    if !holds(s, si) {
+        return false;
+    }
+    let x = &s.slots[si];
+    r.tenant = x.tenant;
+    r.stream_hash = x.stream_hash;
+    r.generation = x.session_generation;
+    r.slot = si as u32;
+    r.shard = x.shard;
+    r.protocol = x.protocol;
+    r.keep_alive_ms = x.keep_alive_ms;
+    r.next_msg_id = x.next_msg_id;
+    r.session_expiry_s = x.session_expiry_s;
+    r.receive_maximum = x.receive_maximum;
+    r.flags = if x.clean_start != 0 {
+        super::site_core::SITE_FLAG_CLEAN_START
+    } else {
+        0
+    };
+    r.will_present = x.will_present;
+    r.will_qos = x.will_qos;
+    r.will_retain = x.will_retain;
+    r.will_delay_ms = x.will_delay_ms;
+    let wt = usize::from(x.will_topic_len);
+    let wp = usize::from(x.will_payload_len);
+    if wt > super::site_core::SITE_WILL_TOPIC_MAX || wp > super::site_core::SITE_WILL_PAYLOAD_MAX {
+        return false;
+    }
+    r.will_topic[..wt].copy_from_slice(&x.will_topic[..wt]);
+    r.will_topic_len = wt as u16;
+    r.will_payload[..wp].copy_from_slice(&x.will_payload[..wp]);
+    r.will_payload_len = wp as u16;
+    let mut n = 0usize;
+    for e in x.inflight.iter() {
+        if e.active == 0 {
+            continue;
+        }
+        if n == super::site_core::SITE_INFLIGHT_MAX {
+            return false;
+        }
+        r.inflight[n] = super::site_core::SiteInflight {
+            packet_id: e.packet_id,
+            qos: e.qos,
+            phase: e.phase,
+            direction: e.direction,
+            generation: e.session_generation,
+            wal_index: e.wal_index,
+            correlation_id: e.correlation_id,
+            partition_id: e.partition_id,
+            rec_sent: e.rec_sent,
+        };
+        n += 1;
+    }
+    r.inflight_count = n as u8;
+    true
 }

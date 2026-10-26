@@ -57,7 +57,7 @@ identically-named objects stay independent:
 
 | Domain | Key | What the shard owns |
 |---|---|---|
-| MQTT session | `(tenant, client_id)`, equivalently `(tenant, stream_hash)` | The session record, its inflight state and its offline queue |
+| MQTT session | `(tenant, client_id)` — see [Session placement](#session-placement) | The session record, its inflight state and its offline queue |
 | MQTT topic | `(tenant, normalized_topic)` | Matching of publishes against subscriptions, and the retained message |
 | Kafka | `(tenant, topic, partition)` | That partition's log |
 | Kafka group | `(tenant, group_id)` | Coordinator state and committed offsets |
@@ -74,6 +74,54 @@ The hash algorithm and seed are versioned. Any change requires a
 routing-epoch migration coordinated by the control plane: every node
 must drain the old hash before the new hash starts producing routing
 decisions.
+
+### Session placement
+
+An MQTT session is placed by `wire::shard_mqtt_session(tenant,
+client_id)`: client id to virtual shard to PRG. The key is derived at
+CONNECT, where the client id is in scope, by the same function where the
+CONNECT is proposed and wherever the committed `QOP_CONNECT` is applied
+(it carries the client id), so every node records the same shard on the
+session (`sessions::shard`). The session's handoff record carries it to
+an importing worker. Every later proposal of the session — SUBSCRIBE,
+UNSUBSCRIBE, PUBLISH, PUBREL, DISCONNECT, the keep-alive teardown, the
+delivery log — reads `sessions::shard` rather than re-deriving a key,
+so one session's ops cannot land on two partitions, and the placement
+gate at CONNECT (redirect or refuse when the shard is not this node's)
+decides against the same key.
+
+A client that presents an empty client id has nothing to key by. Its
+session is keyed by its stream hash (`wire::shard_mqtt_stream`), which
+the broker derives from the connection id, through the same path.
+
+`stream_hash` (`fnv1a_64(client_id)`) is the session's **identity**:
+the dedupe key, the WAL records and `find_by_stream` are all keyed by
+it.
+
+**Tenant.** The tenant in the key is `TENANT_UNRESOLVED` (0): the codec
+envelope carries no listener or authenticated identity, so
+`session_processor` cannot resolve one at CONNECT. The gap and the
+control-plane record that closes it are in
+[multi_tenancy.md](multi_tenancy.md); the constant is the one place the
+value lives, so the sites are greppable.
+
+### Unkeyed proposals
+
+clustor's `partition_router` accepts an unkeyed `MSG_CLIENT_PROPOSAL`
+and places it by hashing its bytes (`shard_for_key(fnv1a_64(body))`,
+counted as `proposals_body_hashed`), for producers other than Quantum.
+From Quantum's side that path is closed by `session_processor`'s
+`keyed_only` parameter (default on): every proposal the module
+originates names its shard, and an op with no derivable key — an MQTT
+packet type with no handler, a proposal from a protocol the module
+cannot parse — is refused and counted (`unkeyed=` on the `[sess] hb`
+line) rather than scattered by its bytes. Kafka group records
+(`QOP_KAFKA_GROUP_GEN`, `QOP_KAFKA_GROUP_MEMBER`) are keyed to the
+group's shard, with the offsets the group commits. `keyed_only: 0`
+passes such an op through to the body-hash placement. Refusing unkeyed
+proposals outright at the router would take a `partition_router`
+parameter, which clustor does not have; a body-hashed proposal from
+another producer is placed.
 
 ### Shards and raft partitions are different things
 
@@ -238,6 +286,21 @@ DELIVERY, not the publish: a message carrying `stream_hash`, routed to
 the session's PRG and consumed by `session_processor` there. Never by
 `topic_engine` — a delivery that re-enters publish matching on the far
 side is a routing loop, not a delivery.
+
+## Gates
+
+- `tools/core_tests/src/edge_routing_tests.rs` — placement epochs under
+  load: ten thousand sessions keyed across three PRGs resolve to the
+  same owner on every node; a shard-map epoch overriding 64 shards moves
+  exactly the sessions on those shards and nothing else; a replayed or
+  older epoch changes nothing; a clearing epoch returns every session to
+  its baseline; a fence withholds one PRG without moving ownership.
+- `tests/integration/placement_load.sh` — the same on a three-node
+  cluster: every client id's CONNECT is admitted on exactly the node the
+  key names, a `shard-map` override moves exactly the clients on the
+  overridden shards to the new PRG, and every other verdict is
+  unchanged. Boots brokers, so it runs under `make test-mqtt-suite`,
+  not `fluxor ci`.
 
 ## Operator surfaces
 

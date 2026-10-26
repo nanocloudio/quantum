@@ -137,6 +137,39 @@ define_params! {
     // refuse the handoff. 0 in every deployment.
     8, export_cursor_skew, u32, 0
         => |s, d, len| { s.worker.cursor_skew = p_u32(d, len, 0, 0); };
+    // Refuse to emit an UNKEYED proposal (`MSG_CLIENT_PROPOSAL` with no
+    // shard id). On, the default, every proposal this module originates
+    // names its virtual shard and an op with no derivable key is counted
+    // (`unkeyed=` on the `[sess] hb` line) and dropped instead of taking
+    // clustor `partition_router`'s body-hash placement. Off (0) passes
+    // such an op through to that placement. The router accepts
+    // body-hashed proposals from other producers either way
+    // (docs/architecture/partitioning.md, "Unkeyed proposals").
+    9, keyed_only, u8, 1
+        => |s, d, len| { s.keyed_only = p_u8(d, len, 0, 1); };
+    // Log every QoS 1/2 delivery to a subscriber (`QOP_DELIVER`) and its
+    // progress (`QOP_DELIVER_ACK`), so what a session is owed is
+    // reconstructible from the log after a worker crash or a node
+    // restart and resent on resume. Costs two proposals per QoS 1
+    // delivery and three per QoS 2; 0 turns it off, and what a session
+    // is owed then lives only in the memory of the worker serving it
+    // (docs/architecture/session_continuity.md, "Exact replay").
+    10, log_deliveries, u8, 1
+        => |s, d, len| { s.log_deliveries = p_u8(d, len, 0, 1); };
+    // Test-only fault injection for the worker-loss gate: on the first
+    // liveness mark (a client's PINGREQ) the worker goes dark — it drains
+    // every input and discards it, and emits nothing, as a crashed worker
+    // whose channels were torn down would. Draining (rather than
+    // stopping) keeps the shared fan-outs it hangs off flowing for the
+    // workers that are not lost. 0 in every deployment.
+    11, fault_stop_on_ping, u8, 0
+        => |s, d, len| { s.fault_stop_on_ping = p_u8(d, len, 0, 0); };
+    // Checkpoint period (0 = none): every period, each session this
+    // worker serves whose consumed delivery high-water moved is sent, at
+    // a coherent point, through the anchor to the standby — what a loss
+    // of this worker is adopted from (docs/architecture/mqtt_anchor.md).
+    12, checkpoint_ms, u32, 0
+        => |s, d, len| { s.worker.checkpoint_ms = p_u32(d, len, 0, 0); };
 }
 
 /// Kafka idempotent-producer sequence bookkeeping. Enforced on the
@@ -179,16 +212,29 @@ mod edge;
 
 mod consumers;
 mod correlate;
+/// Exact replay across a handoff: the QSR2 tail, the import cursor rule
+/// and the outbound delivery ledger (`cores/session_replay_core.rs`).
+mod replay {
+    include!("../../common/cores/session_replay_core.rs");
+}
 mod sessions;
+mod site;
 mod store;
 mod worker;
+/// The site record (`QSS1`) and the cursors it carries, mounted beside the
+/// replay and identity cores it names by bare name.
+mod site_core {
+    include!("../../common/cores/session_replay_core.rs");
+    include!("../../common/cores/session_identity_core.rs");
+    include!("../../common/cores/session_site_core.rs");
+}
 
 /// Kernel step ABI: 0=Continue, 1=Done, 2=Burst, 3=Ready. Returning
 /// Burst re-runs the domain's exec rotation within the same tick (up to
 /// the kernel's pass cap), so a record consumed here reaches its
 /// consumer in this tick instead of the next. We burst only when a
 /// record was actually consumed: an idle graph reports no burst and the
-/// tick costs exactly one pass, as before.
+/// tick costs exactly one pass.
 const STEP_BURST: i32 = 2;
 
 #[path = "../../common/types.rs"]
@@ -197,6 +243,8 @@ mod types;
 use types::*;
 
 const MAX_SESSIONS: usize = 16384;
+// The site book tracks every slot's subscriptions individually.
+const _: () = assert!(MAX_SESSIONS <= site_core::SITE_BOOK_SLOTS);
 
 /// Apply cursors, one per hosted raft partition. Must be at least
 /// clustor's `consensus` `K_MAX` (64); a partition id at or above this
@@ -204,6 +252,39 @@ const MAX_SESSIONS: usize = 16384;
 /// partition the per-partition sequencing but never memory safety.
 const MAX_APPLY_PARTITIONS: usize = 64;
 const MAX_INFLIGHT_PER_SESSION: usize = 16;
+/// The tenant every proposal this module originates is stamped with.
+///
+/// The codec envelope on `codec_in` carries no listener or authenticated
+/// identity, so the tenant a CONNECT belongs to cannot be resolved here;
+/// `docs/architecture/multi_tenancy.md` names the gap and the
+/// control-plane record (`MSG_TENANT_RECORD`) that closes it. Every
+/// session, and therefore every placement key, is tenant 0 until then.
+/// Named so the sites are greppable rather than literal zeros that read
+/// as "no tenant" and "tenant zero" alike.
+const TENANT_UNRESOLVED: TenantId = 0;
+
+/// The placement of an MQTT session: its client id's shard, or, for a
+/// client that presented none, its stream hash's. A pure function of the
+/// CONNECT, run where the CONNECT is proposed and where it is applied.
+fn session_shard(tenant: TenantId, client_id: &[u8], stream_hash: StreamHash) -> u32 {
+    if client_id.is_empty() {
+        wire::shard_mqtt_stream(tenant, stream_hash)
+    } else {
+        wire::shard_mqtt_session(tenant, client_id)
+    }
+}
+
+/// Imports at once whose replay floor is still filtering entries. A full
+/// table refuses the import `STATUS_NOT_READY` (the anchor keeps the
+/// session where it is) rather than admit one that would apply twice.
+const REPLAY_FLOORS: usize = 64;
+
+#[derive(Clone, Copy)]
+struct ReplayFloor {
+    slot: u32,
+    live: u8,
+    tail: replay::HandoffTail,
+}
 /// Proposal credit the codec drain requires before it takes a packet
 /// off `codec_in`: the substrate's entry cap, so no admitted packet can
 /// find the credit gone when it reaches admission.
@@ -334,6 +415,9 @@ const PKT_SUBSCRIBE: u8 = 8;
 const PKT_SUBACK: u8 = 9;
 const PKT_UNSUBSCRIBE: u8 = 10;
 const PKT_UNSUBACK: u8 = 11;
+/// PINGRESP: answered here only for a seated session (anchor continuity),
+/// where every byte the client reads is a production.
+const PKT_PINGRESP: u8 = 13;
 /// Server-initiated DISCONNECT. v5 only — the codec drops it for 3.1.1,
 /// which has no such packet.
 const PKT_DISCONNECT: u8 = 14;
@@ -585,12 +669,16 @@ const CORRELATION_TIMEOUT_MS: u64 = 30_000;
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_codec: i32,
+    /// The second anchor seam's session envelopes (in[11]) and their
+    /// responses (out[14]); -1 when the graph wires one anchor.
+    in_codec2: i32,
+    out_codec2: i32,
     /// The in-graph front's session envelopes (in[10]) and their
     /// responses (out[12]); -1 when the graph wires no front.
     in_front: i32,
     out_front: i32,
-    /// Which input the codec drain offers first, alternated per packet so
-    /// neither a busy transport nor a busy front starves the other.
+    /// Which input the codec drain offers first, rotated per packet so no
+    /// busy input starves the others.
     codec_turn: u8,
     /// Envelopes dropped for naming a connection outside their input's
     /// namespace.
@@ -632,6 +720,38 @@ struct ModuleState {
     co_located_workers: u8,
     slot_base: u16,
     slot_count: u16,
+    /// Param 9: refuse unkeyed proposals (see `try_emit_unkeyed`).
+    keyed_only: u8,
+    /// Param 10: log outbound QoS 1/2 deliveries (`log_delivery`).
+    log_deliveries: u8,
+    /// Param 11 (test only) and whether it has fired: the worker is dark.
+    fault_stop_on_ping: u8,
+    faulted: u8,
+    /// Deliveries the log says each session is owed, applied on every
+    /// worker whatever slot the entry names (`replay::DeliveryLedger`).
+    ledger: replay::DeliveryLedger,
+    /// Per slot, the most recent committed entry this worker skipped as
+    /// another worker's: `(partition, index)`, index 0 = none. The import
+    /// cursor rule reads it (`replay::cursor_verdict`).
+    skip_part: [u16; MAX_SESSIONS],
+    skip_index: [u64; MAX_SESSIONS],
+    /// Replay floors of sessions imported while this worker's apply was
+    /// behind the record: their entries at or below the record's cursor
+    /// are already in it and are skipped until the cursor passes.
+    floors: [ReplayFloor; REPLAY_FLOORS],
+    /// Committed entries a floor filtered, imports refused for a cursor
+    /// the importer had passed, deliveries that could not be logged, and
+    /// deliveries redelivered from the ledger.
+    replay_floor_skipped: u32,
+    replay_cursor_refused: u32,
+    deliver_logged: u32,
+    deliver_unlogged: u32,
+    redelivered: u32,
+    /// Proposals refused by the keyed-only gate: ops with no derivable
+    /// routing key that would otherwise have taken the router's
+    /// body-hash placement. Steady state 0 on a graph whose clients
+    /// speak only the ops this module keys.
+    proposals_unkeyed_refused: u32,
     /// QoS 2 PUBLISH retransmissions answered from the in-flight ledger
     /// instead of starting a second flow.
     qos2_dup_answered: u32,
@@ -642,6 +762,16 @@ struct ModuleState {
     #[cfg(feature = "kafka")]
     kafka_retention_evictions: u32,
     out_codec: i32,
+    /// `site_out` (out[13]): `QSS1` records for the cross-site carrier.
+    out_site: i32,
+    /// The worker's book of its sessions' subscriptions (site.rs).
+    sub_book: site_core::SiteSubBook,
+    site_rec: site_core::SiteSession,
+    site_buf: [u8; site_core::SITE_RECORD_MAX],
+    /// A session's book section, assembled for its handoff record.
+    book_buf: [u8; site_core::SITE_BOOK_SECTION_MAX],
+    site_exported: u32,
+    site_refused: u32,
     out_topic: i32,
     out_messaging: i32,
     out_forward: i32,
@@ -968,8 +1098,28 @@ pub unsafe extern "C" fn module_new(
         // Declared after ctrl_in / ctrl_out: in[10] / out[12].
         s.in_front = dev_channel_port(sys, 0, 10);
         s.out_front = dev_channel_port(sys, 1, 12);
+        s.out_site = dev_channel_port(sys, 1, 13);
+        // The second anchor seam, declared last: in[11] / in[12] and
+        // out[14] / out[15].
+        s.in_codec2 = dev_channel_port(sys, 0, 11);
+        s.out_codec2 = dev_channel_port(sys, 1, 14);
+        s.sub_book.lost = [0; site_core::SITE_BOOK_SLOTS / 64];
+        s.sub_book.lost_beyond = false;
+        s.site_exported = 0;
+        s.site_refused = 0;
         s.codec_turn = 0;
         s.codec_namespace_drops = 0;
+        s.proposals_unkeyed_refused = 0;
+        s.replay_floor_skipped = 0;
+        s.faulted = 0;
+        s.replay_cursor_refused = 0;
+        s.deliver_logged = 0;
+        s.deliver_unlogged = 0;
+        s.redelivered = 0;
+        s.ledger.refused = 0;
+        for f in s.floors.iter_mut() {
+            f.live = 0;
+        }
         s.out_topic = dev_channel_port(sys, 1, 2);
         s.out_messaging = dev_channel_port(sys, 1, 3);
         s.out_forward = dev_channel_port(sys, 1, 4);
@@ -1025,6 +1175,7 @@ pub unsafe extern "C" fn module_new(
         sessions::set_alloc_range(&mut s.sessions, s.slot_base, hi);
         for i in 0..MAX_SESSIONS {
             sessions::clear(&mut s.sessions, i);
+            s.sub_book.clear(i as u32);
             sessions::clear_flow(&mut s.sessions, i);
         }
         correlate::init(&mut s.correlate);
@@ -1032,6 +1183,8 @@ pub unsafe extern "C" fn module_new(
         // Declared last in the manifest: in[9] / out[11].
         s.worker.in_ctrl = dev_channel_port(sys, 0, 9);
         s.worker.out_ctrl = dev_channel_port(sys, 1, 11);
+        s.worker.in_ctrl2 = dev_channel_port(sys, 0, 12);
+        s.worker.out_ctrl2 = dev_channel_port(sys, 1, 15);
         store::init(&mut s.store);
         s.sub_inflight_dropped_on_resume = 0;
         s.conn_bindings_evicted = 0;
@@ -1089,7 +1242,7 @@ unsafe fn emit_codec_response(
     flags: u8,
     body: &[u8],
 ) -> bool {
-    let chan = codec_chan(s.out_codec, s.out_front, conn_id);
+    let chan = codec_chan(s, conn_id);
     if chan < 0 {
         return false;
     }
@@ -1098,6 +1251,50 @@ unsafe fn emit_codec_response(
     if worker::is_frozen(&s.worker, conn_id) {
         s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
         return true;
+    }
+    // A session attached as transport-migratable answers in productions:
+    // numbered and retained until the anchor's horizon covers them
+    // (docs/architecture/anchor_continuity.md). A full ring holds the
+    // response back, as a full channel does.
+    if s.worker.seats.seat_of(conn_id).is_some() {
+        let total = CODEC_ENV_HDR + body.len();
+        if total > BUF_SIZE {
+            return false;
+        }
+        let mut inner = [0u8; BUF_SIZE];
+        inner[0..2].copy_from_slice(&conn_id.to_le_bytes());
+        inner[2] = proto;
+        inner[3] = pkt_type;
+        inner[4] = flags;
+        inner[CODEC_ENV_HDR..total].copy_from_slice(body);
+        let poll = (sys.channel_poll)(chan, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+            return false;
+        }
+        let mut out = [0u8; BUF_SIZE + worker::anchor_core::PRODUCTION_INSERT];
+        return match worker::produce(&mut s.worker, conn_id, &inner[..total], &mut out) {
+            worker::anchor_core::Produced::Wrapped { id, len } => {
+                let w =
+                    wire::channel_write_msg(sys, chan, wire::MSG_ANCHOR_PRODUCTION, &out[..len]);
+                if w > 0 {
+                    worker::note_out(&mut s.worker, conn_id, wire::ENVELOPE_HDR + len);
+                    true
+                } else {
+                    // Refused after `writable` said yes: the id is taken
+                    // back and the response held, so the anchor never
+                    // sees a gap in the numbering.
+                    s.worker.seats.unproduce(conn_id, id);
+                    false
+                }
+            }
+            worker::anchor_core::Produced::Full => false,
+            worker::anchor_core::Produced::Unseated => false,
+            // Unreachable for a frame built above; dropped and counted.
+            worker::anchor_core::Produced::Malformed => {
+                s.worker.seats.full = s.worker.seats.full.wrapping_add(1);
+                true
+            }
+        };
     }
     let ok = emit_codec_response_raw(sys, chan, conn_id, proto, pkt_type, flags, body);
     if ok {
@@ -1111,17 +1308,18 @@ unsafe fn emit_codec_response(
 }
 
 /// The next codec input with an envelope waiting: the transport's
-/// `codec_in` and the front's `front_in`, offered first in turn.
+/// `codec_in`, the second anchor seam's `codec2_in` and the front's
+/// `front_in`, each offered first in turn.
 ///
 /// # Safety
 /// `sys` is the kernel's live syscall table.
 unsafe fn next_codec_input(s: &mut ModuleState, sys: &SyscallTable) -> Option<i32> {
-    let order = if s.codec_turn == 0 {
-        [s.in_codec, s.in_front]
-    } else {
-        [s.in_front, s.in_codec]
+    let order = match s.codec_turn {
+        0 => [s.in_codec, s.in_codec2, s.in_front],
+        1 => [s.in_codec2, s.in_front, s.in_codec],
+        _ => [s.in_front, s.in_codec, s.in_codec2],
     };
-    s.codec_turn ^= 1;
+    s.codec_turn = (s.codec_turn + 1) % 3;
     for chan in order {
         if chan < 0 {
             continue;
@@ -1135,11 +1333,27 @@ unsafe fn next_codec_input(s: &mut ModuleState, sys: &SyscallTable) -> Option<i3
 }
 
 /// The channel a response to `conn_id` leaves on: `front_out` for an
-/// in-graph front session, `codec_out` for a transport connection.
+/// in-graph front session, `codec2_out` for a transport connection
+/// attached through the second anchor seam, `codec_out` for any other.
 #[inline]
-fn codec_chan(out_codec: i32, out_front: i32, conn_id: u16) -> i32 {
+fn codec_chan(s: &ModuleState, conn_id: u16) -> i32 {
+    out_chan(
+        s.out_codec,
+        s.out_codec2,
+        s.out_front,
+        worker::seam(&s.worker, conn_id),
+        conn_id,
+    )
+}
+
+/// [`codec_chan`] over copied-out channels, for a caller that holds
+/// part of the module state.
+#[inline]
+fn out_chan(out_codec: i32, out_codec2: i32, out_front: i32, seam: u8, conn_id: u16) -> i32 {
     if wire::is_front_conn(conn_id) {
         out_front
+    } else if seam == 1 {
+        out_codec2
     } else {
         out_codec
     }
@@ -1175,6 +1389,375 @@ unsafe fn emit_codec_response_raw(
     out[CODEC_ENV_HDR..total].copy_from_slice(body);
     let w = wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]);
     w > 0
+}
+
+/// Offer the productions `conn`'s seat owes a replacement anchor again,
+/// under their original ids, oldest first, for as long as the channel
+/// takes them; the rest go on a later pass. The replacement's gate
+/// answers what its transport already holds without sending it twice and
+/// sends the rest.
+///
+/// # Safety
+/// `sys` is the kernel's live syscall table.
+pub(crate) unsafe fn reoffer_productions(s: &mut ModuleState, sys: &SyscallTable, conn: u16) {
+    let chan = codec_chan(s, conn);
+    if chan < 0 {
+        return;
+    }
+    let mut copy = [0u8; worker::anchor_core::RETAIN_BYTES_MAX];
+    let mut out =
+        [0u8; worker::anchor_core::RETAIN_BYTES_MAX + worker::anchor_core::PRODUCTION_INSERT];
+    while let Some((id, inner)) = s.worker.seats.next_reoffer(conn) {
+        let len = inner.len();
+        copy[..len].copy_from_slice(inner);
+        let n = s
+            .worker
+            .seats
+            .rewrap(conn, wire::MSG_SESSION_RESPONSE, id, &copy[..len], &mut out);
+        if n == 0 || wire::channel_write_msg(sys, chan, wire::MSG_ANCHOR_PRODUCTION, &out[..n]) <= 0
+        {
+            return;
+        }
+        worker::note_out(&mut s.worker, conn, wire::ENVELOPE_HDR + n);
+        s.worker.seats.reoffered(conn, id);
+    }
+}
+
+/// Per-step work for the seated sessions: re-offers a replacement anchor
+/// is still owed, then a PINGRESP a full ring held back, then how far the
+/// session has consumed.
+///
+/// # Safety
+/// `sys` is the kernel's live syscall table.
+pub(crate) unsafe fn seat_step(s: &mut ModuleState, sys: &SyscallTable) {
+    for i in 0..worker::anchor_core::SEAT_COUNT {
+        let seat = &s.worker.seats.seats[i];
+        if !seat.used {
+            continue;
+        }
+        let conn = seat.conn;
+        if seat.reoffer_next != 0 {
+            reoffer_productions(s, sys, conn);
+        }
+        if s.worker.seats.seats[i].pingresp_owed
+            && emit_codec_response(s, sys, conn, PROTO_MQTT, PKT_PINGRESP, 0, &[])
+        {
+            s.worker.seats.seats[i].pingresp_owed = false;
+        }
+        worker::report_consumed(&mut s.worker, sys, i);
+    }
+}
+
+/// The dark worker of the fault-injection gate: every input is read and
+/// discarded, nothing is emitted. Returns the step outcome.
+///
+/// # Safety
+/// `sys` must be the live kernel syscall table.
+unsafe fn fault_drain(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
+    #[cfg(feature = "kafka")]
+    let wal_reply = s.in_wal_reply;
+    #[cfg(not(feature = "kafka"))]
+    let wal_reply = -1;
+    let chans = [
+        s.in_codec,
+        s.in_codec2,
+        s.in_committed,
+        s.in_flow,
+        s.in_ack,
+        s.in_cp,
+        s.in_messaging,
+        s.in_deliver,
+        s.in_assigned,
+        wal_reply,
+        s.worker.in_ctrl,
+        s.worker.in_ctrl2,
+        s.in_front,
+    ];
+    let mut worked = 0u32;
+    for ch in chans {
+        if ch < 0 {
+            continue;
+        }
+        for _ in 0..64 {
+            let poll = (sys.channel_poll)(ch, 0x01);
+            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                break;
+            }
+            let _ = wire::channel_read_msg(sys, ch, &mut s.in_buf);
+            worked += 1;
+        }
+    }
+    if worked > 0 {
+        STEP_BURST
+    } else {
+        0
+    }
+}
+
+// ── Exact replay (session_replay_core) ──────────────────────────────────────
+
+/// The most recent entry for `slot` this worker skipped as another
+/// worker's, if any.
+fn replay_last_skip(s: &ModuleState, slot: usize) -> Option<(u16, u64)> {
+    if slot < MAX_SESSIONS && s.skip_index[slot] != 0 {
+        Some((s.skip_part[slot], s.skip_index[slot]))
+    } else {
+        None
+    }
+}
+
+/// Install a replay floor for an imported `slot`. `false` when every
+/// floor is in use.
+fn replay_install_floor(s: &mut ModuleState, slot: u32, tail: &replay::HandoffTail) -> bool {
+    let Some(f) = s.floors.iter_mut().find(|f| f.live == 0 || f.slot == slot) else {
+        return false;
+    };
+    f.slot = slot;
+    f.tail = *tail;
+    f.live = 1;
+    true
+}
+
+/// True when a free floor exists (or `slot` already has one).
+fn replay_floor_available(s: &ModuleState, slot: u32) -> bool {
+    s.floors.iter().any(|f| f.live == 0 || f.slot == slot)
+}
+
+/// The import of `slot` is committed: what this worker skipped for it
+/// while it was the other worker's no longer matters.
+fn replay_clear_skip(s: &mut ModuleState, slot: usize) {
+    if slot < MAX_SESSIONS {
+        s.skip_index[slot] = 0;
+        s.skip_part[slot] = 0;
+    }
+}
+
+/// True when the entry at `(partition, index)` for `slot` is already in
+/// the record the slot was imported with.
+fn replay_floor_filters(s: &ModuleState, slot: u32, partition: u16, index: u64) -> bool {
+    s.floors
+        .iter()
+        .any(|f| f.live != 0 && f.slot == slot && replay::below_floor(&f.tail, partition, index))
+}
+
+/// Release every floor this worker's apply cursor has passed.
+fn replay_release_floors(s: &mut ModuleState) {
+    let apply = s.apply_index;
+    for f in s.floors.iter_mut() {
+        if f.live != 0 && replay::floor_passed(&f.tail, &apply) {
+            f.live = 0;
+        }
+    }
+}
+
+/// The ledger's half of apply, run on EVERY worker whatever slot the
+/// entry names: it has no side effects, so a worker that may one day
+/// adopt the session holds what it is owed. `QOP_DELIVER` records an
+/// owed delivery, `QOP_DELIVER_ACK` releases or completes one, and a
+/// clean-start `QOP_CONNECT` forgets what the session was owed.
+fn replay_apply_ledger(s: &mut ModuleState, p: &wire::PeeledQProp, start: usize, end: usize) {
+    if end <= start || end > s.in_buf.len() {
+        return;
+    }
+    match p.op {
+        wire::QOP_DELIVER => {
+            if let Some(d) = replay::decode_deliver(&s.in_buf[start..end]) {
+                if !s.ledger.record(p.tenant, &d) {
+                    // What the session is owed is no longer whole here: a
+                    // site export of it would leave this delivery out.
+                    if let Some(si) = sessions::find_by_stream(&s.sessions, p.tenant, d.stream_hash)
+                    {
+                        s.sub_book.lose(si as u32);
+                    }
+                }
+            }
+        }
+        wire::QOP_DELIVER_ACK => {
+            if let Some(a) = replay::decode_deliver_ack(&s.in_buf[start..end]) {
+                s.ledger.ack(p.tenant, &a);
+            }
+        }
+        wire::QOP_CONNECT => {
+            // `[clean_start][keep_alive:2][stream_hash:8]...`
+            if end - start >= 11 && s.in_buf[start] != 0 {
+                let mut h = [0u8; 8];
+                h.copy_from_slice(&s.in_buf[start + 3..start + 11]);
+                s.ledger.drop_stream(p.tenant, u64::from_le_bytes(h));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Log a QoS 1/2 delivery just handed to the codec for session `si`
+/// under `packet_id` (`QOP_DELIVER`), keyed to the session's shard.
+/// A delivery that cannot be logged — past the ledger's body bound, or
+/// refused by the proposal edge — is counted: it is not reconstructible.
+///
+/// # Safety
+/// `sys` must be the live kernel syscall table.
+unsafe fn log_delivery(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    si: usize,
+    packet_id: u16,
+    qos: u8,
+    body: &[u8],
+) {
+    if s.log_deliveries == 0 {
+        return;
+    }
+    let mut buf =
+        [0u8; wire::QPROP_UNTAGGED_HDR_LEN + replay::DELIVER_FIXED + replay::DELIVER_BODY_MAX];
+    let tenant = sessions::tenant(&s.sessions, si);
+    wire::encode_qprop_header(
+        &mut buf[..wire::QPROP_HEADER_LEN],
+        wire::QOP_DELIVER,
+        tenant,
+        si as u32,
+    );
+    let n = replay::encode_deliver(
+        &mut buf[wire::QPROP_UNTAGGED_HDR_LEN..],
+        &replay::Deliver {
+            stream_hash: sessions::stream_hash(&s.sessions, si),
+            generation: sessions::generation(&s.sessions, si),
+            packet_id,
+            qos,
+            body,
+        },
+    );
+    let total = wire::QPROP_UNTAGGED_HDR_LEN + n;
+    let shard = sessions::shard(&s.sessions, si);
+    if n != 0 && try_emit_keyed(sys, s.out_proposals, &s.view, shard, &buf[..total]) {
+        s.deliver_logged = s.deliver_logged.wrapping_add(1);
+        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+    } else {
+        s.deliver_unlogged = s.deliver_unlogged.wrapping_add(1);
+    }
+}
+
+/// Log the progress of the delivery session `si` owes under
+/// `packet_id` (`QOP_DELIVER_ACK`): `replay::ACK_RELEASED` when a QoS 2
+/// subscriber's PUBREC moved it to PUBREL, `replay::ACK_COMPLETE` at the
+/// client's PUBACK or PUBCOMP.
+///
+/// # Safety
+/// `sys` must be the live kernel syscall table.
+unsafe fn log_deliver_ack(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    si: usize,
+    packet_id: u16,
+    stage: u8,
+) {
+    if s.log_deliveries == 0 {
+        return;
+    }
+    let mut buf = [0u8; wire::QPROP_UNTAGGED_HDR_LEN + replay::DELIVER_ACK_LEN];
+    wire::encode_qprop_header(
+        &mut buf[..wire::QPROP_HEADER_LEN],
+        wire::QOP_DELIVER_ACK,
+        sessions::tenant(&s.sessions, si),
+        si as u32,
+    );
+    replay::encode_deliver_ack(
+        &mut buf[wire::QPROP_UNTAGGED_HDR_LEN..],
+        &replay::DeliverAck {
+            stream_hash: sessions::stream_hash(&s.sessions, si),
+            generation: sessions::generation(&s.sessions, si),
+            packet_id,
+            stage,
+        },
+    );
+    let shard = sessions::shard(&s.sessions, si);
+    if try_emit_keyed(sys, s.out_proposals, &s.view, shard, &buf) {
+        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+    }
+}
+
+/// Resend, in the order first sent, everything the log says session `si`
+/// is still owed: on a resumed CONNECT, and when a worker adopts the
+/// session after its previous worker was lost (MQTT 3.1.1 §4.4, 5.0
+/// §4.4: unacknowledged PUBLISH and PUBREL packets are re-sent under
+/// their original packet ids).
+///
+/// A delivery the subscriber has not answered goes out again as a DUP
+/// PUBLISH. A QoS 2 delivery whose PUBREC arrived — the ledger says
+/// released, or the session's own in-flight entry is past PUBLISH — goes
+/// out as its PUBREL: the subscriber may already have handed the message
+/// on and forgotten the packet id, so a PUBLISH now would be a second
+/// copy. Each is registered in the session's outbound in-flight table
+/// under its packet id, so the client's PUBACK / PUBREC / PUBCOMP
+/// completes it as usual; an entry the session already held (a resume on
+/// the same worker, or one carried in a handoff record) is reused and not
+/// counted against the flow window again.
+///
+/// # Safety
+/// `sys` must be the live kernel syscall table.
+unsafe fn redeliver_owed(s: &mut ModuleState, sys: &SyscallTable, si: usize) -> u32 {
+    let tenant = sessions::tenant(&s.sessions, si);
+    let stream = sessions::stream_hash(&s.sessions, si);
+    let conn_id = sessions::conn_id(&s.sessions, si);
+    let mut owed = [0usize; MAX_INFLIGHT_PER_SESSION];
+    let n = s.ledger.owed(tenant, stream, &mut owed);
+    let mut sent = 0u32;
+    for &i in owed.iter().take(n) {
+        let e = s.ledger.entries[i];
+        sessions::reserve_sub_packet_id(&mut s.sessions, si, e.packet_id);
+        let (ii, added) = match sessions::inflight_find(&s.sessions, si, e.packet_id, INFLIGHT_SUB)
+        {
+            Some(ii) => (ii, false),
+            None => {
+                match sessions::inflight_add(&mut s.sessions, si, e.packet_id, e.qos, INFLIGHT_SUB)
+                {
+                    Some(ii) => (ii, true),
+                    None => continue,
+                }
+            }
+        };
+        let in_rel =
+            sessions::inflight_view(&s.sessions, si, ii).is_some_and(|v| v.phase == QOS2_PUBREL);
+        let ok = if e.qos == 2 && (e.released != 0 || in_rel) {
+            sessions::inflight_set_phase(&mut s.sessions, si, ii, QOS2_PUBREL);
+            let pubrel = e.packet_id.to_be_bytes();
+            emit_codec_response(s, sys, conn_id, PROTO_MQTT, PKT_PUBREL, 0x02, &pubrel)
+        } else {
+            let flags = (e.qos << 1) | 0x08; // DUP
+            emit_codec_response(s, sys, conn_id, PROTO_MQTT, PKT_PUBLISH, flags, e.body())
+        };
+        if ok {
+            if added {
+                sessions::note_delivery(&mut s.sessions, si);
+            }
+            sent += 1;
+        }
+    }
+    s.redelivered = s.redelivered.wrapping_add(sent);
+    sent
+}
+
+/// Emit a proposal that names NO routing key — the one path onto clustor
+/// `partition_router`'s body-hash placement — or refuse it when
+/// `keyed_only` (param 9, default on) says every proposal from this
+/// module must be keyed.
+///
+/// Refusal is counted (`proposals_unkeyed_refused`, `unkeyed=` on the
+/// `[sess] hb` line) and said once per 32 so the drop is never silent:
+/// a client whose op reaches here is sending something this module
+/// cannot place, and placing it by a hash of its bytes would scatter
+/// one session's ops over the partitions.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn try_emit_unkeyed(s: &mut ModuleState, sys: &SyscallTable, body: &[u8]) -> bool {
+    if s.keyed_only != 0 {
+        s.proposals_unkeyed_refused = s.proposals_unkeyed_refused.wrapping_add(1);
+        if s.proposals_unkeyed_refused & 0x1F == 1 {
+            dev_log(sys, 2, b"[sess] unkeyed proposal refused".as_ptr(), 31);
+        }
+        return false;
+    }
+    try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, body)
 }
 
 #[cfg(feature = "kafka")]
@@ -1692,12 +2275,12 @@ unsafe fn propose_group_member(
     s.out_buf[o..o + 2].copy_from_slice(&(al as u16).to_le_bytes());
     o += 2;
     s.out_buf[o..o + al].copy_from_slice(assign);
-    if try_emit(
-        sys,
-        s.out_proposals,
-        wire::MSG_CLIENT_PROPOSAL,
-        &s.out_buf[..total],
-    ) {
+    // Coordinator state rides the group's shard, like the offsets it
+    // commits (`handle_kafka_offset_commit`), so a group's records stay
+    // on one partition. Routed, not ownership-gated: the member joined
+    // HERE, and the record must land whatever this node's placement is.
+    let shard = wire::shard_kafka_group(TENANT_UNRESOLVED, &name[..nl]);
+    if emit_keyed_unowned(sys, s.out_proposals, &s.view, shard, &s.out_buf[..total]) {
         s.kafka_group_members_proposed = s.kafka_group_members_proposed.wrapping_add(1);
         s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
         s.hb_prop = s.hb_prop.wrapping_add(1);
@@ -1745,12 +2328,9 @@ unsafe fn reconcile_group_generations(s: &mut ModuleState, sys: &SyscallTable) {
         s.out_buf[ob..ob + 2].copy_from_slice(&(nl as u16).to_le_bytes());
         s.out_buf[ob + 2..ob + 2 + nl].copy_from_slice(&name[..nl]);
         s.out_buf[ob + 2 + nl..ob + 2 + nl + 4].copy_from_slice(&generation.to_le_bytes());
-        if try_emit(
-            sys,
-            s.out_proposals,
-            wire::MSG_CLIENT_PROPOSAL,
-            &s.out_buf[..total],
-        ) {
+        // Keyed to the group's shard, as every other group record is.
+        let shard = wire::shard_kafka_group(TENANT_UNRESOLVED, &name[..nl]);
+        if emit_keyed_unowned(sys, s.out_proposals, &s.view, shard, &s.out_buf[..total]) {
             // Record only on a successful write: a dropped proposal must
             // be retried, or the generation this coordinator issued is
             // never replicated and a successor could reissue it.
@@ -3386,7 +3966,7 @@ unsafe fn handle_kafka_offset_commit(
             q += 8;
             // Committed offsets belong to the group coordinator's
             // shard, so a group's offsets stay on one partition.
-            let shard = wire::shard_kafka_group(0, &group[..gl]);
+            let shard = wire::shard_kafka_group(TENANT_UNRESOLVED, &group[..gl]);
             let mut emitted_gated = false;
             if let Some((ki, slot)) = gate {
                 if gated_parts < u8::MAX {
@@ -4015,8 +4595,7 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
             // Build the MSG_TOPIC_PUBLISH envelope topic_engine expects:
             //   [tenant:u32 LE][qos:u8][_pad:u8][topic_len:u16 LE][topic]
             //   [user_props_count:u8][per prop ...][payload]
-            // tenant is hardcoded 0 for now (single-tenant first ship); when
-            // multi-tenancy lands the tenant will be stashed alongside.
+            // The tenant is `TENANT_UNRESOLVED` (below).
             let stash_env = correlate::stash_env(&s.correlate, stash_idx);
             let pub_qos = stash_env[0];
             let topic_len = u16::from_be_bytes([stash_env[16], stash_env[17]]) as usize;
@@ -4043,8 +4622,8 @@ unsafe fn finalise_stash(s: &mut ModuleState, sys: &SyscallTable, stash_idx: usi
             }
             // TENANCY GAP: the stash is keyed by correlation, not session,
             // so no per-session tenant is reachable here. See
-            // docs/architecture/multi_tenancy.md.
-            let tenant: TenantId = 0;
+            // `TENANT_UNRESOLVED`.
+            let tenant: TenantId = TENANT_UNRESOLVED;
             s.out_buf[0..4].copy_from_slice(&tenant.to_le_bytes());
             s.out_buf[4] = pub_qos;
             s.out_buf[5] = 0;
@@ -4321,6 +4900,16 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
         s.pid_entry_credits = s.pid_entry_credits.saturating_sub(1);
         s.pid_byte_credits = s.pid_byte_credits.saturating_sub(body_cost);
         if sub_qos > 0 {
+            // What the subscriber is now owed goes into the log, so it
+            // survives the worker that sent it.
+            log_delivery(
+                s,
+                sys,
+                session_slot,
+                sub_packet_id,
+                sub_qos,
+                &body[..body_len],
+            );
             sessions::note_delivery(&mut s.sessions, session_slot);
             let mut lag_msg = [0u8; 8];
             lag_msg[0..4].copy_from_slice(&(session_slot as u32).to_le_bytes());
@@ -4381,6 +4970,7 @@ unsafe fn apply_reset(
     // semantic.
     for i in 0..MAX_SESSIONS {
         sessions::clear(&mut s.sessions, i);
+        s.sub_book.clear(i as u32);
         sessions::clear_flow(&mut s.sessions, i);
     }
     s.session_count = 0;
@@ -4732,6 +5322,7 @@ unsafe fn apply_qop_connect(
     if clean_start && prior.is_some() {
         let drop_body = (i as u32).to_le_bytes();
         try_emit(sys, s.out_topic, wire::MSG_SESSION_DROP, &drop_body);
+        s.sub_book.clear(i as u32);
         // Only wipe local operational state when taking over a genuinely
         // pre-existing session. When `prior` is this same CONNECT's
         // propose-side transient slot (the leader path — propose-side
@@ -4766,6 +5357,11 @@ unsafe fn apply_qop_connect(
         sessions::ConnectParams {
             tenant,
             stream_hash,
+            shard: session_shard(
+                tenant,
+                &s.in_buf[body_start + 13..body_start + 13 + cid_len],
+                stream_hash,
+            ),
             protocol,
             clean_start,
             keep_alive_ms: keep_alive_s.saturating_mul(1000),
@@ -4880,10 +5476,9 @@ unsafe fn fire_will(s: &mut ModuleState, sys: &SyscallTable, tenant: TenantId, i
     // path so topic_engine fan-out is identical):
     //   [tenant:u32 LE][pub_qos:u8][_pad:u8][topic_len:u16 LE]
     //   [topic][user_props_count:u8][payload]
-    // Will-fired publishes carry no user properties (the Will section
-    // in CONNECT has its own properties block but they aren't stored
-    // on the Session for now), so the user_props block is a single
-    // zero byte.
+    // Will-fired publishes carry no user properties (the Will
+    // properties in CONNECT are not stored on the Session), so the
+    // user_props block is a single zero byte.
     let dlv_total = 4 + 1 + 1 + 2 + topic_len + 1 + payload_len;
     if dlv_total <= s.out_buf.len() {
         s.out_buf[0..4].copy_from_slice(&tenant.to_le_bytes());
@@ -5054,6 +5649,7 @@ unsafe fn apply_qop_disconnect(
         sessions::close(&mut s.sessions, i, false, now);
         let drop_body = (i as u32).to_le_bytes();
         try_emit(sys, s.out_topic, wire::MSG_SESSION_DROP, &drop_body);
+        s.sub_book.clear(i as u32);
     } else {
         // Persistent session: park the slot for matching reconnect.
         // Stamp `disconnected_at_ms` so the expiry sweep can purge
@@ -5139,6 +5735,11 @@ unsafe fn apply_qop_subscribe(
         Some(i) => i as u32,
         None => SESSION_SLOT_REMOTE,
     };
+    if let Some(i) = local_session {
+        // The worker's own book of the subscription, for a site export.
+        let filter = core::slice::from_raw_parts(s.in_buf.as_ptr().add(topic_off), topic_len);
+        s.sub_book.subscribe(i as u32, req_qos, filter);
+    }
 
     // MSG_TOPIC_SUBSCRIBE body:
     //   [tenant:u32 LE][session_slot:u32 LE][req_qos:u8][worker:u8]
@@ -5242,8 +5843,12 @@ unsafe fn apply_qop_unsubscribe(
         return;
     };
     let session_slot = i as u32;
+    {
+        let filter = core::slice::from_raw_parts(s.in_buf.as_ptr().add(topic_off), topic_len);
+        s.sub_book.unsubscribe(session_slot, filter);
+    }
 
-    // MSG_TOPIC_UNSUBSCRIBE body (matches the legacy shape):
+    // MSG_TOPIC_UNSUBSCRIBE body:
     //   [tenant:u32 LE][session_slot:u32 LE][topic_len:u16 LE][topic]
     let unsub_len = 4 + 4 + 2 + topic_len;
     if unsub_len <= s.out_buf.len() {
@@ -5720,6 +6325,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         let sys = &*s.syscalls;
         let mut worked = 0u32;
         let now = dev_millis(sys);
+        if s.faulted != 0 {
+            return fault_drain(s, sys);
+        }
 
         // ── Phase 1: drain flow signals (wire envelope) ──────────
         // flow_in is shared by admission (MSG_THROTTLE_CREDITS),
@@ -5805,7 +6413,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // envelope length prefix is what lets the consumer demarcate each
         // message when several writers fan in or one writer bursts multiple
         // packets within a tick.
-        if s.in_codec >= 0 || s.in_front >= 0 {
+        if s.in_codec >= 0 || s.in_codec2 >= 0 || s.in_front >= 0 {
             // 32 packets/tick: at the apply domain's 250 µs tick this admits
             // ~128k requests/s before the codec_in drain — not the session
             // engine — becomes the pipeline's rate limiter. A smaller quota
@@ -5853,7 +6461,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     break;
                 };
 
-                let (mt, plen) = {
+                let (mut mt, mut plen) = {
                     worked += 1;
                     s.hb_codec = s.hb_codec.wrapping_add(1);
                     wire::channel_read_msg(sys, chan, &mut s.in_buf)
@@ -5878,7 +6486,30 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
                         continue;
                     }
-                    worker::note_in(&mut s.worker, c, wire::ENVELOPE_HDR + plen as usize);
+                    let bytes = wire::ENVELOPE_HDR + plen as usize;
+                    if mt == wire::MSG_ANCHOR_DELIVERY {
+                        // Counted only at the binding's epoch: the anchor
+                        // that wrote it counted it under that epoch, and
+                        // one a session has left counts for nobody.
+                        worker::note_in_delivery(&mut s.worker, &s.in_buf[..plen as usize], bytes);
+                    } else {
+                        worker::note_in(&mut s.worker, c, bytes);
+                    }
+                }
+                // An anchored frame names the session, the epoch it was
+                // decided under and its delivery id: admit it against the
+                // binding (old epochs and retried ids are refused, counted)
+                // and consume the frame inside as if it had come bare.
+                // The cursor above counts the envelope as written, which
+                // is the unit the anchor counts too.
+                if mt == wire::MSG_ANCHOR_DELIVERY {
+                    match worker::admit(&mut s.worker, &mut s.in_buf, plen as usize) {
+                        Some((inner, n)) => {
+                            mt = inner;
+                            plen = n as u16;
+                        }
+                        None => continue,
+                    }
                 }
 
                 // Transport connection-closed notice (payload `[conn_id:u16 LE]`,
@@ -5889,7 +6520,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // sessions keep their apply-side keep-alive / will-fire
                 // lifecycle.
                 if mt == wire::MSG_CONN_CLOSED && plen >= 2 {
-                    handle_conn_disconnect(s, env_conn_id(&s.in_buf));
+                    // From an anchor it ends the binding as well, in order
+                    // behind the client's last frames (`worker::client_gone`).
+                    let c = env_conn_id(&s.in_buf);
+                    if !worker::client_gone(s, sys, c) {
+                        handle_conn_disconnect(s, c);
+                    }
                     continue;
                 }
                 if (plen as usize) < CODEC_ENV_HDR {
@@ -5909,11 +6545,46 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // at the tail of module_step uses last_activity_ms to
                 // detect dropped sockets that peer_router cleared without
                 // notifying us.
+                //
+                // That includes `MSG_SESSION_LIVENESS`: the codec answers
+                // PINGREQ itself and forwards only this mark, so without
+                // it a client that does nothing but ping — an idle
+                // subscriber — would read as silent here and be torn down
+                // at 1.5x its keep-alive while alive and pinging.
                 if let Some(si) = sessions::find_by_conn(&s.sessions, conn_id) {
                     sessions::touch(&mut s.sessions, si, now);
                 }
 
                 match mt {
+                    // Activity only: the touch above is all it carries —
+                    // unless the worker-loss gate's fault fires on it.
+                    wire::MSG_SESSION_LIVENESS => {
+                        if s.fault_stop_on_ping != 0 {
+                            s.faulted = 1;
+                            dev_log(sys, 1, b"[sess] fault injection: worker dark".as_ptr(), 35);
+                            break;
+                        }
+                        // A seated session's anchor forwards the PINGREQ
+                        // instead of answering it: the PINGRESP is a
+                        // production, placed in the connection's output
+                        // like every other response.
+                        if let Some(i) = s.worker.seats.seat_of(conn_id) {
+                            if !emit_codec_response(
+                                s,
+                                sys,
+                                conn_id,
+                                PROTO_MQTT,
+                                PKT_PINGRESP,
+                                0,
+                                &[],
+                            ) {
+                                // Owed, and answered by `seat_step`.
+                                s.worker.seats.seats[i].pingresp_owed = true;
+                                s.worker.pingresp_refused =
+                                    s.worker.pingresp_refused.wrapping_add(1);
+                            }
+                        }
+                    }
                     wire::MSG_SESSION_CONNECT => {
                         s.connects = s.connects.wrapping_add(1);
                         // MQTT CONNECT envelope from `protocol::mqtt`:
@@ -5959,9 +6630,22 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             0
                         };
                         // TENANCY GAP: CONNECT arrival — no session exists
-                        // yet, so the tenant would have to come from the
-                        // control plane. See docs/architecture/multi_tenancy.md.
-                        let tenant: TenantId = 0;
+                        // yet, and the codec envelope carries no listener
+                        // or authenticated identity for the tenant to come
+                        // from. See `TENANT_UNRESOLVED`.
+                        let tenant: TenantId = TENANT_UNRESOLVED;
+                        // The session's placement, by `(tenant, client_id)`.
+                        // The same derivation runs where the CONNECT is
+                        // applied, so every node keys the session alike.
+                        let session_shard = session_shard(
+                            tenant,
+                            if cid_present {
+                                &body[12..12 + cid_len]
+                            } else {
+                                &[]
+                            },
+                            stream_hash,
+                        );
 
                         // Placement, BEFORE the optimistic CONNACK.
                         //
@@ -5987,8 +6671,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // its session instead of being pinned to
                         // whichever node it happened to reach first.
                         if proto == PROTO_MQTT {
-                            let shard = wire::shard_mqtt_stream(tenant, stream_hash);
-                            let action = edge::classify(&s.view.view, s.view.owner_prg(shard), 0);
+                            let action =
+                                edge::classify(&s.view.view, s.view.owner_prg(session_shard), 0);
                             if action != edge::EdgeAction::Local {
                                 // Version-agnostic: the codec spells it.
                                 // A fence or a stale view is transient
@@ -6069,6 +6753,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 sessions::ConnectParams {
                                     tenant,
                                     stream_hash,
+                                    shard: session_shard,
                                     protocol: proto,
                                     clean_start,
                                     keep_alive_ms: keep_alive_s.saturating_mul(1000),
@@ -6118,6 +6803,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 0,
                                 &connack_body,
                             );
+                            // A resumed session is owed what the log says it
+                            // was sent and never acknowledged — including
+                            // deliveries a crashed worker or a restarted node
+                            // no longer holds in memory.
+                            if resurrecting_persisted {
+                                if let Some(i) = session_idx {
+                                    redeliver_owed(s, sys, i);
+                                }
+                            }
                         }
 
                         // Locate the Will section in the codec envelope. After
@@ -6301,10 +6995,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.out_buf[wpos + 4..wpos + 6]
                                 .copy_from_slice(&receive_maximum_s.to_le_bytes());
                             // Session state is owned by the session
-                            // shard. `stream_hash` is the session
-                            // identity the module indexes on, so every
-                            // op for one session shares this shard.
-                            let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                            // shard — the one the placement gate above
+                            // admitted this CONNECT on.
+                            let shard = session_shard;
                             if try_emit_keyed(
                                 sys,
                                 s.out_proposals,
@@ -6356,7 +7049,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 s.out_buf[off] = wire::QDISC_REASON_CLEAN;
                                 s.out_buf[off + 1..off + 9]
                                     .copy_from_slice(&stream_hash.to_le_bytes());
-                                let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                let shard = sessions::shard(&s.sessions, i);
                                 if try_emit_keyed(
                                     sys,
                                     s.out_proposals,
@@ -6840,7 +7533,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     // session state, so it rides the session
                                     // shard. The topic-side fan-out travels
                                     // separately as MSG_TOPIC_SUBSCRIBE.
-                                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                    let shard = session_idx
+                                        .map(|i| sessions::shard(&s.sessions, i))
+                                        .unwrap_or_else(|| {
+                                            wire::shard_mqtt_stream(tenant, stream_hash)
+                                        });
                                     if try_emit_keyed(
                                         sys,
                                         s.out_proposals,
@@ -6906,7 +7603,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     // session state, so it rides the session
                                     // shard. The topic-side fan-out travels
                                     // separately as MSG_TOPIC_SUBSCRIBE.
-                                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                    let shard = session_idx
+                                        .map(|i| sessions::shard(&s.sessions, i))
+                                        .unwrap_or_else(|| {
+                                            wire::shard_mqtt_stream(tenant, stream_hash)
+                                        });
                                     if try_emit_keyed(
                                         sys,
                                         s.out_proposals,
@@ -6954,6 +7655,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                                 si,
                                                 ii,
                                                 QOS2_PUBREL,
+                                            );
+                                            log_deliver_ack(
+                                                s,
+                                                sys,
+                                                si,
+                                                packet_id,
+                                                replay::ACK_RELEASED,
                                             );
                                             s.qos2_rec = s.qos2_rec.wrapping_add(1);
                                             let mut pubrel = [0u8; 2];
@@ -7098,7 +7806,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     });
                                     s.out_buf[off + 10..off + 14]
                                         .copy_from_slice(&flow_epoch.to_le_bytes());
-                                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                    let shard = sessions::shard(&s.sessions, session_slot as usize);
                                     if try_emit_keyed(
                                         sys,
                                         s.out_proposals_tagged,
@@ -7150,6 +7858,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         INFLIGHT_SUB,
                                     ) {
                                         sessions::inflight_release(&mut s.sessions, si, ii);
+                                        log_deliver_ack(
+                                            s,
+                                            sys,
+                                            si,
+                                            packet_id,
+                                            replay::ACK_COMPLETE,
+                                        );
                                         if sessions::sub_outstanding(&s.sessions, si) > 0 {
                                             sessions::note_ack(&mut s.sessions, si);
                                             let mut lag_msg = [0u8; 8];
@@ -7185,6 +7900,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         INFLIGHT_SUB,
                                     ) {
                                         sessions::inflight_release(&mut s.sessions, si, ii);
+                                        log_deliver_ack(
+                                            s,
+                                            sys,
+                                            si,
+                                            packet_id,
+                                            replay::ACK_COMPLETE,
+                                        );
                                         s.acks_emitted = s.acks_emitted.wrapping_add(1);
                                         if sessions::sub_outstanding(&s.sessions, si) > 0 {
                                             sessions::note_ack(&mut s.sessions, si);
@@ -7207,14 +7929,17 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             }
 
                             _ => {
-                                // Opaque passthrough: the body is an
-                                // unrecognised op with no routing key we
-                                // can name, so it takes the router's
-                                // legacy body-hash path and is counted
-                                // there (`proposals_legacy_hashed`).
-                                try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, body);
-                                s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
-                                s.hb_prop = s.hb_prop.wrapping_add(1);
+                                // An MQTT packet type this module has no
+                                // handler for (AUTH, or a type the codec
+                                // let through): the body is not a Quantum
+                                // op and names no routing key. Under
+                                // `keyed_only` it is refused and counted;
+                                // with the gate off it takes the router's
+                                // body-hash placement.
+                                if try_emit_unkeyed(s, sys, body) {
+                                    s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                                    s.hb_prop = s.hb_prop.wrapping_add(1);
+                                }
                             }
                         }
                     }
@@ -7263,13 +7988,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
 
                     wire::MSG_SESSION_PROPOSAL => {
-                        // Unknown protocol — forward to raft (legacy path).
-                        // No routing key is derivable from an unknown
-                        // protocol's body, so this keeps the router's
-                        // body-hash placement and is counted there.
-                        try_emit(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, body);
-                        s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
-                        s.hb_prop = s.hb_prop.wrapping_add(1);
+                        // Unknown protocol. No routing key is derivable
+                        // from a body this module cannot parse, so under
+                        // `keyed_only` it is refused and counted; with the
+                        // gate off it takes the router's body-hash
+                        // placement.
+                        if try_emit_unkeyed(s, sys, body) {
+                            s.proposals_emitted = s.proposals_emitted.wrapping_add(1);
+                            s.hb_prop = s.hb_prop.wrapping_add(1);
+                        }
                     }
 
                     _ => {}
@@ -7389,6 +8116,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if entry_end > wire::COMMITTED_ENTRY_HDR {
                         let peeled =
                             wire::peel_qprop(&s.in_buf[wire::COMMITTED_ENTRY_HDR..entry_end]);
+                        if peeled.is_none() {
+                            // An operator swap record (`QASW`): forwarded
+                            // to the anchor, sequenced by its log position.
+                            // It still reaches the control plane below.
+                            let mut rec = [0u8; wire::QA_SWAP_RECORD_LEN];
+                            let n = (entry_end - wire::COMMITTED_ENTRY_HDR).min(rec.len());
+                            rec[..n].copy_from_slice(
+                                &s.in_buf[wire::COMMITTED_ENTRY_HDR..wire::COMMITTED_ENTRY_HDR + n],
+                            );
+                            worker::forward_swap_record(
+                                &mut s.worker,
+                                sys,
+                                &rec[..n],
+                                entry_partition,
+                                entry_index,
+                            );
+                        }
                         if peeled.is_none() && s.out_cp >= 0 {
                             // Not a Quantum operation: an epoch or
                             // migration record, an admin or config
@@ -7411,7 +8155,37 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 dev_log(sys, 2, b"[sess] cp forward refused".as_ptr(), 25);
                             }
                         }
-                        if let Some(p) = peeled.filter(|p| entry_is_mine(s, p.session_slot)) {
+                        // The ledger applies on every worker; everything else
+                        // only on the worker that holds the slot, and not if
+                        // the slot's import record already contains it.
+                        let mine = match peeled {
+                            Some(p) => {
+                                let body_start = wire::COMMITTED_ENTRY_HDR + p.op_body_offset;
+                                replay_apply_ledger(s, &p, body_start, entry_end);
+                                if matches!(p.op, wire::QOP_DELIVER | wire::QOP_DELIVER_ACK) {
+                                    None
+                                } else if !entry_is_mine(s, p.session_slot) {
+                                    let slot = p.session_slot as usize;
+                                    if slot < MAX_SESSIONS {
+                                        s.skip_part[slot] = entry_partition;
+                                        s.skip_index[slot] = entry_index;
+                                    }
+                                    None
+                                } else if replay_floor_filters(
+                                    s,
+                                    p.session_slot,
+                                    entry_partition,
+                                    entry_index,
+                                ) {
+                                    s.replay_floor_skipped = s.replay_floor_skipped.wrapping_add(1);
+                                    None
+                                } else {
+                                    Some(p)
+                                }
+                            }
+                            None => None,
+                        };
+                        if let Some(p) = mine {
                             let body_start = wire::COMMITTED_ENTRY_HDR + p.op_body_offset;
                             // The index of the entry being applied RIGHT
                             // NOW. `apply_index` is the last COMPLETED
@@ -7425,6 +8199,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     s.apply_index[cur] = entry_index;
+                    replay_release_floors(s);
                 } else if plen > 0 {
                     s.applied = s.applied.wrapping_add(1);
                 }
@@ -7866,7 +8641,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                         });
                                 s.out_buf[off + 10..off + 14]
                                     .copy_from_slice(&flow_epoch.to_le_bytes());
-                                let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                                let shard = sessions::shard(&s.sessions, session_slot);
                                 if try_emit_keyed(
                                     sys,
                                     s.out_proposals_tagged,
@@ -7895,8 +8670,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             continue;
                         }
                         // TENANCY GAP: keyed by correlation, not session.
-                        // See docs/architecture/multi_tenancy.md.
-                        let tenant: TenantId = 0;
+                        // See `TENANT_UNRESOLVED`.
+                        let tenant: TenantId = TENANT_UNRESOLVED;
                         let prop_total = wire::QPROP_TAGGED_HDR_LEN + env_len;
                         if prop_total > s.out_buf.len() {
                             continue;
@@ -8268,7 +9043,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // `s.sessions` is mutably borrowed for the sweep.
                         let out_messaging = s.out_messaging;
                         let out_codec = s.out_codec;
+                        let out_codec2 = s.out_codec2;
                         let out_front = s.out_front;
+                        let w = &s.worker;
                         let released = sessions::release_foreign(
                             &mut s.sessions,
                             |sh| view.is_local(sh),
@@ -8289,7 +9066,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 if let Some(conn_id) = conn {
                                     emit_codec_response_raw(
                                         sys,
-                                        codec_chan(out_codec, out_front, conn_id),
+                                        out_chan(
+                                            out_codec,
+                                            out_codec2,
+                                            out_front,
+                                            worker::seam(w, conn_id),
+                                            conn_id,
+                                        ),
                                         conn_id,
                                         PROTO_MQTT,
                                         PKT_DISCONNECT,
@@ -8484,7 +9267,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         if now.wrapping_sub(s.last_hb_ms) >= 1000 {
             s.last_hb_ms = now;
             // Every label below with ten digits after it.
-            let mut line = [0u8; 544];
+            let mut line = [0u8; 832];
             let mut pos = 0usize;
             for (label, v) in [
                 (&b"[sess] hb codec="[..], s.hb_codec),
@@ -8516,6 +9299,21 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" href="[..], s.worker.refused),
                 (&b" hfull="[..], s.worker.busy_overflow),
                 (&b" nsdrop="[..], s.codec_namespace_drops),
+                (&b" unkeyed="[..], s.proposals_unkeyed_refused),
+                (&b" dstale="[..], s.worker.delivery_stale),
+                (&b" ddup="[..], s.worker.delivery_dup),
+                (&b" dunk="[..], s.worker.delivery_unknown),
+                (&b" swfwd="[..], s.worker.swaps_forwarded),
+                (&b" dlog="[..], s.deliver_logged),
+                (&b" dunlog="[..], s.deliver_unlogged),
+                (&b" ledger="[..], s.ledger.live() as u32),
+                (&b" redlv="[..], s.redelivered),
+                (&b" floorskip="[..], s.replay_floor_skipped),
+                (&b" curref="[..], s.replay_cursor_refused),
+                (&b" cksent="[..], s.worker.ckpt_sent),
+                (&b" ckkept="[..], s.worker.ckpt_kept),
+                (&b" adopted="[..], s.worker.adopted),
+                (&b" adoptref="[..], s.worker.adopt_refused),
             ] {
                 for &b in label {
                     line[pos] = b;
@@ -8524,6 +9322,36 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 pos += fmt_u32_raw(line.as_mut_ptr().add(pos), v);
             }
             dev_log(sys, 3, line.as_ptr(), pos);
+            // Anchor continuity and site export, once any of it ran:
+            // seats refused, productions held on a full ring, numbered
+            // without bytes, released; horizon reports ignored; re-anchors
+            // answered and refused; PINGRESPs held; site records out and
+            // refused; consumption reports to the anchor.
+            let seats = &s.worker.seats;
+            let cont = [
+                (&b"[sess] cont seatref="[..], seats.refused),
+                (&b" full="[..], seats.full),
+                (&b" unret="[..], seats.unretained),
+                (&b" rel="[..], seats.released),
+                (&b" hzstale="[..], seats.stale_reports),
+                (&b" reanch="[..], seats.reanchors),
+                (&b" reref="[..], seats.reanchor_refused),
+                (&b" pongheld="[..], s.worker.pingresp_refused),
+                (&b" siteout="[..], s.site_exported),
+                (&b" siteref="[..], s.site_refused),
+                (&b" consumed="[..], s.worker.consumed_reports),
+            ];
+            if cont.iter().any(|&(_, v)| v != 0) {
+                let mut pos = 0usize;
+                for (label, v) in cont {
+                    for &b in label {
+                        line[pos] = b;
+                        pos += 1;
+                    }
+                    pos += fmt_u32_raw(line.as_mut_ptr().add(pos), v);
+                }
+                dev_log(sys, 3, line.as_ptr(), pos);
+            }
             s.hb_codec = 0;
             s.hb_pub = 0;
             s.hb_prop = 0;
@@ -8616,7 +9444,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     let off = wire::QPROP_UNTAGGED_HDR_LEN;
                     s.out_buf[off] = wire::QDISC_REASON_KEEPALIVE;
                     s.out_buf[off + 1..off + 9].copy_from_slice(&stream_hash.to_le_bytes());
-                    let shard = wire::shard_mqtt_stream(tenant, stream_hash);
+                    let shard = sessions::shard(&s.sessions, i);
                     if try_emit_keyed(
                         sys,
                         s.out_proposals,
@@ -8674,6 +9502,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let drop_body = (i as u32).to_le_bytes();
                 try_emit(sys, s.out_topic, wire::MSG_SESSION_DROP, &drop_body);
                 sessions::clear(&mut s.sessions, i);
+                s.sub_book.clear(i as u32);
             }
 
             // ── Phase 5e: deferred Will-message fire sweep.

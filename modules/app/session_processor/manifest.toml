@@ -47,7 +47,7 @@ features = ["mqtt", "amqp"]
 # The index is the ABI — a graph binds a port by position — so a port is
 # only ever appended, never inserted or reordered.
 #
-# Inputs (11):
+# Inputs (13):
 #   [0] codec_in         — MQTT/Kafka/AMQP proposals (demux by PROTO_* byte)
 #   [1] committed_in     — applied entries from consensus
 #   [2] flow_in          — PID credits + backpressure + prefetch (demux by msg_type)
@@ -59,8 +59,10 @@ features = ["mqtt", "amqp"]
 #   [8] wal_reply        — WAL records answering a cold Kafka Fetch
 #   [9] ctrl_in          — SessionCtrlV1 commands from the anchor
 #   [10] front_in        — session envelopes from the in-graph front
+#   [11] codec2_in       — session envelopes from the second anchor
+#   [12] ctrl2_in        — SessionCtrlV1 commands from the second anchor
 #
-# Outputs (13):
+# Outputs (16, the limit):
 #   [0] proposals         — untagged proposals to consensus (CONNECT/DISCONNECT/etc)
 #   [1] codec_out         — responses to codecs (tag by PROTO_*)
 #   [2] topic_out         — publish + subscribe + unsubscribe to topic_engine
@@ -74,6 +76,9 @@ features = ["mqtt", "amqp"]
 #   [10] cp_out           — committed entries belonging to the control plane
 #   [11] ctrl_out         — SessionCtrlV1 replies + export frames to the anchor
 #   [12] front_out        — responses to the in-graph front's sessions
+#   [13] site_out         — QSS1 site records for the cross-site carrier
+#   [14] codec2_out       — responses to the second anchor's sessions
+#   [15] ctrl2_out        — SessionCtrlV1 replies + export frames to the second anchor
 
 [[ports]]
 name = "codec_in"
@@ -263,3 +268,44 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 32768
 max_record = 8195
+
+# A session exported for a surviving site (`MSG_SITE_RECORD`, a `QSS1`
+# record or `[session_id][status]`), answering `MSG_SITE_EXPORT` on
+# `ctrl_in` (docs/architecture/anchor_continuity.md). Optional; unwired,
+# the request is ignored.
+[[ports]]
+name = "site_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 65536
+max_record = 49152
+
+# The second anchor seam: a worker behind two anchors (a paired ingress
+# host's, docs/architecture/anchor_continuity.md) takes the other one's
+# session envelopes and SessionCtrlV1 sideband here, and serves each
+# session on the seam its attachment, resume, adoption or re-anchor came
+# from. Unwired, the module serves one anchor. Declared last: the port
+# index is the ABI (in[11], in[12], out[14], out[15]).
+[[ports]]
+name = "codec2_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ctrl2_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "codec2_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ctrl2_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027

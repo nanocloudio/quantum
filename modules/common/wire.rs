@@ -3,8 +3,10 @@
 //! Reuses Clustor's 3-byte envelope format:
 //!   [msg_type: u8] [len: u16 LE] [payload: len bytes]
 //!
-//! Quantum-specific message types occupy the 0x90-0xEF range, leaving
+//! Quantum-specific message types occupy the 0x90-0xF0 range, leaving
 //! 0x00-0x8F for Clustor substrate types (shared with clustor/modules/common/wire.rs).
+//! The `MSG_CLIENT_*` connection types in that range are Clustor
+//! `peer_router`'s, mirrored here.
 
 #![allow(
     dead_code,
@@ -341,6 +343,136 @@ pub const MSG_BP_SIGNAL: u8 = 0xC3;
 pub const MSG_PREFETCH_CREDIT: u8 = 0xC4;
 pub const MSG_DELIVERY_LAG: u8 = 0xC5;
 
+// ── MQTT anchor seam (docs/architecture/mqtt_anchor.md) ─────────────────────
+//
+// Quantum's own records on the anchor <-> worker seam, beside the
+// SessionCtrlV1 sideband. None is in the SessionCtrlV1 opcode range
+// (0x70..0x9F), so the control channel carries both without ambiguity.
+// The byte layouts and their codecs are `cores/mqtt_anchor_core.rs`'s,
+// which the host test bed exercises; these are the type ids.
+
+/// Data plane, anchor -> worker: a framed request carrying the identity
+/// it was decided under. Payload:
+/// `[conn_id:u16 LE][session_id:16][session_epoch:u32 LE]
+///  [delivery_id:u64 LE][inner_msg_type:u8][inner payload after conn_id]`.
+/// The worker rejects an epoch other than the one it is bound at and a
+/// delivery id at or below the session's consumed high-water, then
+/// consumes the inner envelope as if it had arrived bare. An anchor with
+/// no worker attached (the plain seam) sends bare envelopes.
+pub const MSG_ANCHOR_DELIVERY: u8 = 0xC6;
+
+/// Bytes `MSG_ANCHOR_DELIVERY` adds to the envelope it wraps.
+pub const ANCHOR_DELIVERY_INSERT: usize = 16 + 4 + 8 + 1;
+
+/// Data plane, anchor -> worker: the client sent a PINGREQ the anchor
+/// answered. Payload `[conn_id:u16 LE][proto][pkt_type=12][flags=0]`.
+/// Carries no work; it is what lets the worker's keep-alive sweep see a
+/// client that only pings as alive.
+pub const MSG_SESSION_LIVENESS: u8 = 0xC7;
+
+/// Control, operator or worker -> anchor: start a handoff. Payload
+/// `[anchor_id:8][mode:u8][seq:u64 LE]` (`SWAP_*` in the core). Accepted
+/// on `ctrl_in` / `ctrl2_in` (a worker forwarding a committed
+/// [`QA_SWAP_RECORD_MAGIC`] record) and on `cmd_in` (a control plane
+/// wired directly).
+pub const MSG_ANCHOR_SWAP: u8 = 0xC8;
+
+/// A committed control record asking anchors to swap:
+/// `["QASW":4][anchor_id:8][mode:u8]`. Proposed through the log (an
+/// operator `POST /propose`), so the command is ordered and durable;
+/// every worker that applies it forwards it to its anchor as
+/// [`MSG_ANCHOR_SWAP`] with `seq = (partition << 48) | raft index`, which
+/// is what lets the anchor execute it once.
+pub const QA_SWAP_RECORD_MAGIC: [u8; 4] = *b"QASW";
+/// Bytes of a swap record.
+pub const QA_SWAP_RECORD_LEN: usize = 4 + 8 + 1;
+
+/// Control, anchor <-> worker: a liveness probe and its answer, payload
+/// `[seq:u32 LE]` echoed. A worker that answers no probe for the
+/// anchor's `worker_loss_ms` is declared lost.
+pub const MSG_ANCHOR_PROBE: u8 = 0xC9;
+pub const MSG_ANCHOR_PROBE_ACK: u8 = 0xCA;
+
+/// Control, live worker -> anchor -> standby: a CHECKPOINT of a session
+/// the live worker serves, in the same three frames and layouts as
+/// `CMD_SC_EXPORT_BEGIN` / `_CHUNK` / `_END` (the record is QSR2). The
+/// anchor relays it; the standby keeps it as a non-live shadow and does
+/// not import it. Unlike an export, the session is not drained, so the
+/// anchor does not compare cursors: what a checkpoint is checked by is
+/// its delivery high-water, and replay starts after it.
+pub const MSG_ANCHOR_CKPT_BEGIN: u8 = 0xCB;
+pub const MSG_ANCHOR_CKPT_CHUNK: u8 = 0xCC;
+pub const MSG_ANCHOR_CKPT_END: u8 = 0xCD;
+
+/// Control, standby -> anchor: a checkpoint was kept. Payload
+/// `[session_id:16][epoch:u32 LE][status:u8][delivery_hw:u64 LE]`. The
+/// anchor trims its replay window to frames above `delivery_hw`.
+pub const MSG_ANCHOR_CKPT_ACK: u8 = 0xCE;
+/// Bytes of `MSG_ANCHOR_CKPT_ACK`.
+pub const ANCHOR_CKPT_ACK_LEN: usize = 16 + 4 + 1 + 8;
+
+/// Control, anchor -> standby: the session's worker was lost; adopt it
+/// from its checkpoint at `new_epoch`. Payload
+/// `[session_id:16][new_epoch:u32 LE]`, then, for a connection under
+/// anchor continuity, where the anchor's production gate stands
+/// `[next_production:u64 LE][bytes_written:u64 LE]` (as `CMD_SC_RESUME`
+/// carries it too). The standby commits the shadow,
+/// redelivers what the log says the session is owed, and answers
+/// `MSG_SC_RESUMED` at `new_epoch` (or `MSG_SC_ERROR`).
+pub const MSG_ANCHOR_ADOPT: u8 = 0xCF;
+
+// Anchor continuity: the INGRESS host under the anchor is replaced (a
+// paired-anchor takeover) while the worker stays. Layouts and codecs are
+// `cores/anchor_continuity_core.rs`'s; see
+// docs/architecture/anchor_continuity.md. `quantum_mqtt_anchor` runs them
+// under `continuity: 1`, `session_processor` seats every session attached
+// as `CC_TRANSPORT_MIGRATABLE` (`cores/production_seat_core.rs`).
+
+/// Control, replacement anchor -> worker: rebind the session to this
+/// anchor at a higher epoch. Payload `[session_id:16][new_epoch:u32 LE]
+/// [anchor_id:8][next_delivery:u64 LE][bytes_held:u64 LE]`.
+pub const MSG_ANCHOR_REANCHOR: u8 = 0xD5;
+/// Control, worker -> anchor: the answer, with the worker's own cursors.
+/// Payload `[session_id:16][new_epoch:u32 LE][status:u8]
+/// [delivery_hw:u64 LE][next_production:u64 LE][released:u64 LE]
+/// [released_bytes:u64 LE]`.
+pub const MSG_ANCHOR_REANCHORED: u8 = 0xD6;
+/// Control, anchor -> worker: the transport's mirrored output horizon
+/// reached `accepted_through`, whose last byte is `bytes_through`;
+/// productions at or below it are given. Payload `[session_id:16]
+/// [epoch:u32 LE][accepted_through:u64 LE][bytes_through:u64 LE]`.
+pub const MSG_ANCHOR_HORIZON: u8 = 0xD7;
+/// Data plane, worker -> anchor: a response numbered for the horizon.
+/// Payload `[conn_id:u16 LE][session_id:16][session_epoch:u32 LE]
+/// [production_id:u64 LE][inner_msg_type:u8][inner payload after conn_id]`.
+pub const MSG_ANCHOR_PRODUCTION: u8 = 0xD8;
+/// `state_out` -> the transport's pairing -> the paired host's
+/// `state_in`: a connection's `QAC1` record and its client,
+/// `[QAC1:88][peer_family:u8][peer_addr:16][peer_port:u16 LE]`, at
+/// attachment and whenever its binding changes, so it travels beside the
+/// transport's checkpoint and the paired anchor holds it for a takeover.
+/// On `cmd_in`, `[session_id:16]` asks for the session's record now (a
+/// planned cut).
+pub const MSG_ANCHOR_QAC: u8 = 0xDA;
+pub const QAC_EXPORT_LEN: usize = 88 + 1 + 16 + 2;
+/// On the same path: the connection of `[session_id:16]` closed here; the
+/// paired anchor drops its record.
+pub const MSG_ANCHOR_QAC_RETIRE: u8 = 0xDB;
+/// Control, worker -> anchor: the session consumed every delivery through
+/// `delivery_hw`. Payload `[session_id:16][epoch:u32 LE]
+/// [delivery_hw:u64 LE]`, sent for a seated session as its high-water
+/// moves; the anchor acknowledges to the transport only what it covers.
+pub const MSG_ANCHOR_CONSUMED: u8 = 0xDE;
+pub const ANCHOR_CONSUMED_LEN: usize = 16 + 4 + 8;
+/// Control, -> worker: export a session for a surviving site. Payload
+/// `[session_id:16][source_site:u32 LE][export_seq:u64 LE]`.
+pub const MSG_SITE_EXPORT: u8 = 0xDC;
+/// `site_out`, worker -> the cross-site carrier: one `QSS1` record
+/// (`cores/session_site_core.rs`), or `[session_id:16][status:u8]` when
+/// the session cannot be exported (no live attachment here, past a bound,
+/// or its state not whole here).
+pub const MSG_SITE_RECORD: u8 = 0xDD;
+
 /// MSG_ACK_REGISTER body:
 /// `[session_slot:u32 LE][message_id:u32 LE][partition_id:u16 LE]
 ///  [wal_index:u64 LE][session_generation:u32 LE]`.
@@ -416,7 +548,10 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 
 /// Transport-level connection-closed notice on the same
 /// `peer_router.cleartext → protocol::router → codec` chain as
-/// MSG_CLIENT_FRAME. Payload is `[conn_id:u16 LE]`. peer_router emits it when
+/// MSG_CLIENT_FRAME. Payload is `[conn_id:u16 LE]`. An MQTT anchor also
+/// hands it to the worker a connection is bound to, inside
+/// `MSG_ANCHOR_DELIVERY`, to end that binding in order behind the
+/// client's last frames. peer_router emits it when
 /// a CLIENT socket closes (NMSG_CLOSED, replica_id < 0); `protocol::router`
 /// clears its sniff state and forwards it to the conn's codec, which
 /// clears per-conn reassembly and forwards MSG_SESSION_DISCONNECT to
@@ -425,6 +560,36 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 /// group members) deterministically instead of leaking until a timeout —
 /// and closes the conn_id-reuse cross-delivery hazard.
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
+/// The client at the far end of a connection, on the same
+/// `peer_router.cleartext` chain as [`MSG_CLIENT_FRAME`], ahead of its
+/// first frame: `[conn_id:u16 LE][family:u8][addr:16][port:u16 LE]`
+/// (Fluxor's `MSG_PEER`, relabelled by the router). The MQTT anchor
+/// matches a connection the transport moved here to its staged import
+/// by it; every other consumer ignores it.
+pub const MSG_CLIENT_PEER: u8 = 0xED;
+pub const CLIENT_PEER_LEN: usize = 2 + 1 + 16 + 2;
+/// `[conn_id:2][bytes_through:u64 LE]`, transport -> anchor (relayed from
+/// Fluxor's `net_proto::MSG_HORIZON` by `peer_router`): the connection's
+/// mirrored output horizon — how many of the bytes the anchor wrote the
+/// standby holds.
+pub const MSG_CLIENT_HORIZON: u8 = 0xEE;
+pub const CLIENT_HORIZON_LEN: usize = 2 + 8;
+/// `[conn_id:2][consumer_cursor:u64 LE][in_bytes:u64 LE]`, anchor ->
+/// transport on the response edge (relayed as Fluxor's
+/// `net_proto::CMD_DELIVERED`, in order with the connection's sends): the
+/// connection's first `in_bytes` clear bytes are consumed, and the next
+/// delivery after them takes id `consumer_cursor`.
+pub const MSG_CLIENT_DELIVERED: u8 = 0xEF;
+pub const CLIENT_DELIVERED_LEN: usize = 2 + 8 + 8;
+/// `[conn_id:2][consumer_cursor:u64 LE][in_bytes:u64 LE][out_bytes:u64 LE]`,
+/// transport -> anchor (relayed from Fluxor's `net_proto::MSG_RESUMED`):
+/// a connection a takeover moved here, after its `MSG_CLIENT_PEER` and
+/// before any of its data. The predecessor's last `MSG_CLIENT_DELIVERED`
+/// (both 0 if none was mirrored) — the bytes handed from here start at
+/// `in_bytes`, their first delivery takes `consumer_cursor` — and the
+/// output the standby holds, in `MSG_CLIENT_HORIZON`'s numbering.
+pub const MSG_CLIENT_RESUMED: u8 = 0xF0;
+pub const CLIENT_RESUMED_LEN: usize = 2 + 8 + 8 + 8;
 
 /// Ask `peer_router` to CLOSE a client connection. Payload `[conn_id:u16 LE]`.
 /// The inverse of [`MSG_CONN_CLOSED`], which is a notice; this is a
@@ -727,20 +892,20 @@ pub fn shard_for_ordinal(domain: u8, tenant: u32, key: &[u8], ordinal: u32) -> u
 }
 
 /// Shard owning an MQTT session's state: `(tenant, client_id)`.
+///
+/// Derived once, at CONNECT, where the client id is in scope, and kept
+/// on the session (`session_processor`'s `sessions::shard`), so every
+/// later op of the session rides the same shard without the client id
+/// being threaded through.
 #[inline]
 pub fn shard_mqtt_session(tenant: u32, client_id: &[u8]) -> u32 {
     shard_for(RKEY_MQTT_SESSION, tenant, client_id)
 }
 
-/// Shard owning an MQTT session's state, keyed by the stream hash the
-/// codec already stamps on every session-scoped op.
-///
-/// `stream_hash` *is* the session identity: `session_processor` indexes
-/// every session by `(tenant, stream_hash)` and the codec carries it on
-/// CONNECT, DISCONNECT, SUBSCRIBE, UNSUBSCRIBE and the QoS ack path.
-/// Deriving the shard from it rather than re-hashing `client_id` — which
-/// is only in scope at CONNECT — keeps every op for one session on one
-/// shard without threading the client id through the module.
+/// Shard of an MQTT session whose client presented no client id, keyed
+/// by its stream hash (which the broker derives from the connection), so
+/// it has a key at all. Also the fallback for a malformed op that names
+/// no session.
 #[inline]
 pub fn shard_mqtt_stream(tenant: u32, stream_hash: u64) -> u32 {
     shard_for(RKEY_MQTT_SESSION, tenant, &stream_hash.to_le_bytes())
@@ -1183,6 +1348,26 @@ pub const QOP_KAFKA_GROUP_GEN: u8 = 0x0B;
 /// Restored members come back UNBOUND (`conn_id` is meaningless across
 /// a restart); the rejoining client rebinds them.
 pub const QOP_KAFKA_GROUP_MEMBER: u8 = 0x0C;
+
+/// DELIVER: a QoS 1/2 PUBLISH the broker handed to a subscriber and is
+/// now owed an acknowledgement for. Op-body (`session_replay_core`):
+/// `[stream_hash:u64 LE][generation:u32 LE][packet_id:u16 BE][qos:u8]
+///  [body_len:u16 LE][body]`, `body` being the encoded PUBLISH body the
+/// codec sent (topic, packet id, properties, payload).
+///
+/// Applied by EVERY worker into its outbound delivery ledger, whatever
+/// slot the entry names: the ledger has no side effects, and a worker
+/// that adopts the session after its worker is lost, or a node replaying
+/// its WAL after a restart, rebuilds from the log alone what the session
+/// is still owed and resends it. A clean-start CONNECT forgets it.
+pub const QOP_DELIVER: u8 = 0x0D;
+
+/// DELIVER ACK: a logged delivery progressed. Op-body:
+/// `[stream_hash:u64 LE][generation:u32 LE][packet_id:u16 BE][stage:u8]`,
+/// stage 1 = released (a QoS 2 subscriber's PUBREC arrived and the PUBREL
+/// went out), 2 = complete (PUBACK for QoS 1, PUBCOMP for QoS 2). Applies
+/// to a delivery logged at its generation or an earlier one.
+pub const QOP_DELIVER_ACK: u8 = 0x0E;
 
 // ── Disconnect reasons (QOP_DISCONNECT body) ────────────────────────────────
 
