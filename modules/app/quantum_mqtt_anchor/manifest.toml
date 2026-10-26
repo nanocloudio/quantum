@@ -1,0 +1,157 @@
+version = "0.1.0"
+type             = "Transformer"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+
+# quantum_mqtt_anchor — the MQTT transport anchor
+# (docs/architecture/mqtt_anchor.md).
+#
+# Holds the client's MQTT connection open while the session worker
+# behind it is drained, replaced or lost, keeping only what that needs:
+# connection identity, framing state, safe liveness, and bounded queues
+# of frames waiting for a worker (with their delivery ids) and responses
+# waiting for the transport (with their production ids). Session state
+# proper stays with the worker and the committed log.
+#
+# Components: the MQTT codec (protocol/mqtt.rs, mounted) and the
+# SessionCtrlV1 anchor (anchor.rs, also mounted by `protocol`) over the
+# pure `mqtt_anchor_core`. A graph that serves MQTT alone uses this
+# module instead of `protocol`.
+
+permissions = []
+
+# Transport-anchor role: owns the client-visible attachment and moves the
+# session worker behind it. Consumed by the `continuity` validator.
+capabilities = ["transport.anchor.stream"]
+
+# The index is the ABI — a graph binds a port by position — so a port is
+# only ever appended. Inputs [0] raw_in [1] responses_in [2] ctrl_in
+# [3] ctrl2_in [4] responses2_in [5] dir_in [6] cmd_in; outputs
+# [0] proposals_out [1] frames_out [2] metrics [3] ctrl_out [4] ctrl2_out
+# [5] proposals2_out [6] dir_out.
+
+# ── inputs ───────────────────────────────────────────────────
+
+# Cleartext client records from peer_router (MSG_CLIENT_FRAME
+# `[conn_id][tcp chunk]`) and MSG_CONN_CLOSED notices. Not read while the
+# hold is at its high-water mark: that is the backpressure.
+[[ports]]
+name = "raw_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Worker 0's session responses.
+[[ports]]
+name = "responses_in"
+direction = "input"
+content_type = "OctetStream"
+
+# SessionCtrlV1 from worker 0 and worker 1, plus MSG_ANCHOR_SWAP a worker
+# forwards from a committed `QASW` record.
+[[ports]]
+name = "ctrl_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl2_in"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+# Worker 1's session responses.
+[[ports]]
+name = "responses2_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Session directory verdicts (ATTACHED / DETACHED / ERROR). Optional.
+[[ports]]
+name = "dir_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Control-plane commands wired straight to the anchor: MSG_ANCHOR_SWAP
+# `[anchor_id:8][mode:u8][seq:u64 LE]`, and under continuity
+# MSG_ANCHOR_QAC `[session_id:16]` (export that session's record now).
+# Optional; unwired, swaps arrive through the workers.
+[[ports]]
+name = "cmd_in"
+direction = "input"
+content_type = "OctetStream"
+
+# Anchor continuity (`continuity: 1`): the paired anchor's `state_out`,
+# carried by the transport's pairing — its records, held for a takeover
+# (docs/architecture/anchor_continuity.md). Optional.
+[[ports]]
+name = "state_in"
+direction = "input"
+content_type = "OctetStream"
+
+# ── outputs ──────────────────────────────────────────────────
+
+# Session envelopes to worker 0 — MSG_ANCHOR_DELIVERY while a worker is
+# attached, bare on the plain seam.
+[[ports]]
+name = "proposals_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Encoded client frames to the transport. NetProto: the port carries
+# wire envelopes and is fanned, and a NetProto fan moves whole frames.
+[[ports]]
+name = "frames_out"
+direction = "output"
+content_type = "NetProto"
+rate_class_default = "transaction"
+
+# Component-tagged samples under the dimensional metric envelope
+# (metric_id 0x22 = mqtt codec, 0x25 = anchor).
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ctrl_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+[[ports]]
+name = "ctrl2_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 32768
+max_record = 1027
+
+# Session envelopes to worker 1.
+[[ports]]
+name = "proposals2_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Session directory requests (ATTACH / DETACH). Optional.
+[[ports]]
+name = "dir_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Anchor continuity: each connection's QAC1 record and client
+# (MSG_ANCHOR_QAC), at attachment, at every binding change and when asked
+# on `cmd_in`, and MSG_ANCHOR_QAC_RETIRE when it closes — to travel beside
+# the transport's checkpoint to the paired anchor's `state_in`. Optional.
+[[ports]]
+name = "state_out"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = [
+    "attached", "swaps", "relocated", "refused", "cursor_mismatch",
+    "hold_overflows", "packets_decoded", "packets_encoded", "parse_errors",
+]

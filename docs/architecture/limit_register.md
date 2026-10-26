@@ -21,6 +21,7 @@ leaves the work in its channel for a later step.
 | MQTT 5 Maximum Packet Size | Shape | `MQTT5_MAX_PACKET` | modules/common/wire.rs | RAFT_ENTRY_MAX - QOS1_ENTRY_FIXED + MQTT5_PUBLISH_FRAMING_MIN | Derived: 2014, advertised in every MQTT 5 CONNACK — the largest packet whose PUBLISH, at any QoS, fits the Raft entry. A larger PUBLISH is refused as for `RAFT_ENTRY_MAX` when its entry does not fit. |
 | Envelope payload | Shape | `MAX_PAYLOAD` | modules/common/wire.rs | 0xFFFF | The `len u16` of the wire envelope `[msg_type][len][payload]`. |
 | Wire message | Shape | `MAX_MSG` | modules/common/wire.rs | crate::abi::CHANNEL_BUFFER_SIZE | One envelope written or read whole (8192 bytes). A larger message is refused by the writer; a reader discards one it cannot hold, whole. |
+| Delivery envelope | Shape | `DELIVERY_ENVELOPE_MAX` | modules/common/wire.rs | 4112 | The largest `MSG_TOPIC_DELIVER`: every hop that holds one — a worker's delivery park, `messaging`'s offline queue — holds this much, so no delivery a publish can make is refused for its size. |
 
 ## The publish provider
 
@@ -63,6 +64,7 @@ MQTT5_MAX_PACKET | modules/common/wire.rs | RAFT_ENTRY_MAX - QOS1_ENTRY_FIXED + 
 MAX_PAYLOAD | modules/common/wire.rs | 0xFFFF
 MAX_MSG | modules/common/wire.rs | crate::abi::CHANNEL_BUFFER_SIZE
 MAX_MSG | modules/common/wire.rs | crate::abi::CHANNEL_BUFFER_SIZE
+DELIVERY_ENVELOPE_MAX | modules/common/wire.rs | 4112
 HEADERS_MAX | modules/common/publish_exchange.rs | 512
 WIRE_MAX | modules/common/front_session.rs | 8192
 ENVELOPE_MAX | modules/common/front_session.rs | WIRE_MAX - WIRE_HDR

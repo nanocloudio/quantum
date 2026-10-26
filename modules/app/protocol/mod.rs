@@ -87,6 +87,10 @@ mod wire;
 #[path = "../../common/cores/kafka_metadata_core.rs"]
 mod kafka_metadata;
 
+/// The transport anchor is `quantum_mqtt_anchor`'s, mounted here so the
+/// multi-protocol front door and the MQTT anchor are one implementation
+/// (docs/architecture/mqtt_anchor.md).
+#[path = "../quantum_mqtt_anchor/anchor.rs"]
 mod anchor;
 mod router;
 
@@ -113,7 +117,7 @@ const ADVERTISED_PEERS: usize = 3;
 define_params! {
     ModuleState;
 
-    // Tags 1, 2 and 6 to 11 are retired; the next allocation is 23.
+    // Tags 1, 2 and 6 to 11 are retired; the next allocation is 28.
     //
     // This broker as Kafka Metadata advertises it: `host[:port]`, port
     // 9090 when it names none. It must be the address CLIENTS can reach
@@ -200,6 +204,27 @@ define_params! {
     // Swaps the record trigger may start (0 = unlimited).
     18, handoff_max_swaps, u32, 0
         => |s, d, len| { s.anchor.handoff_max_swaps = p_u32(d, len, 0, 0); };
+    // Route policy: 1 admits liveness-only mode — while no worker is
+    // authoritative the anchor answers a PINGREQ itself (and never
+    // PUBLISH, SUBSCRIBE, UNSUBSCRIBE or AUTH). 0 owes the PINGRESP
+    // until a worker is.
+    23, liveness_only, u8, 0
+        => |s, d, len| { s.anchor.liveness_only = p_u8(d, len, 0, 0); };
+    // Hold fill, in percent, at which raw bytes stop being read (0 =
+    // never): the stream contract's only backpressure, so the client's
+    // TCP window closes before the hold can overflow.
+    24, hold_high_water_pct, u8, 75
+        => |s, d, len| { s.anchor.hold_high_water_pct = p_u8(d, len, 0, 75).min(100); };
+    // Worker liveness and loss recovery, as on `quantum_mqtt_anchor`
+    // (docs/architecture/mqtt_anchor.md, "Worker loss").
+    25, worker_probe_ms, u32, 0
+        => |s, d, len| { s.anchor.worker_probe_ms = p_u32(d, len, 0, 0); };
+    26, worker_loss_ms, u32, 0
+        => |s, d, len| { s.anchor.worker_loss_ms = p_u32(d, len, 0, 0); };
+    27, replay_bytes, u32, 0
+        => |s, d, len| {
+            s.anchor.replay_bytes = p_u32(d, len, 0, 0).min(anchor::REPLAY_MAX as u32);
+        };
 }
 
 /// Kernel step ABI: 0=Continue, 1=Done, 2=Burst, 3=Ready. Returning
@@ -207,7 +232,7 @@ define_params! {
 /// the kernel's pass cap), so a record that arrives here reaches its
 /// consumer in this tick instead of the next. We burst only when a
 /// record was actually consumed: an idle graph reports no burst and the
-/// tick costs exactly one pass, as before.
+/// tick costs exactly one pass.
 const STEP_BURST: i32 = 2;
 
 /// Records drained from `raw_in` per step. Sized to stay ahead of a full
@@ -557,6 +582,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let rx_open = mqtt::flush_held(&mut s.mqtt, sys);
             #[cfg(not(feature = "mqtt"))]
             let rx_open = true;
+            // A hold at its high-water mark stops the read: not reading
+            // is the backpressure (anchor::read_paused).
+            let rx_open = rx_open && !anchor::read_paused(&mut s.anchor);
             let rx_budget = if rx_open { RX_BUDGET } else { 0 };
             for _ in 0..rx_budget {
                 let poll = (sys.channel_poll)(s.in_raw, 0x01);
@@ -600,8 +628,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // CONSUME the other codecs' records. The demux lives here
         // instead: read once, dispatch on the session proto tag at
         // payload[2]. Both workers' buses are drained before their
-        // control channels (§Delivery cursors: what a worker emitted
-        // before DRAINED must be counted before its export is read).
+        // control channels (session_continuity.md, "Delivery cursors":
+        // what a worker emitted before DRAINED must be counted before
+        // its export is read).
         {
             // The held response goes first, and nothing else is drained
             // until its edge takes it.
@@ -612,7 +641,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if dispatch_response(s, sys, held) {
                     let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
                     let w = usize::from(s.resp_held_w);
-                    anchor::note_relayed(&mut s.anchor, w, conn, wire::ENVELOPE_HDR + held);
+                    anchor::note_relayed(&mut s.anchor, w, conn, wire::ENVELOPE_HDR + held, now);
                     s.resp_held_len = 0;
                 } else {
                     resp_open = false;
@@ -636,8 +665,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     worked += 1;
                     s.hb_resp = s.hb_resp.wrapping_add(1);
                     let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
+                    // Only the worker the connection is bound to may emit
+                    // for it; a stale emitter is fenced here.
+                    if !anchor::response_admitted(&mut s.anchor, w, conn) {
+                        continue;
+                    }
                     if dispatch_response(s, sys, n) {
-                        anchor::note_relayed(&mut s.anchor, w, conn, wire::ENVELOPE_HDR + n);
+                        anchor::note_relayed(&mut s.anchor, w, conn, wire::ENVELOPE_HDR + n, now);
                     } else {
                         s.resp_held[..n].copy_from_slice(&s.buf[..n]);
                         s.resp_held_len = n as u16;
@@ -660,15 +694,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // One accounting line per second: records in, packets decoded
         // and written to the session, packets held, responses in,
         // frames out, frames refused. Cumulative where the counter is
-        // cumulative (`dec`, `held`, `enc`, `refused`).
+        // cumulative (`dec`, `held`, `enc`, `refused`). The anchor's own
+        // `[anchor] hb` line follows it.
         if now.wrapping_sub(s.last_hb_ms) >= 1000 {
             s.last_hb_ms = now;
             #[cfg(feature = "mqtt")]
             let (dec, held, enc, refused) = mqtt::hb_counters(&s.mqtt);
             #[cfg(not(feature = "mqtt"))]
             let (dec, held, enc, refused) = (0u32, 0u32, 0u32, 0u32);
-            let (att, reloc, hoffref, heldrec) = anchor::hb_counters(&s.anchor);
-            let mut line = [0u8; 200];
+            let mut line = [0u8; 128];
             let mut pos = 0usize;
             for (label, v) in [
                 (&b"[proto] hb raw="[..], s.hb_raw),
@@ -677,10 +711,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" resp="[..], s.hb_resp),
                 (&b" enc="[..], enc),
                 (&b" refused="[..], refused),
-                (&b" att="[..], att),
-                (&b" reloc="[..], reloc),
-                (&b" hoffref="[..], hoffref),
-                (&b" heldrec="[..], heldrec),
             ] {
                 for &b in label {
                     line[pos] = b;
@@ -689,6 +719,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 pos = fmt_u32(&mut line, pos, v);
             }
             dev_log(sys, 3, line.as_ptr(), pos);
+            anchor::log_hb(&s.anchor, sys);
             s.hb_raw = 0;
             s.hb_resp = 0;
         }

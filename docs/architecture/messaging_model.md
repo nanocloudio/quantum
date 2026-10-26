@@ -65,7 +65,13 @@ routing_record {
 }
 ```
 
-Owned by `topic_engine`.
+Owned by `topic_engine`. A publish is fanned out to every matching
+subscription, one delivery each on its worker's deliver edge. A full edge
+holds the fan-out at the subscription it refused and nothing more is
+read until the rest has gone, so each subscriber receives every publish,
+in order; the worker reads its deliveries without waiting on any client
+(see [flow_control.md](flow_control.md#a-sessions-in-flight-table-session_processor)),
+so the hold always clears.
 
 ### Retained record
 
@@ -119,9 +125,31 @@ offline_entry {
 }
 ```
 
-Owned by `messaging`'s offline component, a bounded per-session FIFO.
+Owned by `messaging`'s offline component, a bounded per-session FIFO of
+the deliveries a session cannot take now: while it is offline, and while
+a connected one waits on its client to acknowledge. An envelope of any
+size a delivery can have (`wire::DELIVERY_ENVELOPE_MAX`) is held whole,
+in 256-byte chunks of a shared 4 MiB arena; 4096 entries in all. One
+refused — the queue full — is counted as rejected.
 The earliest non-expired entry per PRG is the WAL compaction floor
 for queued state.
+
+### Answers on a full edge
+
+Every answer `messaging` gives is one a worker waits on and never asks
+for twice: a dedup verdict resolves a committed publish's stash, and a
+retained read or an offline drain carries deliveries. So none is dropped
+when the worker's result edge is full; what is left of it is held for
+that worker's bus. Verdicts queue in order (64 per bus) and the bus goes
+on being read meanwhile, since pausing it would back up the op edge the
+worker files its dedup checks on. A retained read or an offline drain
+answers at most the credit its request carries — the room the worker
+reserved for its deliveries — and ends with a marker saying where it
+stopped, so the worker can ask again for the rest. One the edge cuts
+short is kept as where it stopped, marker included, and that bus is not
+read again until it has finished, nor while its verdict queue is full.
+The worker's side of the exchange is in
+[flow_control.md](flow_control.md#the-exchange-with-messaging-session_processor).
 
 ## Invariants
 

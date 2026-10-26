@@ -52,6 +52,18 @@
 //! Any other frame type on the bus is ignored — `op_in` is a shared bus
 //! and carries traffic addressed to other consumers.
 //!
+//! Every answer is one a worker waits on and never asks for twice — a
+//! dedup verdict resolves a committed publish's stash, a retained read or
+//! an offline drain carries deliveries — so none is dropped on a full
+//! result edge. What is left of it is held for its bus (`hold`). Verdicts
+//! queue, in order, and the bus goes on being read meanwhile: pausing it
+//! would back up the op edge the worker files its dedup checks on. A
+//! retained read or offline drain answers at most the credit its request
+//! carries — room the worker reserved — and ends with a marker saying
+//! where it stopped (MSG_RETAINED_READ_END, MSG_OFFLINE_DRAINED); one the
+//! edge cuts short is kept as where it stopped, and that bus — like one
+//! whose verdict queue is full — is not read again until it has gone.
+//!
 //! Step effects are reported per component at their original sites; the
 //! module step itself always returns 0.
 
@@ -82,6 +94,10 @@ mod wire;
 mod dedup;
 mod offline;
 mod retained;
+
+/// What a bus still owes when its result edge had no room for an answer.
+#[path = "../../common/cores/messaging_hold_core.rs"]
+mod hold;
 
 /// Placement: shared with `session_processor` and `topic_engine` so all
 /// three resolve a shard to the same owner.
@@ -142,6 +158,9 @@ struct ModuleState {
     dedup: dedup::Dedup,
     offline: offline::Offline,
     retained: retained::Retained,
+    /// Per bus (worker 0's, worker 1's), the answer its result edge had
+    /// no room for: written on before the bus is read again.
+    holds: [hold::BusHold; 2],
 
     /// Placement, learned over the op bus from `session_processor`.
     view: edge::EdgeMap,
@@ -223,6 +242,7 @@ pub unsafe extern "C" fn module_new(
         s.view = edge::EdgeMap::new(0, 0);
         s.retained_released = 0;
         s.offline_released = 0;
+        s.holds = [hold::BusHold::new(); 2];
 
         // All three components reply on out[0]; the consumer demuxes by
         // frame type exactly as it did across the three separate edges.
@@ -266,6 +286,54 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
     }
 }
 
+/// A bus's result edge, as the hold writes on what it owes.
+struct BusOut<'a> {
+    sys: &'a SyscallTable,
+    out: i32,
+    dedup: &'a dedup::Dedup,
+    offline: &'a mut offline::Offline,
+    retained: &'a mut retained::Retained,
+}
+
+impl hold::Replies for BusOut<'_> {
+    fn verdict(&mut self, v: &[u8; hold::VERDICT_LEN]) -> bool {
+        // SAFETY: `sys` is the kernel's live syscall table for the step.
+        unsafe { dedup::write_verdict(self.dedup, self.sys, v) }
+    }
+
+    fn drain(&mut self, session: u32, left: &mut u16) -> Option<u32> {
+        // SAFETY: as above.
+        unsafe { offline::drain(self.offline, self.sys, session, left) }
+    }
+
+    fn read(&mut self, c: &mut hold::ReadCursor) -> Option<u32> {
+        // SAFETY: as above.
+        unsafe { retained::read_from(self.retained, self.sys, c) }
+    }
+
+    fn marker(&mut self, m: &hold::Marker) -> bool {
+        let (mt, a, b) = match *m {
+            hold::Marker::Drained { session, remaining } => {
+                (wire::MSG_OFFLINE_DRAINED, session, remaining)
+            }
+            hold::Marker::ReadEnd { session, next } => (wire::MSG_RETAINED_READ_END, session, next),
+        };
+        if self.out < 0 {
+            return true;
+        }
+        let mut p = [0u8; 8];
+        p[..4].copy_from_slice(&a.to_le_bytes());
+        p[4..].copy_from_slice(&b.to_le_bytes());
+        // SAFETY: as above.
+        unsafe {
+            let poll = (self.sys.channel_poll)(self.out, 0x02);
+            poll > 0
+                && (poll as u32 & 0x02) != 0
+                && wire::channel_write_msg(self.sys, self.out, mt, &p) > 0
+        }
+    }
+}
+
 /// PIC module ABI entry: run one scheduler step against this instance.
 ///
 /// # Safety
@@ -304,13 +372,29 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // under saturation, not starvation. It also matches the shape
         // of a handoff pair, where the busy worker and the standby
         // trade places rather than run hot together.
-        for (in_chan, out_chan) in [(s.in_op, s.out_result), (s.in_op2, s.out_result2)] {
+        for (bus, (in_chan, out_chan)) in [(s.in_op, s.out_result), (s.in_op2, s.out_result2)]
+            .into_iter()
+            .enumerate()
+        {
             if in_chan < 0 || out_chan < 0 {
                 continue;
             }
             s.dedup.out_result = out_chan;
             s.offline.out_drain = out_chan;
             s.retained.out_read = out_chan;
+            // What the bus still owes goes first: verdicts in order, then
+            // a read or drain cut short. The bus is read only while no
+            // read or drain is owed and a verdict has room to wait.
+            let mut out = BusOut {
+                sys,
+                out: out_chan,
+                dedup: &s.dedup,
+                offline: &mut s.offline,
+                retained: &mut s.retained,
+            };
+            if !s.holds[bus].resume(&mut out) {
+                continue;
+            }
             for _ in 0..OP_BUDGET {
                 // Every budget decision precedes consumption. A record's
                 // type is not known until it is read, so once ANY
@@ -318,7 +402,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // rather than take a record it might not be able to
                 // handle. Losing a MSG_DEDUP_CHECK this way would leave a
                 // committed publish's stash unresolved indefinitely.
-                if checks >= dedup::CHECK_BUDGET
+                if !s.holds[bus].can_read()
+                    || checks >= dedup::CHECK_BUDGET
                     || enqueues >= offline::ENQUEUE_BUDGET
                     || reconnects >= offline::RECONNECT_BUDGET
                     || writes >= retained::WRITE_BUDGET
@@ -337,6 +422,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
 
                 worked += 1;
+                let mut owed = hold::Owed::None;
                 match mt {
                     wire::MSG_APPLY_RESET_FANOUT => {
                         dedup::on_reset(&mut s.dedup);
@@ -345,7 +431,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     wire::MSG_DEDUP_CHECK => {
                         checks += 1;
-                        dedup::on_check(&mut s.dedup, sys, &s.buf[..plen], now);
+                        if let Some(v) = dedup::on_check(&mut s.dedup, &s.buf[..plen], now) {
+                            let mut out = BusOut {
+                                sys,
+                                out: out_chan,
+                                dedup: &s.dedup,
+                                offline: &mut s.offline,
+                                retained: &mut s.retained,
+                            };
+                            s.holds[bus].verdict(&mut out, &v);
+                        }
                     }
                     wire::MSG_DEDUP_PHASE => {
                         dedup::on_phase(&mut s.dedup, &s.buf[..plen]);
@@ -356,7 +451,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     wire::MSG_OFFLINE_RECONNECT => {
                         reconnects += 1;
-                        offline::on_reconnect(&mut s.offline, sys, &s.buf[..plen]);
+                        owed = offline::on_reconnect(&s.buf[..plen]);
                     }
                     wire::MSG_RETAINED_WRITE => {
                         writes += 1;
@@ -364,7 +459,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     wire::MSG_RETAINED_READ => {
                         reads += 1;
-                        retained::on_read(&mut s.retained, sys, &s.buf[..plen]);
+                        owed = retained::on_read(&mut s.retained, &s.buf[..plen]);
                     }
                     // Placement, forwarded verbatim by `session_processor`
                     // over this same op bus because this module has no
@@ -396,6 +491,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     // Shared bus: traffic addressed to other consumers.
                     _ => {}
+                }
+                if owed != hold::Owed::None {
+                    let mut out = BusOut {
+                        sys,
+                        out: out_chan,
+                        dedup: &s.dedup,
+                        offline: &mut s.offline,
+                        retained: &mut s.retained,
+                    };
+                    s.holds[bus].start(&mut out, owed);
                 }
             }
         }

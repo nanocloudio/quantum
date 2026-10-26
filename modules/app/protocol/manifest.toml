@@ -26,7 +26,10 @@ permissions = []
 
 # Transport-anchor role (docs/architecture/session_continuity.md): this
 # module owns the client-visible attachment and moves the session worker
-# behind it. Consumed by the `continuity` config block validator.
+# behind it. The anchor is `quantum_mqtt_anchor`'s implementation,
+# mounted here (docs/architecture/mqtt_anchor.md); an MQTT-only front
+# door uses that module directly. Consumed by the `continuity` config
+# block validator.
 capabilities = ["transport.anchor.stream"]
 
 [[variant]]

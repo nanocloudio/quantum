@@ -680,3 +680,190 @@ fn a_resize_moves_only_the_shards_the_new_prg_takes() {
     // 1/4 of the space, within sampling noise.
     assert!((4_500..5_500).contains(&moved), "moved {moved} of 20000");
 }
+
+// ── Placement epochs under load ─────────────────────────────────────────────
+//
+// `client_id -> virtual shard -> PRG` for ten thousand sessions across
+// three PRGs, then a shard-map epoch that overrides a subset: every
+// session's owner must be a pure function of the map, and only the
+// sessions whose shard the map names may move.
+
+/// `wire::shard_for(RKEY_MQTT_SESSION, tenant, client_id)`, restated:
+/// FNV-1a over `[domain][tenant LE][key]` reduced into `VIRTUAL_SHARDS`.
+/// `wire.rs` mounts the syscall ABI and cannot be `include!`d here; the
+/// constants below mirror its `RKEY_MQTT_SESSION` and `VIRTUAL_SHARDS`.
+fn session_shard(tenant: u32, client_id: &[u8]) -> u32 {
+    const RKEY_MQTT_SESSION: u8 = 1;
+    const VIRTUAL_SHARDS: u64 = 1 << 18;
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let step = |h: u64, b: u8| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    h = step(h, RKEY_MQTT_SESSION);
+    for &b in &tenant.to_le_bytes() {
+        h = step(h, b);
+    }
+    for &b in client_id {
+        h = step(h, b);
+    }
+    (h % VIRTUAL_SHARDS) as u32
+}
+
+/// Ten thousand client ids, `sess-<n>`, as their shards.
+fn session_shards() -> Vec<u32> {
+    (0..10_000u32)
+        .map(|i| session_shard(0, format!("sess-{i}").as_bytes()))
+        .collect()
+}
+
+/// A `MSG_SHARD_MAP_UPDATE` body at `epoch` naming `entries`.
+fn shard_map(epoch: u64, entries: &[(u32, u16)]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(SHARD_MAP_HDR + entries.len() * SHARD_MAP_ENTRY);
+    b.extend_from_slice(&epoch.to_le_bytes());
+    let count = u16::try_from(entries.len()).expect("a test map fits the u16 count");
+    b.extend_from_slice(&count.to_le_bytes());
+    for &(shard, prg) in entries {
+        b.extend_from_slice(&shard.to_le_bytes());
+        b.extend_from_slice(&prg.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn ten_thousand_sessions_resolve_deterministically_across_three_prgs() {
+    let shards = session_shards();
+    let mut m = EdgeMap::new(0, 0);
+    assert_eq!(
+        apply_placement_update(&mut m.view, &update(1, 3, 0, 0, false)),
+        PlacementUpdate::Applied
+    );
+    let owners: Vec<u16> = shards.iter().map(|&sh| m.owner_prg(sh)).collect();
+    // Deterministic: the same map answers the same owner every time,
+    // and a second map built from the same update agrees with it.
+    let again: Vec<u16> = shards.iter().map(|&sh| m.owner_prg(sh)).collect();
+    assert_eq!(owners, again);
+    let mut peer = EdgeMap::new(1, 0);
+    apply_placement_update(&mut peer.view, &update(1, 3, 1, 0, false));
+    let from_peer: Vec<u16> = shards.iter().map(|&sh| peer.owner_prg(sh)).collect();
+    assert_eq!(owners, from_peer, "every node resolves the same owner");
+    // Spread: each PRG carries a share, within sampling noise of a third.
+    let mut per_prg = [0u32; 3];
+    for &o in &owners {
+        per_prg[usize::from(o)] += 1;
+    }
+    for (prg, n) in per_prg.iter().enumerate() {
+        assert!((2_800..=3_900).contains(n), "prg {prg} owns {n} of 10000");
+    }
+}
+
+#[test]
+fn a_shard_map_epoch_moves_only_the_shards_it_names() {
+    let shards = session_shards();
+    let mut m = EdgeMap::new(0, 0);
+    apply_placement_update(&mut m.view, &update(1, 3, 0, 0, false));
+    let before: Vec<u16> = shards.iter().map(|&sh| m.owner_prg(sh)).collect();
+
+    // Override 64 distinct shards — one in every ~150 sessions — each
+    // to the PRG after its baseline owner.
+    let mut overridden: Vec<(u32, u16)> = Vec::new();
+    for (i, &sh) in shards.iter().enumerate() {
+        if i % 150 == 0 && !overridden.iter().any(|&(s, _)| s == sh) {
+            overridden.push((sh, (before[i] + 1) % 3));
+        }
+        if overridden.len() == 64 {
+            break;
+        }
+    }
+    assert_eq!(overridden.len(), 64);
+    assert_eq!(
+        apply_shard_map_update(&mut m.overrides, &shard_map(2, &overridden)),
+        PlacementUpdate::Applied
+    );
+    assert_eq!(m.overrides.epoch(), 2);
+
+    let mut moved = 0u32;
+    for (i, &sh) in shards.iter().enumerate() {
+        let now = m.owner_prg(sh);
+        match overridden.iter().find(|&&(s, _)| s == sh) {
+            Some(&(_, prg)) => {
+                assert_eq!(now, prg, "session {i}: overridden shard follows the map");
+                assert_ne!(now, before[i], "session {i}: the override is a move");
+                moved += 1;
+            }
+            None => assert_eq!(now, before[i], "session {i}: an unnamed shard stayed"),
+        }
+    }
+    // Every session on an overridden shard moved, and only those. The
+    // count is the sessions sharing those 64 shards, at least 64.
+    assert!(moved >= 64, "moved {moved}");
+    let on_overridden = shards
+        .iter()
+        .filter(|&&sh| overridden.iter().any(|&(s, _)| s == sh))
+        .count();
+    assert_eq!(moved as usize, on_overridden);
+
+    // The same map replayed at the same epoch changes nothing, and an
+    // older one cannot rewind: placement is a function of the HIGHEST
+    // epoch applied, not of arrival order.
+    let mut rewind = overridden.clone();
+    for e in &mut rewind {
+        e.1 = (e.1 + 1) % 3;
+    }
+    assert_eq!(
+        apply_shard_map_update(&mut m.overrides, &shard_map(2, &rewind)),
+        PlacementUpdate::Stale
+    );
+    assert_eq!(
+        apply_shard_map_update(&mut m.overrides, &shard_map(1, &rewind)),
+        PlacementUpdate::Stale
+    );
+    for (i, &sh) in shards.iter().enumerate() {
+        let expect = overridden
+            .iter()
+            .find(|&&(s, _)| s == sh)
+            .map_or(before[i], |&(_, p)| p);
+        assert_eq!(m.owner_prg(sh), expect);
+    }
+
+    // A later epoch clearing the overrides returns every session to
+    // its baseline, and nothing else moves.
+    let clear: Vec<(u32, u16)> = overridden
+        .iter()
+        .map(|&(s, _)| (s, SHARD_OVERRIDE_CLEAR))
+        .collect();
+    assert_eq!(
+        apply_shard_map_update(&mut m.overrides, &shard_map(3, &clear)),
+        PlacementUpdate::Applied
+    );
+    assert!(m.overrides.is_empty());
+    let after: Vec<u16> = shards.iter().map(|&sh| m.owner_prg(sh)).collect();
+    assert_eq!(after, before);
+}
+
+/// A fence raised on one PRG at the next placement epoch withholds
+/// exactly that PRG's sessions and leaves the other two serving.
+#[test]
+fn a_fence_under_load_withholds_one_prg_and_keeps_ownership() {
+    let shards = session_shards();
+    let mut m = EdgeMap::new(0, 0);
+    apply_placement_update(&mut m.view, &update(1, 3, 0, 0, false));
+    let before: Vec<u16> = shards.iter().map(|&sh| m.owner_prg(sh)).collect();
+    apply_placement_update(&mut m.view, &update(2, 3, 0, 0, true));
+    for (i, &sh) in shards.iter().enumerate() {
+        assert_eq!(
+            m.owner_prg(sh),
+            before[i],
+            "a fence does not move ownership"
+        );
+        let action = classify(&m.view, m.owner_prg(sh), 0);
+        if before[i] == 0 {
+            assert_eq!(action, EdgeAction::Fenced, "session {i} on the fenced PRG");
+            assert!(m.is_local(sh), "still ours: an abort leaves it here");
+            assert!(!m.owns_shard(sh), "but not servable while fenced");
+        } else {
+            assert_eq!(
+                action,
+                EdgeAction::Forward(before[i]),
+                "session {i} unaffected"
+            );
+        }
+    }
+}

@@ -76,6 +76,13 @@ pub struct Correlate {
     dlv_active: [u8; PENDING_DLV_SLOTS],
     dlv_len: [u16; PENDING_DLV_SLOTS],
     dlv_env: [[u8; MAX_PENDING_DLV]; PENDING_DLV_SLOTS],
+    /// Arrival order of each parked delivery, and the next to give: a
+    /// session's deliveries are retried oldest first.
+    dlv_seq: [u64; PENDING_DLV_SLOTS],
+    dlv_next_seq: u64,
+    /// Where each parked delivery came from (the caller's code: fresh, a
+    /// retained read's answer, a drain's), retried as such.
+    dlv_kind: [u8; PENDING_DLV_SLOTS],
 
     ack_active: [u8; PENDING_ACK_SLOTS],
     ack_buf: [[u8; wire::ACK_REGISTER_LEN]; PENDING_ACK_SLOTS],
@@ -95,6 +102,12 @@ pub struct Correlate {
     stash_durable: [u8; STASH_SLOTS],
     stash_env_len: [u16; STASH_SLOTS],
     stash_env: [[u8; MAX_STASH_ENV]; STASH_SLOTS],
+    /// When each stash became ready — verdict and durability both in —
+    /// in order (0: not yet), and the next to give: stashes are released
+    /// to the topic bus oldest-ready first, so one the bus refused is
+    /// never overtaken.
+    stash_ready: [u64; STASH_SLOTS],
+    stash_next_ready: u64,
 }
 
 // ── Commit-gating stash ─────────────────────────────────────────────
@@ -113,6 +126,7 @@ pub fn stash_alloc(s: &mut Correlate, correlation_id: u64, dedup_key: &[u8]) -> 
             s.stash_dedup_state[i] = STASH_DEDUP_PENDING;
             s.stash_durable[i] = 0;
             s.stash_env_len[i] = 0;
+            s.stash_ready[i] = 0;
             return Some(i);
         }
     }
@@ -139,6 +153,32 @@ pub fn stash_release(s: &mut Correlate, slot: usize) {
     s.stash_dedup_state[slot] = STASH_DEDUP_PENDING;
     s.stash_durable[slot] = 0;
     s.stash_env_len[slot] = 0;
+    s.stash_ready[slot] = 0;
+}
+
+/// Free stash slots.
+pub fn stash_free(s: &Correlate) -> usize {
+    (0..STASH_SLOTS).filter(|&i| s.stash_active[i] == 0).count()
+}
+
+/// The stash that became ready first and is still held.
+pub fn stash_oldest_ready(s: &Correlate) -> Option<usize> {
+    (0..STASH_SLOTS)
+        .filter(|&i| s.stash_active[i] == 1 && s.stash_ready[i] != 0)
+        .min_by_key(|&i| s.stash_ready[i])
+}
+
+/// Number the stash in `slot` ready once both its verdict and its
+/// durability are in.
+fn stash_note_ready(s: &mut Correlate, slot: usize) {
+    if s.stash_active[slot] == 1
+        && s.stash_ready[slot] == 0
+        && s.stash_durable[slot] != 0
+        && s.stash_dedup_state[slot] != STASH_DEDUP_PENDING
+    {
+        s.stash_next_ready = s.stash_next_ready.wrapping_add(1);
+        s.stash_ready[slot] = s.stash_next_ready;
+    }
 }
 
 pub fn stash_occupied(s: &Correlate, slot: usize) -> bool {
@@ -156,6 +196,7 @@ pub fn stash_dedup_state(s: &Correlate, slot: usize) -> u8 {
 pub fn stash_set_dedup_state(s: &mut Correlate, slot: usize, state: u8) {
     if slot < STASH_SLOTS {
         s.stash_dedup_state[slot] = state;
+        stash_note_ready(s, slot);
     }
 }
 
@@ -166,6 +207,7 @@ pub fn stash_is_durable(s: &Correlate, slot: usize) -> bool {
 pub fn stash_mark_durable(s: &mut Correlate, slot: usize) {
     if slot < STASH_SLOTS {
         s.stash_durable[slot] = 1;
+        stash_note_ready(s, slot);
     }
 }
 
@@ -208,7 +250,10 @@ pub fn init(s: &mut Correlate) {
     for i in 0..PENDING_DLV_SLOTS {
         s.dlv_active[i] = 0;
         s.dlv_len[i] = 0;
+        s.dlv_seq[i] = 0;
+        s.dlv_kind[i] = 0;
     }
+    s.dlv_next_seq = 0;
     for i in 0..PENDING_ACK_SLOTS {
         s.ack_active[i] = 0;
     }
@@ -219,7 +264,9 @@ pub fn init(s: &mut Correlate) {
         s.stash_dedup_state[i] = STASH_DEDUP_PENDING;
         s.stash_durable[i] = 0;
         s.stash_env_len[i] = 0;
+        s.stash_ready[i] = 0;
     }
+    s.stash_next_ready = 0;
 }
 
 /// Wipe every correlation and stash. Apply-derived state does not
@@ -366,13 +413,35 @@ pub fn dlv_alloc(s: &Correlate) -> Option<usize> {
     (0..PENDING_DLV_SLOTS).find(|&i| s.dlv_active[i] == 0)
 }
 
-/// Park a backpressured envelope: reserve a slot and store it in one
-/// step. False when the stash is full or the envelope does not fit, in
-/// which case the caller must account the drop.
-pub fn dlv_park(s: &mut Correlate, env: &[u8]) -> bool {
+/// Park a backpressured envelope of `kind` (where it came from): reserve a
+/// slot and store it in one step. False when the stash is full or the
+/// envelope does not fit.
+pub fn dlv_park(s: &mut Correlate, env: &[u8], kind: u8) -> bool {
     match dlv_alloc(s) {
-        Some(slot) => dlv_store(s, slot, env),
+        Some(slot) => {
+            let stored = dlv_store(s, slot, env);
+            if stored {
+                s.dlv_kind[slot] = kind;
+            }
+            stored
+        }
         None => false,
+    }
+}
+
+/// Parked deliveries of `kind`.
+pub fn dlv_count_kind(s: &Correlate, kind: u8) -> usize {
+    (0..PENDING_DLV_SLOTS)
+        .filter(|&i| s.dlv_active[i] == 1 && s.dlv_kind[i] == kind)
+        .count()
+}
+
+/// Where the delivery parked in `slot` came from, as parked.
+pub fn dlv_kind(s: &Correlate, slot: usize) -> u8 {
+    if slot < PENDING_DLV_SLOTS {
+        s.dlv_kind[slot]
+    } else {
+        0
     }
 }
 
@@ -387,7 +456,37 @@ pub fn dlv_store(s: &mut Correlate, slot: usize, env: &[u8]) -> bool {
     }
     s.dlv_len[slot] = env.len() as u16;
     s.dlv_active[slot] = 1;
+    s.dlv_seq[slot] = s.dlv_next_seq;
+    s.dlv_next_seq = s.dlv_next_seq.wrapping_add(1);
     true
+}
+
+/// Park slots free.
+pub fn dlv_free_slots(s: &Correlate) -> usize {
+    (0..PENDING_DLV_SLOTS)
+        .filter(|&i| s.dlv_active[i] == 0)
+        .count()
+}
+
+/// The parked deliveries' slots into `out`, oldest first. Returns how
+/// many there are.
+pub fn dlv_order(s: &Correlate, out: &mut [usize; PENDING_DLV_SLOTS]) -> usize {
+    let mut n = 0;
+    for i in 0..PENDING_DLV_SLOTS {
+        if s.dlv_active[i] == 1 {
+            out[n] = i;
+            n += 1;
+        }
+    }
+    // Insertion sort: a handful of slots.
+    for k in 1..n {
+        let mut j = k;
+        while j > 0 && s.dlv_seq[out[j - 1]] > s.dlv_seq[out[j]] {
+            out.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    n
 }
 
 pub fn dlv_is_active(s: &Correlate, slot: usize) -> bool {
@@ -416,7 +515,7 @@ pub fn dlv_copy_out(s: &Correlate, slot: usize, dst: &mut [u8]) -> bool {
     true
 }
 
-pub fn dlv_free(s: &mut Correlate, slot: usize) {
+pub fn dlv_release(s: &mut Correlate, slot: usize) {
     if slot < PENDING_DLV_SLOTS {
         s.dlv_active[slot] = 0;
         s.dlv_len[slot] = 0;

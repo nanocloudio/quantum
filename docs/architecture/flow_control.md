@@ -106,6 +106,111 @@ dropped — MQTT packet ids are client-chosen, so slot and packet id alone
 would match a delayed completion against whichever client now holds the
 slot.
 
+## A session's in-flight table (`session_processor`)
+
+An MQTT session's QoS 1/2 flows share one in-flight table of 16: the
+client's publishes until they are answered, and the deliveries to it
+until it acknowledges them. A client may pipeline publishes past it, and
+MQTT 3.1.1 gives the broker no way to say so, so a publish that finds
+the table full while one of the session's own flows is still being
+committed — a QoS 1 or QoS 2 PUBLISH before its answer, a PUBREL before
+its PUBCOMP — waits whole on its codec input, as if still in the
+channel, until that commit frees or moves on a slot; the pressure
+reaches the client's TCP window instead of the publish being dropped.
+The input is not read past it meanwhile, so the other sessions on that
+input wait with it, for a commit. The deliveries leave half the table to
+the publishes, so a full table always holds one a commit will free,
+never only flows that wait on acknowledgements still behind the publish
+in the client's stream. Only a table held entirely by QoS 2 publishes
+awaiting their PUBREL drops the next one, counted as throttled.
+
+A delivery that cannot go yet waits where its reason says. One waiting
+on something shared that clears without any client — the codec edge,
+admission credit, its seat ring's horizon — is parked (8 slots), and the
+parked ones are retried oldest first: a session's later deliveries wait
+behind its earlier ones, so it receives them in the order they were
+published. One waiting on its own client — its flow credit, its receive
+maximum, its half of the in-flight table — joins its session's offline
+queue instead (`[sess] hb spill=`), with whatever the session has parked
+moved ahead of it; the session's later deliveries join the queue behind
+them, even while the queue's head is parked here as a drain's answers,
+and the queue is drained to the session in turn. So a client slow to
+acknowledge holds back only its own deliveries.
+
+`deliver_in` is read only while a park slot is free. Two of the eight
+are never credited to drains, whose answers may wait on a client, so a
+slot always frees without one. Meanwhile `topic_engine` holds its
+fan-out on the full edge rather than dropping
+([messaging_model.md](messaging_model.md#routing-record)).
+
+A QoS 1/2 publish reaches `topic_engine` from its stash once its dedup
+verdict and its durability are both in. Stashes are released in the
+order they became ready, which is commit order, and one the topic bus
+refuses holds back every stash behind it, so a subscriber receives a
+publisher's messages in the order they were published. The apply path
+reads a committed entry only with a stash slot free, so a stash is never
+refused; a slot frees on its verdict and the topic bus, never on a
+client.
+
+## The exchange with `messaging` (`session_processor`)
+
+Nothing either side asks of the other is asked twice, so nothing is
+dropped on a full edge in either direction, and neither direction waits
+on the other.
+
+- **Toward `messaging`.** Dedup checks and phases, retained writes and
+  reads, offline enqueues, releases and drains all go through one ordered
+  outbox: what the op edge refuses waits there, in order, and is written
+  as it has room. An input that files requests is read only while the
+  outbox has room for the most its next record can file, beyond the room
+  kept for what answers already credited may file: the apply path (a
+  committed entry's worth), the control-plane bus (a placement update may
+  release every session's queue) and `deliver_in` (a delivery joining its
+  session's queue, with what the session has parked).
+  Codec input files nothing toward `messaging` directly, so it is never
+  held for it.
+- **From `messaging`.** `messaging_in` is always read. It carries the
+  dedup verdicts committed publishes wait on, and `messaging` holds its
+  answers while they are not read, which would back up the op edge in
+  turn. So the deliveries it carries are bounded at the source: a
+  retained read or an offline drain carries a credit, `max`, and the
+  worker reserves room for that many before it asks. `messaging` answers
+  at most that many and ends with a marker (`MSG_RETAINED_READ_END` with
+  the entry to resume from, `MSG_OFFLINE_DRAINED` with how many are left),
+  and the worker asks again for the rest. A drain's answers are the oldest
+  of its session's queue and must reach it in order, so each is credited
+  a park slot. A retained read's answers may join an offline queue
+  instead, so reads share a fixed credit of 8, backed by outbox room for
+  that: a read finishes without any client acknowledging anything.
+- **Whose answer.** A read or a drain remembers the identity of the
+  session it was asked for, and each answer is checked against the
+  identity its slot holds when it arrives. An answer for a session that
+  has since been released, or whose slot a new session now holds, is
+  dropped, and its credit comes back; slots are reused, and an answer
+  asked for one session never reaches the next. A request `messaging`
+  cannot read past its session slot is answered with its end marker
+  alone, so no credit is ever stranded.
+- **Order behind a backlog.** While a session's offline queue drains — a
+  reconnect under `!clean_start`, a move's settle — its fresh deliveries
+  join the queue behind what is there, and the session receives the
+  backlog and then them, in order. The backlog clears once a drain finds
+  nothing left and nothing joined meanwhile.
+
+No wait closes a cycle, because nothing a commit waits on waits on a
+client. A codec input held for a commit waits on the apply path. The
+apply path waits on room in the outbox, on the topic and control-plane
+edges, on a free retained-read slot and on a free stash slot. The outbox
+drains whenever `messaging` reads its op edge, which needs only that its
+answers are read, and the worker always reads them. A read slot frees
+when its scan completes, which needs only read credit and outbox room. A
+stash frees on its verdict and the topic edge. The topic edge drains as
+`topic_engine` fans publishes out, and a fan-out held on a full deliver
+edge waits only for the worker to read `deliver_in`, which waits on
+outbox room and a free park slot; a slot not held by a drain's answer
+frees on something shared, or its delivery moves to its session's queue.
+Only drains' answers and offline queues wait on clients, and nothing
+waits on them but the deliveries to those clients.
+
 ## Backpressure translation (`flow`'s backpressure component)
 
 The operational observability surface for flow control. Tracks queue

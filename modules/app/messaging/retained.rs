@@ -10,9 +10,14 @@
 //! `on_read` handles ONE subscription filter per call ([`READ_BUDGET`] per
 //! step) and emits up to [`MAX_RETAINED`] responses for it — a wildcard
 //! SUBSCRIBE matches every retained entry on the filter, which MQTT 3.1.1
-//! §3.3.1.6 / MQTT 5 §3.3.1.5 both require.
+//! §3.3.1.6 / MQTT 5 §3.3.1.5 both require. A read answers at most the
+//! credit its request carries and says where its scan stopped, so the
+//! worker asks again for the rest; one the edge cuts short is owed
+//! (`hold::Owed::Read`) and answered on by [`read_from`] before the bus
+//! is read again.
 
 use super::abi::SyscallTable;
+use super::hold;
 use super::wire;
 
 /// Retained messages held per node.
@@ -28,6 +33,10 @@ use super::wire;
 const MAX_RETAINED: usize = 4096;
 const MAX_RETAINED_TOPIC: usize = 256;
 const MAX_RETAINED_PAYLOAD: usize = 1024;
+// A read carries any filter a topic may be stored under, and its end
+// says "done" as the wire does.
+const _: () =
+    assert!(MAX_RETAINED_TOPIC == hold::PATTERN_MAX && hold::READ_DONE == wire::RETAINED_READ_DONE);
 
 /// Scratch buffer cap, sized to hold the largest response envelope this
 /// component emits: 23-byte header + topic + payload.
@@ -231,45 +240,83 @@ pub fn on_write(r: &mut Retained, payload: &[u8], now: u64) {
 }
 
 /// MSG_RETAINED_READ request: `[tenant:u32 LE][session_slot:u32 LE]`
-/// `[sub_qos:u8][pattern_len:u16 LE][pattern_bytes]`.
-///
-/// Emits one MSG_RETAINED_READ response per matching entry:
+/// `[sub_qos:u8][pattern_len:u16 LE][pattern_bytes][from:u32 LE]`
+/// `[max:u16 LE]`: the read [`read_from`] answers — at most `max` matching
+/// entries, scanning from entry `from`, then MSG_RETAINED_READ_END. One
+/// that names its session but cannot be read is answered with the end
+/// alone, so the credit the worker reserved for it comes back.
+pub fn on_read(r: &mut Retained, payload: &[u8]) -> hold::Owed {
+    let plen = payload.len();
+    if plen < 8 {
+        return hold::Owed::None;
+    }
+    let tenant = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let session_slot = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let done = hold::Owed::Marker(hold::Marker::ReadEnd {
+        session: session_slot,
+        next: hold::READ_DONE,
+    });
+    if plen < 11 {
+        return done;
+    }
+    let sub_qos = payload[8];
+    let pattern_len = u16::from_le_bytes([payload[9], payload[10]]) as usize;
+    let tail = 11 + pattern_len;
+    if tail + 6 > plen || pattern_len > MAX_RETAINED_TOPIC {
+        return done;
+    }
+    let from = u32::from_le_bytes([
+        payload[tail],
+        payload[tail + 1],
+        payload[tail + 2],
+        payload[tail + 3],
+    ]);
+    let max = u16::from_le_bytes([payload[tail + 4], payload[tail + 5]]);
+    match hold::ReadCursor::new(tenant, session_slot, sub_qos, &payload[11..tail], from, max) {
+        Some(c) => {
+            r.reads = r.reads.wrapping_add(1);
+            hold::Owed::Read(c)
+        }
+        None => done,
+    }
+}
+
+/// Answer the read `c` from entry `c.next` on, one MSG_RETAINED_READ per
+/// matching entry:
 /// `[tenant:u32 LE][topic_hash:u64 LE][session_slot:u32 LE][sub_qos:u8]`
 /// `[topic_len:u16 LE][topic_bytes][payload_len:u32 LE][payload_bytes]`.
 /// The echoed `(session_slot, sub_qos)` lets the consumer attribute the
-/// delivery without a separate in-flight lookup table.
+/// delivery without a separate in-flight lookup table. `Some(next)` once
+/// `c.left` is spent (the entry to resume from) or every entry has been
+/// matched (`hold::READ_DONE`); `None` when `out_read` had no room, `c.next`
+/// at the answer it refused.
 ///
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-pub unsafe fn on_read(r: &mut Retained, sys: &SyscallTable, payload: &[u8]) {
-    let plen = payload.len();
-    if plen < 11 {
-        return;
+pub unsafe fn read_from(
+    r: &mut Retained,
+    sys: &SyscallTable,
+    c: &mut hold::ReadCursor,
+) -> Option<u32> {
+    if r.out_read < 0 {
+        return Some(hold::READ_DONE);
     }
-    let tenant = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let session_slot = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    let sub_qos = payload[8];
-    let pattern_len = u16::from_le_bytes([payload[9], payload[10]]) as usize;
-    if 11 + pattern_len > plen || pattern_len > MAX_RETAINED_TOPIC {
-        return;
-    }
-    // Stash the pattern in a stack buffer so `r.buf` is free as response
-    // scratch without overlapping borrows.
-    let mut pattern = [0u8; MAX_RETAINED_TOPIC];
-    // SAFETY: `pattern_len <= MAX_RETAINED_TOPIC` and `11 + pattern_len <= plen`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(payload.as_ptr().add(11), pattern.as_mut_ptr(), pattern_len);
-    }
-    r.reads = r.reads.wrapping_add(1);
-
-    for i in 0..MAX_RETAINED {
-        if r.entries[i].active == 0 || r.entries[i].tenant != tenant {
+    let pattern = c.pattern;
+    let pattern = &pattern[..usize::from(c.pattern_len)];
+    let mut i = c.next as usize;
+    while i < MAX_RETAINED {
+        if c.left == 0 {
+            return Some(i as u32);
+        }
+        if r.entries[i].active == 0 || r.entries[i].tenant != c.tenant {
+            i += 1;
             continue;
         }
         let entry_topic_len = r.entries[i].topic_len as usize;
         let entry_topic = &r.entries[i].topic[..entry_topic_len];
-        if !wire::mqtt_topic_match(&pattern[..pattern_len], entry_topic) {
+        if !wire::mqtt_topic_match(pattern, entry_topic) {
+            i += 1;
             continue;
         }
         let topic_hash = r.entries[i].topic_hash;
@@ -277,13 +324,14 @@ pub unsafe fn on_read(r: &mut Retained, sys: &SyscallTable, payload: &[u8]) {
         let payload_len = r.entries[i].payload_len as usize;
         let total = 17 + 2 + topic_len + 4 + payload_len;
         if total > r.buf.len() {
+            i += 1;
             continue;
         }
 
-        r.buf[0..4].copy_from_slice(&tenant.to_le_bytes());
+        r.buf[0..4].copy_from_slice(&c.tenant.to_le_bytes());
         r.buf[4..12].copy_from_slice(&topic_hash.to_le_bytes());
-        r.buf[12..16].copy_from_slice(&session_slot.to_le_bytes());
-        r.buf[16] = sub_qos;
+        r.buf[12..16].copy_from_slice(&c.session_slot.to_le_bytes());
+        r.buf[16] = c.sub_qos;
         r.buf[17..19].copy_from_slice(&(topic_len as u16).to_le_bytes());
         let payload_len_off = 19 + topic_len;
         // SAFETY: `total <= r.buf.len()` checked above bounds every write.
@@ -305,24 +353,30 @@ pub unsafe fn on_read(r: &mut Retained, sys: &SyscallTable, payload: &[u8]) {
             );
         }
 
-        if r.out_read >= 0 {
-            // SAFETY: caller guarantees `sys` is live.
-            unsafe {
-                let poll_out = (sys.channel_poll)(r.out_read, 0x02);
-                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    wire::channel_write_msg(
-                        sys,
-                        r.out_read,
-                        wire::MSG_RETAINED_READ,
-                        &r.buf[..total],
-                    );
-                    r.hits = r.hits.wrapping_add(1);
-                }
-            }
+        // SAFETY: caller guarantees `sys` is live.
+        let written = unsafe {
+            let poll_out = (sys.channel_poll)(r.out_read, 0x02);
+            poll_out > 0
+                && (poll_out as u32 & 0x02) != 0
+                && wire::channel_write_msg(
+                    sys,
+                    r.out_read,
+                    wire::MSG_RETAINED_READ,
+                    &r.buf[..total],
+                ) > 0
+        };
+        if !written {
+            c.next = i as u32;
+            return None;
         }
+        r.hits = r.hits.wrapping_add(1);
+        c.left -= 1;
         // Keep iterating — a wildcard subscription matches every
         // retained entry on the filter.
+        i += 1;
+        c.next = i as u32;
     }
+    Some(hold::READ_DONE)
 }
 
 /// Fill the component's metric payload. Returns the byte count.

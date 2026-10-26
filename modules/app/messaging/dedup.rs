@@ -13,6 +13,7 @@
 //! once per `gc_interval_ms`.
 
 use super::abi::SyscallTable;
+use super::hold;
 use super::wire;
 
 const SHARD_COUNT: usize = 16;
@@ -130,22 +131,19 @@ pub fn on_reset(d: &mut Dedup) {
 }
 
 /// MSG_DEDUP_CHECK: `[dedup_key(20)]` or `[dedup_key(20)][phase:u8]`.
-/// Emits MSG_DEDUP_RESULT `[dedup_key(20)][duplicate:u8][phase:u8]` on
-/// `out_result`, where `phase` is the entry's stored QoS 2 state after
-/// this check.
+/// Returns the MSG_DEDUP_RESULT `[dedup_key(20)][duplicate:u8][phase:u8]`
+/// to answer it with ([`write_verdict`]), where `phase` is the entry's
+/// stored QoS 2 state after this check; `None` for a payload too short to
+/// carry a key.
 ///
 /// A check carrying a phase records it on the entry — creating the
 /// entry if this is the first sight of the key — and never moves the
 /// stored phase backwards, so the apply path may replay a committed
 /// QoS 2 transition on any node without inventing progress. A check
 /// without the field leaves the stored phase as it was.
-///
-/// # Safety
-///
-/// `sys` must point at a live kernel syscall table.
-pub unsafe fn on_check(d: &mut Dedup, sys: &SyscallTable, payload: &[u8], now: u64) {
+pub fn on_check(d: &mut Dedup, payload: &[u8], now: u64) -> Option<[u8; hold::VERDICT_LEN]> {
     if payload.len() < wire::DEDUP_KEY_LEN {
-        return;
+        return None;
     }
     let (tenant, stream_hash, epoch, msg_id) = wire::decode_dedup_key(payload);
     let in_phase = wire::decode_dedup_phase(payload);
@@ -228,7 +226,7 @@ pub unsafe fn on_check(d: &mut Dedup, sys: &SyscallTable, payload: &[u8], now: u
         stored_phase = in_phase;
     }
 
-    let mut r = [0u8; 22];
+    let mut r = [0u8; hold::VERDICT_LEN];
     r[..wire::DEDUP_KEY_LEN].copy_from_slice(&payload[..wire::DEDUP_KEY_LEN]);
     r[20] = if duplicate {
         DEDUP_VERDICT_DUPLICATE
@@ -236,23 +234,26 @@ pub unsafe fn on_check(d: &mut Dedup, sys: &SyscallTable, payload: &[u8], now: u
         DEDUP_VERDICT_NEW
     };
     r[21] = stored_phase;
-    emit_result(d, sys, &r);
+    Some(r)
 }
 
-/// Write one MSG_DEDUP_RESULT.
+/// Write one MSG_DEDUP_RESULT on `out_result`. `false` when the edge has
+/// no room for it: the caller holds the verdict and writes it again
+/// (`hold::BusHold`), since the stash it resolves waits on it and it is
+/// never asked for twice. With no edge wired there is no one to answer.
 ///
 /// # Safety
 /// `sys` must point at a live kernel syscall table.
-unsafe fn emit_result(d: &Dedup, sys: &SyscallTable, r: &[u8; 22]) {
+pub unsafe fn write_verdict(d: &Dedup, sys: &SyscallTable, r: &[u8; hold::VERDICT_LEN]) -> bool {
     if d.out_result < 0 {
-        return;
+        return true;
     }
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
         let poll_out = (sys.channel_poll)(d.out_result, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-            wire::channel_write_msg(sys, d.out_result, wire::MSG_DEDUP_RESULT, r);
-        }
+        poll_out > 0
+            && (poll_out as u32 & 0x02) != 0
+            && wire::channel_write_msg(sys, d.out_result, wire::MSG_DEDUP_RESULT, r) > 0
     }
 }
 

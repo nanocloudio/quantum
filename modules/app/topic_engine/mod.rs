@@ -194,10 +194,11 @@ struct ModuleState {
     subs_count: u32,
     publishes: u32,
     deliveries: u32,
-    /// Count of subscriber deliveries that the downstream channel
-    /// rejected (full ring). Without this, the silent-skip would mask
-    /// post-durability subscriber-side data loss.
-    deliveries_failed: u32,
+    /// A publish whose fan-out a full deliver edge stopped, resumed at the
+    /// subscription it stopped on before anything more is read.
+    fanout: Fanout,
+    /// Fan-outs a full deliver edge stopped (each counted once).
+    fanouts_held: u32,
     shared_deliveries: u32,
     last_emit_index: u64,
     last_metrics_ms: u64,
@@ -208,6 +209,51 @@ struct ModuleState {
     // the channel_read_msg discard path.
     buf: [u8; MAX_TOPIC_MSG],
     out_buf: [u8; MAX_TOPIC_MSG],
+    /// Placement frames, read apart from `buf`, which holds a publish
+    /// whose fan-out is still owed.
+    routing_buf: [u8; MAX_TOPIC_MSG],
+}
+
+/// A publish's fan-out, as far as it has gone: the publish is the
+/// `MSG_TOPIC_PUBLISH` body in `buf[..plen]`. The exact chain is walked,
+/// then the tenant's wildcard chain; `cur` is the next subscription to
+/// match. The subscription index cannot change while one is owed — the
+/// ops that change it come on the input that is not read meanwhile — so
+/// the walk resumes exactly where it stopped.
+#[derive(Clone, Copy)]
+struct Fanout {
+    owed: bool,
+    plen: usize,
+    tenant: u32,
+    pub_qos: u8,
+    topic_hash: u64,
+    wild: bool,
+    cur: Link,
+    shared_delivered: [bool; MAX_SHARED_GROUPS],
+}
+
+impl Fanout {
+    const fn none() -> Self {
+        Self {
+            owed: false,
+            plen: 0,
+            tenant: 0,
+            pub_qos: 0,
+            topic_hash: 0,
+            wild: false,
+            cur: 0,
+            shared_delivered: [false; MAX_SHARED_GROUPS],
+        }
+    }
+}
+
+/// What one matched subscription's delivery came to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Delivered {
+    /// Written, or owed nothing on this node.
+    Done,
+    /// The deliver edge is full: offer it again.
+    Full,
 }
 
 // `Subscription` is 280 B, so the 16384 slots are ~4.4 MiB; the index
@@ -407,7 +453,7 @@ unsafe fn drain_routing(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
     for _ in 0..4 {
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_routing, &mut s.buf);
+        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_routing, &mut s.routing_buf);
         if msg_type == 0 && plen == 0 {
             break;
         }
@@ -416,7 +462,7 @@ unsafe fn drain_routing(s: &mut ModuleState, sys: &SyscallTable) {
         // ownership, so both must apply the map, and through the SAME
         // core parser rather than a second one that could drift.
         if msg_type == wire::MSG_SHARD_MAP_UPDATE {
-            if edge::apply_shard_map_update(&mut s.view.overrides, &s.buf[..plen as usize])
+            if edge::apply_shard_map_update(&mut s.view.overrides, &s.routing_buf[..plen as usize])
                 == edge::PlacementUpdate::Stale
             {
                 s.routing_stale = s.routing_stale.wrapping_add(1);
@@ -433,7 +479,7 @@ unsafe fn drain_routing(s: &mut ModuleState, sys: &SyscallTable) {
         // Parsing, the monotone epoch gate and the optional tails all
         // live in the core, so `session_processor` reads the same frame
         // the same way rather than growing a second parser.
-        match edge::apply_placement_update(&mut s.view.view, &s.buf[..pl]) {
+        match edge::apply_placement_update(&mut s.view.view, &s.routing_buf[..pl]) {
             edge::PlacementUpdate::Applied => {}
             edge::PlacementUpdate::Stale => {
                 s.routing_stale = s.routing_stale.wrapping_add(1);
@@ -477,7 +523,8 @@ fn is_wildcard(pattern: &[u8]) -> bool {
 /// The publish is the `MSG_TOPIC_PUBLISH` body in `s.buf[..plen]`,
 /// with its topic at `s.buf[8..8 + topic_len]`. Shared-group election
 /// runs first: at most one member per group receives a given publish,
-/// tracked in `shared_delivered` across every match of that publish.
+/// tracked in `shared_delivered` across every match of that publish, and
+/// marked only once the chosen member's delivery is written.
 ///
 /// # Safety
 ///
@@ -495,8 +542,9 @@ unsafe fn deliver_match(
     plen: usize,
     topic_hash: u64,
     shared_delivered: &mut [bool; MAX_SHARED_GROUPS],
-) {
+) -> Delivered {
     // Shared subscription: deliver to exactly one member per group
+    let mut group = None;
     if s.subs[i].shared_group_id != 0 {
         let mut g_idx: Option<usize> = None;
         for g in 0..MAX_SHARED_GROUPS {
@@ -510,19 +558,18 @@ unsafe fn deliver_match(
         }
         if let Some(g) = g_idx {
             if shared_delivered[g] {
-                return;
+                return Delivered::Done;
             }
             let mc = s.shared[g].member_count;
             if mc == 0 {
-                return;
+                return Delivered::Done;
             }
             let pick = shared_member_index(topic_hash, s.last_emit_index, mc, s.shared_hash_seed);
             let chosen = s.shared[g].member_slots[pick as usize];
             if chosen != s.subs[i].session_slot {
-                return;
+                return Delivered::Done;
             }
-            shared_delivered[g] = true;
-            s.shared_deliveries = s.shared_deliveries.wrapping_add(1);
+            group = Some(g);
         }
     }
 
@@ -544,7 +591,7 @@ unsafe fn deliver_match(
     // A wildcard subscription still records `local_prg` and a local
     // session, so it is unaffected.
     if s.subs[i].session_slot == SESSION_SLOT_REMOTE {
-        return;
+        return Delivered::Done;
     }
     // Envelope to session_processor:
     //   [session_slot:u32][sub_qos:u8][_pad:u8;3]
@@ -557,7 +604,7 @@ unsafe fn deliver_match(
     let downstream_payload_len = plen - 2;
     let total = 8 + downstream_payload_len;
     if total > s.out_buf.len() {
-        return;
+        return Delivered::Done;
     }
     s.out_buf[0..4].copy_from_slice(&s.subs[i].session_slot.to_le_bytes());
     s.out_buf[4] = effective_qos;
@@ -572,21 +619,78 @@ unsafe fn deliver_match(
     } else {
         s.out_deliver
     };
-    if out_chan >= 0 {
-        // Skip the pre-write channel_poll: it races with the downstream
-        // drain and silently drops deliveries when poll says full but
-        // write would have succeeded. Use the write result directly;
-        // failure here counts as a real backpressure event the operator
-        // should see.
-        let written =
-            wire::channel_write_msg(sys, out_chan, wire::MSG_TOPIC_DELIVER, &s.out_buf[..total]);
-        let expected = (wire::ENVELOPE_HDR + total) as i32;
-        if written == expected {
-            s.deliveries = s.deliveries.wrapping_add(1);
-            dev_log(sys, 3, b"[topic] DELIVER".as_ptr(), 15);
-        } else {
-            s.deliveries_failed = s.deliveries_failed.wrapping_add(1);
+    if out_chan < 0 {
+        return Delivered::Done;
+    }
+    // A delivery is committed state: the publish was acknowledged when it
+    // committed, so a full edge holds the fan-out here, to be offered
+    // again, rather than losing the subscriber's copy. The write is all
+    // or nothing, so its result is the edge's answer.
+    let written =
+        wire::channel_write_msg(sys, out_chan, wire::MSG_TOPIC_DELIVER, &s.out_buf[..total]);
+    if written != (wire::ENVELOPE_HDR + total) as i32 {
+        return Delivered::Full;
+    }
+    if let Some(g) = group {
+        shared_delivered[g] = true;
+        s.shared_deliveries = s.shared_deliveries.wrapping_add(1);
+    }
+    s.deliveries = s.deliveries.wrapping_add(1);
+    dev_log(sys, 3, b"[topic] DELIVER".as_ptr(), 15);
+    Delivered::Done
+}
+
+/// Walk the owed fan-out (`s.fanout`) on from where it stopped. `true`
+/// once every matching subscription has its delivery; `false` when the
+/// deliver edge filled, the walk kept at the subscription it refused.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn fan_out(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let mut f = s.fanout;
+    let topic_len = u16::from_le_bytes([s.buf[6], s.buf[7]]) as usize;
+    loop {
+        if f.cur == 0 {
+            if f.wild {
+                s.fanout = Fanout::none();
+                return true;
+            }
+            // Exact subscriptions done: the tenant's wildcard chain.
+            f.wild = true;
+            f.cur = s.wild_head[wild_bucket(f.tenant)];
+            continue;
         }
+        let i = f.cur as usize - 1;
+        let sub = &s.subs[i];
+        let matches = sub.tenant == f.tenant
+            && if f.wild {
+                wire::mqtt_topic_match(
+                    &sub.pattern[..sub.pattern_len as usize],
+                    &s.buf[8..8 + topic_len],
+                )
+            } else {
+                // An exact pattern matches by byte equality and nothing
+                // else; the bucket hash is only a hint.
+                sub.pattern_len as usize == topic_len
+                    && sub.pattern[..topic_len] == s.buf[8..8 + topic_len]
+            };
+        if matches
+            && deliver_match(
+                s,
+                sys,
+                i,
+                f.tenant,
+                f.pub_qos,
+                f.plen,
+                f.topic_hash,
+                &mut f.shared_delivered,
+            ) == Delivered::Full
+        {
+            s.fanout = f;
+            return false;
+        }
+        f.cur = s.next[i];
     }
 }
 
@@ -646,6 +750,8 @@ pub unsafe extern "C" fn module_new(
         s.routing_stale = 0;
         s.in_routing = dev_channel_port(sys, 0, 1);
         s.shared_hash_seed = 0x51_EC_A5_E1; // versioned
+        s.fanout = Fanout::none();
+        s.fanouts_held = 0;
         for i in 0..MAX_SUBS {
             s.subs[i] = Subscription::zero();
         }
@@ -680,7 +786,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // Drain op channel — SUBSCRIBE, UNSUBSCRIBE and PUBLISH come on the
         // same port, demuxed by msg_type. This matches
         // session_processor.topic_out → topic_engine.op_in.
-        if s.in_op >= 0 {
+        // A fan-out the deliver edge stopped goes on first; the op input
+        // is read only once it has gone, so publishes reach each
+        // subscriber in order and the index it walks stays as it was.
+        if s.in_op >= 0 && (!s.fanout.owed || fan_out(s, sys)) {
             for _ in 0..16 {
                 let poll = (sys.channel_poll)(s.in_op, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
@@ -900,68 +1009,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         continue;
                     }
 
-                    // Deliver to matching local subscribers, track shared group exclusivity
-                    let mut shared_delivered = [false; MAX_SHARED_GROUPS];
-                    let mut match_count = 0u32;
-
-                    // Exact subscriptions: the one bucket for (tenant,
-                    // topic). An exact pattern matches by byte equality
-                    // and nothing else, which is what a hash lookup
-                    // answers — but the hash is a hint, so tenant and
-                    // bytes are compared on every chain entry.
-                    let mut cur = s.exact_head[exact_bucket(tenant, topic_hash)];
-                    while cur != 0 {
-                        let i = cur as usize - 1;
-                        cur = s.next[i];
-                        let sub = &s.subs[i];
-                        if sub.tenant != tenant
-                            || sub.pattern_len as usize != topic_len
-                            || sub.pattern[..topic_len] != s.buf[8..8 + topic_len]
-                        {
-                            continue;
-                        }
-                        match_count += 1;
-                        deliver_match(
-                            s,
-                            sys,
-                            i,
-                            tenant,
-                            pub_qos,
-                            plen,
-                            topic_hash,
-                            &mut shared_delivered,
-                        );
-                    }
-
-                    // Wildcard subscriptions: the tenant's chain, each
-                    // entry through the full matcher.
-                    let mut cur = s.wild_head[wild_bucket(tenant)];
-                    while cur != 0 {
-                        let i = cur as usize - 1;
-                        cur = s.next[i];
-                        let sub = &s.subs[i];
-                        if sub.tenant != tenant {
-                            continue;
-                        }
-                        let pat = &sub.pattern[..sub.pattern_len as usize];
-                        if !wire::mqtt_topic_match(pat, &s.buf[8..8 + topic_len]) {
-                            continue;
-                        }
-                        match_count += 1;
-                        deliver_match(
-                            s,
-                            sys,
-                            i,
-                            tenant,
-                            pub_qos,
-                            plen,
-                            topic_hash,
-                            &mut shared_delivered,
-                        );
-                    }
-
-                    if match_count == 0 {
-                        dev_log(sys, 3, b"[topic] no match".as_ptr(), 16);
+                    // Deliver to the matching subscriptions: the exact
+                    // bucket for (tenant, topic), then the tenant's
+                    // wildcard chain. A full deliver edge holds the
+                    // fan-out, and nothing more is read until it goes.
+                    s.fanout = Fanout {
+                        owed: true,
+                        plen,
+                        tenant,
+                        pub_qos,
+                        topic_hash,
+                        wild: false,
+                        cur: s.exact_head[exact_bucket(tenant, topic_hash)],
+                        shared_delivered: [false; MAX_SHARED_GROUPS],
+                    };
+                    if !fan_out(s, sys) {
+                        s.fanouts_held = s.fanouts_held.wrapping_add(1);
+                        break;
                     }
 
                     // end MSG_TOPIC_PUBLISH branch
