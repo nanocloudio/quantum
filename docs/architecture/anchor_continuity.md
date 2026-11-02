@@ -16,9 +16,9 @@ behind an anchor that stays. This document is the other direction: the
 ingress host under the anchor is replaced — a paired-anchor takeover,
 planned or after the primary host loses power — while the worker stays,
 and, for a whole site, a session resumed at a surviving site. It is
-Quantum's half of Wormhole's transport continuity: the transport
-(TCP/TLS, mirrored to a standby host by Fluxor's providers and Wormhole's
-paired anchors) moves the client's connection; Quantum makes sure the
+Quantum's half of a traffic fabric's transport continuity: the transport
+(TCP/TLS, mirrored to a standby host by Fluxor's providers and a
+paired-anchor controller) moves the client's connection; Quantum makes sure the
 MQTT session on it neither repeats nor loses work.
 
 The modules run it. `quantum_mqtt_anchor` with `continuity: 1` attaches
@@ -46,7 +46,7 @@ session, from 1, and hands each to the anchor in the production envelope
 A production counts as GIVEN — the PUBACK, PUBREC or SUBACK the client is
 owed has been answered — only once it is inside the transport's
 **mirrored output horizon**: the standby host holds every byte of it, so
-the primary's loss cannot take it. That is Wormhole's RPO-zero rule, and
+the primary's loss cannot take it. That is the paired anchors' RPO-zero rule, and
 it is the anchor's to enforce, because the anchor is what hands
 responses to the transport.
 
@@ -290,7 +290,7 @@ site's log holds.
 |---|---|
 | `continuity` (param 14) | 1: attach as `CC_TRANSPORT_MIGRATABLE`, gate productions, acknowledge consumed input, export and import `QAC1`. |
 | `state_out` (out[7]) | `MSG_ANCHOR_QAC [QAC1][peer_family][peer_addr:16][peer_port]` — at attachment, at every binding change, and on `cmd_in` `MSG_ANCHOR_QAC [session_id]` (a planned cut asks after its quiesce); `MSG_ANCHOR_QAC_RETIRE [session_id]` when the connection closes. |
-| `state_in` (in[7]) | the paired anchor's `state_out`, carried by the transport's pairing (Wormhole's `transport_mirror`, `state_out` → `state_in`): its records, staged for a takeover. |
+| `state_in` (in[7]) | the paired anchor's `state_out`, carried by the transport's pairing (the paired-anchor controller's `transport_mirror`, `state_out` → `state_in`): its records, staged for a takeover. |
 | `raw_in` `MSG_CLIENT_PEER` / `MSG_CLIENT_RESUMED` / `MSG_CLIENT_HORIZON` | a connection's client, a connection a takeover moved here with the transport's cursors, and its output horizon (Clustor's `peer_router` with `forward_peer: 1` relays Fluxor's `MSG_PEER`, `MSG_RESUMED` and `MSG_HORIZON`). |
 | `out_frames` `MSG_CLIENT_DELIVERED` | `[conn_id][consumer_cursor:u64][in_bytes:u64]`, in order with the connection's output: what its worker has consumed (relayed as `CMD_DELIVERED`; the transport runs `delivery_ack: 1`). |
 
@@ -434,7 +434,7 @@ book could not hold, or an owed delivery the ledger had no room for).
 Every request gets one answer or the other. A parked session has no
 attachment to export: its state is in the committed log, which the
 surviving site resumes it from. The carrier across
-sites is the deployment's (Wormhole's site-loss flow); the import is
+sites is the deployment's (the traffic fabric's site-loss flow); the import is
 `site_admit`.
 
 **Heartbeats.** Under continuity the anchor adds `[anchor] cont given=
@@ -499,19 +499,19 @@ pongheld= siteout= siteref= consumed=`.
   and out-of-place flags or Will bytes are refused; the subscription book
   follows the committed entries, tracks lost sessions one by one, and
   carries a session's subscriptions across a move between workers.
-- Wormhole's `transport_continuity` and `continuity_cores` suites run the
+- The paired-anchor controller's `transport_continuity` and `continuity_cores` suites run the
   re-anchor exchange and the horizon gate through planned and crash
   takeovers over these cores, and its `site_loss` suite resumes sessions
   at the surviving region with `site_admit`.
 
 `examples/paired_anchor/quantum_host.yaml` (each ingress host: Fluxor's
-`ip` and `tls` with `write_horizon` and `delivery_ack` under Wormhole's
-paired anchor and mirror, Clustor's `peer_router` with `forward_peer`,
+`ip` and `tls` with `write_horizon` and `delivery_ack` under the
+paired-anchor controller's anchor and mirror, Clustor's `peer_router` with `forward_peer`,
 the anchor with `continuity: 1`, its records on the mirror and its seam
 on a `remote_channel` to the worker host) and
 `examples/paired_anchor/quantum_worker.yaml` (one `session_processor`
 over a single-node substrate, an anchor seam per ingress host) compose
 the modules end to end; `tests/host/mqtt_peer.py` is the MQTT-over-TLS
 client that counts what the broker owes it — every acknowledgement and
-delivery once, in order — for Wormhole's paired-anchor rig to drive
+delivery once, in order — for the paired-anchor controller's rig to drive
 through planned and crash takeovers.

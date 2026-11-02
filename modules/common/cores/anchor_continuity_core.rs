@@ -4,7 +4,7 @@
 // stays connected and the session worker behind it stays where it is.
 // `include!`d AFTER `mqtt_anchor_core.rs`, in the same module: it names
 // `AnchorConn`, `Phase`, `SESSION_ID_LEN` and `CONN_ID_LEN` by bare name.
-// The host test crate and the Wormhole continuity harness mount it that
+// The host test crate and a paired-anchor controller's continuity harness mount it that
 // way; see docs/architecture/anchor_continuity.md.
 //
 // `quantum_mqtt_anchor` runs it under `continuity: 1` and
@@ -49,7 +49,7 @@
 // anchor reports it inside the transport's MIRRORED OUTPUT HORIZON
 // (`MSG_ANCHOR_HORIZON`): the highest production id the standby holds.
 // Only then does a PUBACK / PUBREC / SUBACK count as given — the RPO-zero
-// rule of Wormhole's paired anchors: a response keeps its production id
+// rule of the paired anchors: a response keeps its production id
 // until the mirrored output horizon accepts it.
 // The hook is [`OutputHorizon`]: the anchor submits a production to it
 // and reads back `accepted_through`. The transport's is

@@ -5,7 +5,7 @@
 // `session_identity_core.rs`, in the same module: it names `HandoffTail`,
 // `cursor_verdict`, `CursorVerdict`, `DELIVER_BODY_MAX` and
 // `SESSION_ID_LEN` by bare name.
-// The host test crate and the Wormhole site-loss harness mount it that
+// The host test crate and a traffic fabric's site-loss harness mount it that
 // way; see docs/architecture/anchor_continuity.md.
 //
 // `session_processor` exports it on `MSG_SITE_EXPORT` (its `site.rs`) to
