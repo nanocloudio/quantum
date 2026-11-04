@@ -187,8 +187,9 @@ wiring:
   - from: consensus.committed_entries
     to: session_processor.committed_in
 
-  # Flow composite: ack / backpressure / prefetch
-  - from: durability.quorum_durable
+  # Flow composite: ack / backpressure / prefetch. The ack component
+  # reads the COMMIT horizon (not the ledger's quorum-durable proof).
+  - from: consensus.durable_horizon
     to: flow.durability_in
   - from: session_processor.forward_out
     to: flow.forward_in

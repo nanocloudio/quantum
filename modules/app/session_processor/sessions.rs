@@ -44,6 +44,10 @@ pub struct Inflight {
     /// current value. 0 for slots opened before any publish named one.
     session_generation: SessionGeneration,
     wal_index: u64,
+    /// The term `wal_index`'s entry was appended in (MSG_PROPOSAL_ASSIGNED):
+    /// an index names an entry only with its term, so an imported flow
+    /// re-registers both and `flow` acks only that entry.
+    wal_term: u64,
     /// Raft correlation_id for the proposal that owns this slot (QoS 1+
     /// only; 0 for QoS 0 and subscriber-side slots). Used to look up the
     /// stashed topic-publish envelope on durability and to re-emit the
@@ -68,6 +72,7 @@ impl Inflight {
             phase: 0,
             session_generation: 0,
             wal_index: 0,
+            wal_term: 0,
             correlation_id: 0,
             partition_id: 0,
             direction: 0,
@@ -214,6 +219,7 @@ impl Session {
                     phase: if qos == 2 { QOS2_PUBLISH } else { 0 },
                     session_generation: 0,
                     wal_index: 0,
+                    wal_term: 0,
                     correlation_id: 0,
                     partition_id: 0,
                     direction,
@@ -1158,6 +1164,7 @@ pub fn release_foreign(
 //   [inflight_count:1] then per entry
 //     [packet_id:2][qos:1][phase:1][direction:1][generation:4]
 //     [wal_index:8][correlation_id:8][partition_id:2][rec_sent:1]
+//     [wal_term:8]
 //   [book_len:2][book section]  — `SiteSubBook::export_section`
 //   then the handoff tail (`session_replay_core`): the delivery-id
 //   high-water and the per-partition apply cursor the state reflects
@@ -1172,7 +1179,9 @@ const RECORD_MAGIC: [u8; 4] = *b"QSR2";
 const RECORD_IDENTITY: usize = 4 + 4 + 8 + 4 + 4;
 const RECORD_FIXED: usize =
     RECORD_IDENTITY + 4 + 1 + 1 + 1 + 4 + 4 + 4 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 4 + 2 + 2 + 1;
-const INFLIGHT_RECORD: usize = 2 + 1 + 1 + 1 + 4 + 8 + 8 + 2 + 1;
+const INFLIGHT_RECORD: usize = 2 + 1 + 1 + 1 + 4 + 8 + 8 + 2 + 1 + 8;
+// The site record carries the in-flight ledger in this same layout.
+const _: () = assert!(INFLIGHT_RECORD == super::site_core::SITE_INFLIGHT_LEN);
 /// Largest handoff record a session can export.
 pub const RECORD_MAX: usize = RECORD_FIXED
     + MAX_WILL_TOPIC
@@ -1241,6 +1250,7 @@ pub fn export_record(
         put(&e.correlation_id.to_le_bytes(), &mut p);
         put(&e.partition_id.to_le_bytes(), &mut p);
         put(&[e.rec_sent], &mut p);
+        put(&e.wal_term.to_le_bytes(), &mut p);
         n += 1;
     }
     if tail.len() > super::replay::TAIL_MAX || book.len() > super::site_core::SITE_BOOK_SECTION_MAX
@@ -1409,6 +1419,8 @@ pub fn import_record(
         c.copy_from_slice(&b[17..25]);
         let partition_id = u16::from_le_bytes([b[25], b[26]]);
         let rec_sent = b[27];
+        let mut t = [0u8; 8];
+        t.copy_from_slice(&b[28..36]);
         x.inflight[i] = Inflight {
             packet_id: u16::from_le_bytes([b[0], b[1]]),
             qos: b[2],
@@ -1416,6 +1428,7 @@ pub fn import_record(
             direction: b[4],
             session_generation: u32::from_le_bytes([b[5], b[6], b[7], b[8]]),
             wal_index: u64::from_le_bytes(w),
+            wal_term: u64::from_le_bytes(t),
             correlation_id: u64::from_le_bytes(c),
             partition_id,
             rec_sent,
@@ -1458,6 +1471,7 @@ pub fn inflight_entries(
                 phase: e.phase,
                 session_generation: e.session_generation,
                 wal_index: e.wal_index,
+                wal_term: e.wal_term,
                 correlation_id: e.correlation_id,
                 partition_id: e.partition_id,
                 rec_sent: e.rec_sent == 1,
@@ -1599,6 +1613,7 @@ pub struct InflightView {
     pub session_generation: SessionGeneration,
     pub correlation_id: u64,
     pub wal_index: u64,
+    pub wal_term: u64,
 }
 
 impl InflightView {
@@ -1614,6 +1629,7 @@ impl InflightView {
             session_generation: 0,
             correlation_id: 0,
             wal_index: 0,
+            wal_term: 0,
         }
     }
 }
@@ -1637,6 +1653,7 @@ pub fn inflight_view(s: &Sessions, si: usize, ii: usize) -> Option<InflightView>
         session_generation: e.session_generation,
         correlation_id: e.correlation_id,
         wal_index: e.wal_index,
+        wal_term: e.wal_term,
     })
 }
 
@@ -1688,16 +1705,21 @@ pub fn inflight_set_correlation(s: &mut Sessions, si: usize, ii: usize, cid: u64
     }
 }
 
+/// Stamp the entry the flow's proposal was assigned: `(partition_id,
+/// wal_index, wal_term)`, or all zero for a flow awaiting its next
+/// assignment.
 pub fn inflight_set_wal_index(
     s: &mut Sessions,
     si: usize,
     ii: usize,
     partition_id: u16,
     wal_index: u64,
+    wal_term: u64,
 ) {
     if si < MAX_SESSIONS && ii < MAX_INFLIGHT_PER_SESSION {
         s.slots[si].inflight[ii].partition_id = partition_id;
         s.slots[si].inflight[ii].wal_index = wal_index;
+        s.slots[si].inflight[ii].wal_term = wal_term;
     }
 }
 
@@ -1825,6 +1847,7 @@ pub fn fill_site(s: &Sessions, si: usize, r: &mut super::site_core::SiteSession)
             correlation_id: e.correlation_id,
             partition_id: e.partition_id,
             rec_sent: e.rec_sent,
+            wal_term: e.wal_term,
         };
         n += 1;
     }

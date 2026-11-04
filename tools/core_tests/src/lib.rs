@@ -208,6 +208,46 @@ pub mod inflight_gate {
     include!("../../../modules/common/cores/inflight_gate_core.rs");
 }
 
+/// What Clustor's refusal of a tagged proposal means for the operation
+/// waiting on it: the decode, and each protocol's answer.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod proposal_refusal {
+    include!("../../../modules/common/cores/proposal_refusal_core.rs");
+}
+
+/// Whether the entry a durable publish was assigned is the one committed
+/// at its index: `flow`'s resolver, `session_processor`'s applied-run
+/// tracker, and the bodies between them.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod ack_term {
+    include!("../../../modules/common/cores/ack_term_core.rs");
+}
+
+/// The order a Kafka connection's responses leave in: request order,
+/// whichever component answers each and whenever.
+#[allow(
+    clippy::all,
+    clippy::pedantic,
+    reason = "compiles a no_std PIC core verbatim into a host test crate; \
+              `fluxor ci` lints `modules/**` against the module build, not \
+              against this test-shaped package"
+)]
+pub mod kafka_order {
+    include!("../../../modules/common/cores/kafka_order_core.rs");
+}
+
 /// `messaging`'s offline queue: chunked envelopes, per-session FIFOs.
 #[allow(
     clippy::all,
@@ -274,6 +314,8 @@ pub mod subscribe_exchange;
 pub mod front_session;
 
 #[cfg(test)]
+mod ack_term_tests;
+#[cfg(test)]
 mod anchor_continuity_tests;
 #[cfg(test)]
 mod authority_tests;
@@ -294,6 +336,8 @@ mod kafka_log_tests;
 #[cfg(test)]
 mod kafka_metadata_tests;
 #[cfg(test)]
+mod kafka_order_tests;
+#[cfg(test)]
 mod messaging_flow_tests;
 #[cfg(test)]
 mod messaging_hold_tests;
@@ -303,6 +347,8 @@ mod mqtt_anchor_tests;
 mod offline_queue_tests;
 #[cfg(test)]
 mod production_seat_tests;
+#[cfg(test)]
+mod proposal_refusal_tests;
 #[cfg(test)]
 mod publish_exchange_tests;
 #[cfg(test)]

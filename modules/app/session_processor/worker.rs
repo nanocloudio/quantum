@@ -38,8 +38,16 @@
 //! [`QUIET_STEPS`] consecutive steps. A QoS 2 flow between PUBREC and
 //! PUBREL is such a point — the ledger records it durably and the
 //! record carries it; a flow whose PUBLISH is still in Raft is not, and
-//! the drain waits. Past the anchor's deadline it refuses the handoff
-//! and returns this worker to service.
+//! the drain waits. So does a connection this worker owes an answer it
+//! gives after its request — a Kafka Produce, OffsetCommit or cold
+//! Fetch, an AMQP confirm: the answer (correlation, its turn in the
+//! connection's request order, the partition outcome) lives only here,
+//! and the anchor fences this worker's output once the connection
+//! moves. Past the anchor's deadline it refuses the handoff and returns
+//! this worker to service, which then answers in turn. A coordinator
+//! call's answer (an OffsetCommit, a group or queue call: the state one
+//! worker owns for the pair) does not hold the drain: the coordinator
+//! gives it on its own path, wherever the connection is bound.
 //!
 //! ## Frozen sessions
 //!
@@ -666,10 +674,28 @@ fn quiescent(s: &ModuleState, conn_id: u16) -> bool {
     if b.quiet < QUIET_STEPS || !s.worker.seats.settled(conn_id) {
         return false;
     }
+    // A response still held for the bus is this worker's to write, and
+    // counts in the cursor the export carries only once written.
+    if super::reply_hold::holds_for(&s.hold, conn_id)
+        || super::reply_hold::owed(&s.disc_owed, conn_id).is_some()
+    {
+        return false;
+    }
+    // An answer decided later than its request (a Kafka Produce,
+    // OffsetCommit or cold Fetch, an AMQP confirm) is this worker's to
+    // give: nothing hands it to the importer, and the anchor fences
+    // what this worker emits once the connection moves. The anchor
+    // holds the connection's new requests while it drains, so these only
+    // finish; past the anchor's deadline the handoff is refused and this
+    // worker answers them in their turn.
+    if super::answer_deferred_for(s, conn_id) {
+        return false;
+    }
     match sessions::find_by_conn(&s.sessions, conn_id) {
         Some(si) => coherent(s, si),
-        // No MQTT session yet (a CONNECT is still in the anchor's
-        // hold, or the client never sent one): nothing to carry.
+        // No MQTT session (a CONNECT is still in the anchor's hold, the
+        // client never sent one, or it speaks Kafka or AMQP): nothing
+        // to carry once its deferred answers are out.
         None => true,
     }
 }
@@ -1138,7 +1164,7 @@ unsafe fn export(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16, now: u64
 /// Post-import work once RESUME admits the rebind: the session is live
 /// on this worker. Re-register every in-flight publish with `flow` (a
 /// completion the exporting worker dropped after its export is
-/// answered again from the durable mark) and drain what was parked
+/// answered again once its `(wal_index, wal_term)` resolves) and drain what was parked
 /// offline while the session was frozen.
 unsafe fn after_resume(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16, now: u64) {
     let slot = s.worker.bindings[usize::from(conn_id)].slot;
@@ -1167,12 +1193,14 @@ unsafe fn after_resume(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16, no
         if v.qos == 2 && v.phase == super::QOS2_PUBLISH && v.rec_sent {
             continue;
         }
-        let mut reg = [0u8; wire::ACK_REGISTER_LEN];
-        reg[0..4].copy_from_slice(&slot.to_le_bytes());
-        reg[4..8].copy_from_slice(&u32::from(v.packet_id).to_le_bytes());
-        reg[8..10].copy_from_slice(&v.partition_id.to_le_bytes());
-        reg[10..18].copy_from_slice(&v.wal_index.to_le_bytes());
-        reg[18..22].copy_from_slice(&gen.to_le_bytes());
+        let reg = super::term::encode_register(&super::term::Registration {
+            session_slot: slot,
+            message_id: u32::from(v.packet_id),
+            partition_id: v.partition_id,
+            wal_index: v.wal_index,
+            session_generation: gen,
+            term: v.wal_term,
+        });
         if !super::try_emit(sys, s.out_forward, wire::MSG_ACK_REGISTER, &reg) {
             let _ = correlate::ack_stash(&mut s.correlate, reg);
         }

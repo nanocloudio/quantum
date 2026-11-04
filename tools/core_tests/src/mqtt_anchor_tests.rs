@@ -477,3 +477,52 @@ fn a_late_checkpoint_ack_does_not_rewind() {
     c.checkpoint_acked(15);
     assert_eq!(c.checkpoint_delivery, 20);
 }
+
+// ── Coordinator calls ───────────────────────────────────────────────────────
+
+#[test]
+fn the_coordinator_is_the_lowest_wired_worker_not_lost() {
+    assert_eq!(coordinator_slot([true, true], [false, false]), Some(0));
+    assert_eq!(coordinator_slot([true, true], [true, false]), Some(1));
+    assert_eq!(coordinator_slot([true, true], [true, true]), None);
+    // One worker owns everything: no call is routed.
+    assert_eq!(coordinator_slot([true, false], [false, false]), None);
+    assert_eq!(coordinator_slot([false, true], [false, false]), None);
+}
+
+#[test]
+fn a_coordinator_call_round_trips_to_the_bare_envelope() {
+    let inner = env(9, 11, 0, b"join-group-body");
+    let mut out = [0u8; 64];
+    let n = encode_coord_call(&mut out, 0x98, &inner);
+    assert_eq!(n, inner.len() + COORD_INSERT);
+    assert_eq!(&out[..2], &9u16.to_le_bytes(), "the connection stays first");
+    assert_eq!(out[2], 0x98);
+    let (mt, m) = unwrap_coord_call_in_place(&mut out, n).expect("a call");
+    assert_eq!((mt, &out[..m]), (0x98, &inner[..]));
+    // A close is a call too: the bare connection id.
+    let n = encode_coord_call(&mut out, 0xEB, &9u16.to_le_bytes());
+    assert_eq!(unwrap_coord_call_in_place(&mut out, n), Some((0xEB, 2)));
+    // Nothing to wrap, no room, or too short to unwrap.
+    assert_eq!(encode_coord_call(&mut out, 0x98, &[7]), 0);
+    assert_eq!(encode_coord_call(&mut [0u8; 4], 0x98, &inner), 0);
+    assert_eq!(unwrap_coord_call_in_place(&mut out, 2), None);
+}
+
+#[test]
+fn the_coordinator_owns_groups_offsets_and_queue_reads_not_the_log() {
+    for api in [8i16, 9, 11, 12, 13, 14] {
+        assert!(kafka_coordinator_api(api), "Kafka api {api}");
+    }
+    // Produce, Fetch, ListOffsets, Metadata, FindCoordinator, ApiVersions,
+    // InitProducerId.
+    for api in [0i16, 1, 2, 3, 10, 18, 22, -1] {
+        assert!(!kafka_coordinator_api(api), "Kafka api {api}");
+    }
+    for op in [2u8, 3, 4, 5] {
+        assert!(amqp_coordinator_op(op), "AMQP op {op}");
+    }
+    for op in [0u8, 1, 6] {
+        assert!(!amqp_coordinator_op(op), "AMQP op {op}");
+    }
+}

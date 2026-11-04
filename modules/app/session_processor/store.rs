@@ -26,6 +26,9 @@ use super::{
     KIN_EPOCH_SHIFT, KIN_KI_MASK, KIN_MAX_PARTS, KSTORE_BYTES, KSTORE_PARTS, KWRAP,
 };
 
+// `KafkaInflight::part_applied` holds one bit per produce partition.
+const _: () = assert!(KIN_MAX_PARTS <= 16);
+
 /// Component state. Owned exclusively by this subtree; the dispatch
 /// table and the other components reach it only through the entry
 /// points below.
@@ -46,6 +49,33 @@ pub struct Store {
     pub compacted: u32,
     pub full: u32,
     pub batches_applied: u32,
+    /// This worker's id (`set_worker`), carried in the top bits of every
+    /// slot epoch it allocates. Not touched by `init`.
+    worker: u8,
+}
+
+/// Where a worker's id sits inside a slot's 22-bit epoch: bits 19..22
+/// (`KIN_EPOCH_MASK` is 22 bits wide), the reuse count below it. Flow's
+/// completions (`MSG_ACK_EMIT`) are fanned to every worker on the node,
+/// and each worker numbers its own 256 slots, so `(index, epoch)` alone
+/// matched one worker's completion against the other's slot at the same
+/// index and reuse count: worker 0 answered worker 1's produce. With the
+/// worker in the epoch the match is structural — `inflight_valid` fails
+/// for any slot another worker allocated.
+pub const KIN_EPOCH_WORKER_SHIFT: u32 = 19;
+/// The reuse count below the worker id: wraps every 2^19 allocations of
+/// ONE slot, far beyond any proposal's lifetime (8 s sweep).
+pub const KIN_EPOCH_COUNT_MASK: u32 = (1 << KIN_EPOCH_WORKER_SHIFT) - 1;
+
+/// Number this worker's slot epochs under worker id `worker` (0..=7).
+/// Called once at construction, after `init`.
+pub fn set_worker(s: &mut Store, worker: u8) {
+    s.worker = worker & 0x07;
+}
+
+/// The worker id a wire slot's epoch names.
+pub fn kin_slot_worker(ss: u32) -> u8 {
+    ((kin_decode_slot(ss).1 >> KIN_EPOCH_WORKER_SHIFT) & 0x07) as u8
 }
 
 /// Wipe the message store. The log is purely apply-derived, so a reset
@@ -89,7 +119,9 @@ pub fn inflight_open(s: &mut Store, ki: usize, o: InflightOpen, topic: &[u8]) {
     e.topic_len = o.topic_len;
     e.n_parts = o.n_parts;
     e.n_done = o.n_done;
-    e.n_applied = 0;
+    e.part_applied = 0;
+    e.answer = ANSWER_NONE;
+    e.coord = 0;
     e.api_ver = o.api_ver;
     e.acks = o.acks;
     e.kafka_corr = o.kafka_corr;
@@ -111,11 +143,18 @@ pub fn inflight_open(s: &mut Store, ki: usize, o: InflightOpen, topic: &[u8]) {
 
 /// Seed one partition slot of a multi-partition produce: its Kafka
 /// partition id and any error decided before the proposal was made.
-/// The offset stays unassigned until durability reports it.
+/// The offset stays unassigned until durability reports it. A partition
+/// failed before proposing is resolved on both counts the response waits
+/// for: the caller opened the slot with it durable (`n_done`), and it has
+/// nothing to apply, so it is counted applied here — otherwise a produce
+/// mixing proposed and failed partitions would never be answered.
 pub fn inflight_set_part(s: &mut Store, ki: usize, pi: usize, id: i32, err: i16) {
     if ki < KAFKA_INFLIGHT && pi < KIN_MAX_PARTS {
         s.inflight[ki].part_ids[pi] = id;
         s.inflight[ki].part_errs[pi] = err;
+        if err != 0 {
+            inflight_apply_part(s, ki, pi);
+        }
     }
 }
 
@@ -124,6 +163,62 @@ pub fn inflight_set_part(s: &mut Store, ki: usize, pi: usize, id: i32, err: i16)
 /// to drop rather than misattribute.
 pub fn inflight_valid(s: &Store, ki: usize, epoch: u32) -> bool {
     ki < KAFKA_INFLIGHT && s.inflight[ki].active == 1 && s.inflight[ki].epoch == epoch
+}
+
+/// No answer is owed for the slot (yet).
+pub const ANSWER_NONE: u8 = 0;
+/// The aggregated ProduceResponse (every partition resolved).
+pub const ANSWER_PRODUCE: u8 = 1;
+/// The parked OffsetCommit response body, as it now stands.
+pub const ANSWER_OFFSET: u8 = 2;
+/// An AMQP Basic.Ack.
+pub const ANSWER_ACK: u8 = 3;
+/// An AMQP Basic.Nack.
+pub const ANSWER_NACK: u8 = 4;
+
+/// The answer slot `ki` owes, decided and not yet written: the codec bus
+/// had no room when it was decided. The slot stays until it is written.
+pub fn inflight_owe(s: &mut Store, ki: usize, answer: u8) {
+    if ki < KAFKA_INFLIGHT {
+        s.inflight[ki].answer = answer;
+    }
+}
+
+/// The answer slot `ki` owes (`ANSWER_NONE` when none is decided).
+pub fn inflight_owed(s: &Store, ki: usize) -> u8 {
+    if ki < KAFKA_INFLIGHT && s.inflight[ki].active == 1 {
+        s.inflight[ki].answer
+    } else {
+        ANSWER_NONE
+    }
+}
+
+/// Whether a live slot still owes connection `conn_id` its answer: a
+/// Kafka Produce or OffsetCommit awaiting durability or its apply, an
+/// AMQP confirm, or one of those decided and owed for want of bus room.
+/// Only the worker that holds the slot can answer it, so a connection
+/// with one is not at a point a handoff may export
+/// (`worker::quiescent`).
+///
+/// A coordinator call's slot (`inflight_set_coord`) is not counted: the
+/// coordinator answers it on its own path whichever worker the connection
+/// is bound to, so it never holds a handoff.
+pub fn inflight_for_conn(s: &Store, conn_id: u16) -> bool {
+    s.inflight
+        .iter()
+        .any(|k| k.active == 1 && k.coord == 0 && k.conn_id == conn_id)
+}
+
+/// Mark open slot `ki` as a coordinator call's: answered as one.
+pub fn inflight_set_coord(s: &mut Store, ki: usize) {
+    if ki < KAFKA_INFLIGHT {
+        s.inflight[ki].coord = 1;
+    }
+}
+
+/// Whether open slot `ki` is a coordinator call's.
+pub fn inflight_coord(s: &Store, ki: usize) -> bool {
+    ki < KAFKA_INFLIGHT && s.inflight[ki].active == 1 && s.inflight[ki].coord == 1
 }
 
 /// Release an inflight slot. The next allocation bumps its epoch, so any
@@ -209,9 +304,16 @@ pub fn inflight_complete_part(s: &mut Store, ki: usize) -> bool {
 /// response released on durability alone therefore reports an offset
 /// apply had not yet assigned. Counting both is what lets the response
 /// carry the real one.
-pub fn inflight_apply_part(s: &mut Store, ki: usize) {
-    if ki < KAFKA_INFLIGHT && s.inflight[ki].n_applied < s.inflight[ki].n_parts {
-        s.inflight[ki].n_applied += 1;
+///
+/// Counted once per partition `pidx`, however often it is reported: a
+/// partition failed on a refusal or a superseded verdict is marked here
+/// when it fails, and an `OUTCOME_UNKNOWN` entry may still commit and
+/// apply afterwards (or have applied before its verdict). Counting it
+/// twice would release the response before another partition's offset
+/// is known.
+pub fn inflight_apply_part(s: &mut Store, ki: usize, pidx: usize) {
+    if ki < KAFKA_INFLIGHT && pidx < KIN_MAX_PARTS {
+        s.inflight[ki].part_applied |= 1u16 << pidx;
     }
 }
 
@@ -221,7 +323,7 @@ pub fn inflight_ready(s: &Store, ki: usize) -> bool {
     ki < KAFKA_INFLIGHT
         && s.inflight[ki].active == 1
         && s.inflight[ki].n_done >= s.inflight[ki].n_parts
-        && s.inflight[ki].n_applied >= s.inflight[ki].n_parts
+        && s.inflight[ki].part_applied.count_ones() >= u32::from(s.inflight[ki].n_parts)
 }
 
 /// True when slot `i` is live and older than `timeout_ms`. The caller
@@ -439,7 +541,8 @@ pub fn init(s: &mut Store) {
 pub fn inflight_alloc(s: &mut Store) -> Option<(usize, u32)> {
     for i in 0..KAFKA_INFLIGHT {
         if s.inflight[i].active == 0 {
-            let epoch = s.inflight[i].epoch.wrapping_add(1);
+            let count = s.inflight[i].epoch.wrapping_add(1) & KIN_EPOCH_COUNT_MASK;
+            let epoch = (u32::from(s.worker) << KIN_EPOCH_WORKER_SHIFT) | count;
             s.inflight[i].epoch = epoch;
             return Some((i, kin_encode_slot(i, epoch)));
         }
@@ -489,9 +592,17 @@ pub struct KafkaInflight {
     pub part_ids: [i32; KIN_MAX_PARTS],
     pub part_offs: [i64; KIN_MAX_PARTS],
     pub part_errs: [i16; KIN_MAX_PARTS],
-    /// Partitions whose apply has landed. Paired with `n_done`
-    /// (durability) — see `inflight_ready`.
-    pub n_applied: u8,
+    /// Partitions whose apply has landed, one bit per partition index.
+    /// Paired with `n_done` (durability) — see `inflight_ready` and
+    /// `inflight_apply_part`.
+    pub part_applied: u16,
+    /// The client's answer is decided and owed (`ANSWER_*`): the codec
+    /// bus had no room for it, so the slot is kept until it is written.
+    pub answer: u8,
+    /// The request came as a coordinator call (`wire::MSG_COORD_CALL`), so
+    /// its answer goes back as one (`wire::MSG_COORD_RESPONSE`) whichever
+    /// worker the connection is bound to.
+    pub coord: u8,
     pub topic: [u8; KAFKA_MAX_TOPIC],
 }
 
@@ -514,7 +625,9 @@ impl KafkaInflight {
             part_ids: [0; KIN_MAX_PARTS],
             part_offs: [-1; KIN_MAX_PARTS],
             part_errs: [0; KIN_MAX_PARTS],
-            n_applied: 0,
+            part_applied: 0,
+            answer: ANSWER_NONE,
+            coord: 0,
             topic: [0; KAFKA_MAX_TOPIC],
         }
     }

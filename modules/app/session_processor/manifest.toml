@@ -180,6 +180,8 @@ metrics = [
     "apply_output_stalls",
     "acks_stale_epoch",
     "correlations_overdue",
+    "acks_superseded",
+    "applied_notice_drops",
 ]
 
 # Cold-read path for Kafka Fetch. A consumer whose offset has aged out

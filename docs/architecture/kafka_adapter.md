@@ -17,6 +17,70 @@ partition model lives in [partitioning.md](partitioning.md).
   validation. Transport security comes from the `tls` module where
   the graph wires it.
 
+## Response order
+
+The Kafka protocol answers a connection's requests in the order they
+were sent, and clients rely on it: Java's `NetworkClient` fails the
+connection on a response whose correlation id is not its oldest
+request's, librdkafka treats one as a protocol error. Quantum's answers
+are made in different places at different times — the codec answers
+ApiVersions, Metadata, FindCoordinator and InitProducerId itself;
+`session_processor` answers Fetch, ListOffsets and the group calls at
+once, a Produce once it is quorum durable, an OffsetCommit likewise, a
+Fetch from the WAL once the read returns — so the codec puts them back
+in order (`modules/common/cores/kafka_order_core.rs`):
+
+- Each request that will be answered (all but an `acks=0` Produce)
+  takes the next place in its connection's queue when the codec takes
+  it. An answer for the oldest place is written at once; an answer for
+  a later place waits in a slot until every answer ahead of it is
+  written.
+- At most 8 requests are in flight per connection (the bound Java's
+  `max.in.flight.requests.per.connection` sets on the client). Slots
+  are shared and reserved when a request is taken, sized by its API
+  (small for fixed-shape answers, large for those carrying records or
+  lists); the oldest request needs none, so a connection that is not
+  pipelining holds none, and an answer that arrives always has its
+  room — taking answers off the response bus never waits on another
+  answer behind it there. A request past the bound, or one no slot is
+  free for, stays in the reassembly buffer; the raw record that would
+  overflow the buffer is held and the codec reads no raw records until
+  it lands. That is the backpressure on a pipelining client.
+- A request that will never be answered closes the connection in its
+  turn, behind the answers ahead of it and before any after it: a
+  malformed one, an API this broker does not serve, one
+  `session_processor` marks with the close marker (a Kafka response
+  whose `api_key` is `wire::KAFKA_API_CLOSE`, sent for any request a
+  handler left without an answer), and one whose answer has not come
+  15 s after it became the oldest (the backstop for an answer lost on
+  the way). The client resends on a new connection what it still
+  wants — exactly, for an idempotent producer.
+- `session_processor` answers every request it expires: a Produce whose
+  durability never came answers `REQUEST_TIMED_OUT` for each unresolved
+  partition after 8 s, an OffsetCommit fails its parked answer the same
+  way.
+- A connection moving between session workers (an anchored front door's
+  swap, [session_continuity.md](session_continuity.md#the-swap)) moves
+  only once the worker it leaves owes it no answer: a Produce or
+  OffsetCommit still awaiting durability or its apply, or a Fetch still
+  reading the WAL, is answered by that worker, because the answer — its
+  correlation, its place in the queue, the partition outcome it reports
+  — exists only there and the anchor fences that worker's output once
+  the connection moves. The anchor holds the connection's new requests
+  while the worker drains, so the owed answers only finish; past the
+  drain deadline the move is refused and the same worker keeps the
+  connection and answers them in their turn. The 15 s backstop is not
+  part of a swap.
+
+MQTT and AMQP need no such sequencing. MQTT's ordering rules on
+acknowledgements (§4.6: PUBACK and PUBREC in the order the PUBLISHes
+arrived) are the receiver's rules, which a server follows as the sender
+of deliveries — and Quantum sends a subscriber's PUBREL when its PUBREC
+arrives, in order, through the response hold. AMQP publisher confirms
+may arrive in any order (each Basic.Ack / Nack names one delivery tag,
+`multiple` unset), and a channel carries one synchronous method at a
+time.
+
 ## Topics, partitions, routing
 
 Topics are tenant-scoped. Each Kafka partition is its own routing key,
@@ -114,7 +178,14 @@ its connection drops rather than only on an explicit `LeaveGroup`:
 clients commonly close without leaving, and ghosts would otherwise
 accumulate until the member table fills and the group wedges.
 
-Group metadata lives in the session-processor state. Offset commits
+Group metadata lives in the session-processor state. With two workers
+on one node (`co_located_workers`) it lives in ONE of them, the anchor's
+coordinator: every group and offset call goes there whichever worker
+the connection is bound to, while Produce, Fetch and ListOffsets stay
+with the connection's worker — every worker applies the whole log
+(docs/architecture/session_continuity.md, "Two workers on one node").
+The codec's sequencer writes the connection's answers in request order
+whichever worker gives them. Offset commits
 are WAL entries — they survive node failure exactly like session
 records. The OffsetCommitResponse is not gated on durability: a lost
 commit re-consumes from the previous offset, which the

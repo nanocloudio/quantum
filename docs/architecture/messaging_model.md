@@ -174,9 +174,14 @@ replay the same prefix produce byte-identical PRG state.
 ### ACK-DURABILITY
 
 Protocol-level ACKs emit only after WAL entries reach quorum
-durability. `flow`'s ack component consumes proofs from
-`durability.quorum_durable` directly; there is no path from
-"WAL written locally" to "PUBACK sent" that skips quorum.
+durability AND commit as the entry the publish was appended as.
+`flow`'s ack component consumes each partition's commit horizon
+(`consensus.durable_horizon`, which under DUR_STRICT / DUR_GROUP_FSYNC
+never runs ahead of quorum durability); there is no path from
+"WAL written locally" to "PUBACK sent" that skips quorum. An index
+names an entry only with its term: a publish whose index another
+term's entry took is failed for the client to retry, never acked
+([flow_control.md](flow_control.md#ack-resolution-the-entry-not-the-index)).
 
 This is the contract that gives MQTT QoS 1/2, Kafka `acks=all`, and
 AMQP `settled=false` their no-loss guarantee. Adapters must not

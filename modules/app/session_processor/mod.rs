@@ -43,6 +43,13 @@
 //! pair, `front_in` / `front_out`, with connection ids from
 //! `wire::FRONT_CONN_BASE` up. Its envelopes take the codec path, and a
 //! response for one of its sessions leaves on `front_out`.
+//!
+//! No client response is lost to a full output (`reply_hold`): one the bus
+//! refuses is held, per output, and written in order as it has room; an
+//! input that answers a client and can wait is read only while the hold
+//! has room for its answers, and one that cannot wait keeps its operation
+//! with the answer owed (an inflight slot, a cold-fetch slot, an owed
+//! DISCONNECT) and answers it on a later step.
 
 #![no_std]
 #![allow(
@@ -226,6 +233,30 @@ mod order {
 mod gate {
     include!("../../common/cores/inflight_gate_core.rs");
 }
+/// What Clustor's refusal of a tagged proposal means for the operation
+/// waiting on it.
+mod refusal {
+    include!("../../common/cores/proposal_refusal_core.rs");
+}
+/// Whether the entry a durable publish was assigned is the one committed
+/// at its index: the registration and completion bodies `flow` reads, and
+/// the applied term runs this module reports to it.
+mod term {
+    include!("../../common/cores/ack_term_core.rs");
+}
+const _: () = assert!(term::REGISTER_LEN == wire::ACK_REGISTER_LEN);
+const _: () = assert!(term::APPLIED_LEN == wire::ACK_APPLIED_LEN);
+const _: () = assert!(term::EMIT_LEN == wire::ACK_EMIT_LEN);
+// A completion's failure status is a refusal status: one mapping fails both.
+const _: () = assert!(term::STATUS_SUPERSEDED == refusal::REFUSED_NOT_LEADER);
+const _: () = assert!(term::STATUS_UNKNOWN == refusal::REFUSED_OUTCOME_UNKNOWN);
+/// How often the open applied term runs are reported to `flow`. A run that
+/// closes (the committed log changed term) is reported at once; the open
+/// run only settles registrations the commit horizon's term cannot — those
+/// that span a leader change — so a few milliseconds' delay costs nothing
+/// in the steady state and bounds the notices to one per partition per
+/// interval.
+const APPLIED_NOTICE_MS: u64 = 10;
 /// Credit for the deliveries `messaging`'s retained reads and offline
 /// drains bring, and which sessions' fresh deliveries join their offline
 /// queue while it drains.
@@ -235,6 +266,7 @@ mod mflow;
 /// on a full op edge.
 #[path = "../../common/cores/messaging_outbox_core.rs"]
 mod outbox;
+mod reply_hold;
 mod sessions;
 mod site;
 mod store;
@@ -548,6 +580,11 @@ const OP_KPRODUCE: u8 = 2;
 // durability stall (exactly what triggers the sweep) could fire a Kafka
 // produce's durability as a spurious AMQP Basic.Ack, or report a foreign
 // WAL index as a base_offset. See docs/architecture/flow_control.md.
+//
+// The epoch's top bits name the WORKER that allocated the slot
+// (`store::KIN_EPOCH_WORKER_SHIFT`): flow's completions reach every worker
+// on the node, and each worker numbers its own slots, so without it worker
+// 0 resolved worker 1's produce at the same index and reuse count.
 
 /// Reserved session_slot namespace for durable-publish inflights. Bit 30
 /// set, far above MAX_SESSIONS (16384) so the two spaces can never collide.
@@ -556,9 +593,10 @@ const KAFKA_INFLIGHT: usize = 256;
 /// Slot index occupies the low 8 bits (KAFKA_INFLIGHT ≤ 256).
 const KIN_KI_MASK: u32 = 0xFF;
 /// Epoch occupies bits 8..30 (22 bits) — below KAFKA_SLOT_BASE's bit 30 so
-/// the `>= KAFKA_SLOT_BASE` routing check is unaffected. Wraps every ~4M
-/// allocations per slot; a collision needs the SAME slot reused exactly
-/// 2^22 times within one stalled proposal's lifetime — impossible.
+/// the `>= KAFKA_SLOT_BASE` routing check is unaffected. Its top 3 bits are
+/// the allocating worker's id and its low 19 the reuse count, which wraps
+/// every 2^19 allocations per slot; a collision needs the SAME slot reused
+/// exactly 2^19 times within one stalled proposal's lifetime — impossible.
 const KIN_EPOCH_SHIFT: u32 = 8;
 const KIN_EPOCH_MASK: u32 = 0x3F_FFFF;
 
@@ -585,8 +623,8 @@ const KERR_OFFSET_OUT_OF_RANGE: i16 = 1;
 /// the ack path is armed, which reads as silent loss. Enforce the
 /// ceiling here with MESSAGE_TOO_LARGE so producers fail fast and
 /// size their batches down (the protocol's designed-for response).
-/// 1900 = 2048 − tagged header (18) − op-body framing (4) − max topic
-/// (64) − slack.
+/// 1900 = 2048 − tagged header (18) − op-body framing
+/// (`wire::PRODUCE_BODY_HDR`, 6) − max topic (64) − slack.
 const KAFKA_MAX_RECORDS_BYTES: usize = 1900;
 
 /// Which protocol a durability-gated publish inflight belongs to.
@@ -708,6 +746,14 @@ struct ModuleState {
     /// Envelopes dropped for naming a connection outside their input's
     /// namespace.
     codec_namespace_drops: u32,
+    /// The answer being written is a coordinator answer
+    /// (`wire::MSG_COORD_RESPONSE`, counted in no cursor): set for a
+    /// `MSG_COORD_CALL` while it is handled, and for a later answer to one
+    /// (an OffsetCommit's slot, a coordinated consumer's delivery) while
+    /// that is written. Read by [`respond`].
+    coord_reply: bool,
+    /// Coordinator calls taken (`MSG_COORD_CALL`).
+    coord_calls: u32,
     in_committed: i32,
     in_flow: i32,
     in_ack: i32,
@@ -944,6 +990,17 @@ struct ModuleState {
     kafka_produce_rx: u32,
     kafka_produce_acked: u32,
     kafka_produce_errors: u32,
+    /// The Kafka request being handled has its answer: written or held,
+    /// owed in an inflight or cold-fetch slot, or none due (acks = 0).
+    /// Cleared before each request; one left unset is answered with the
+    /// close marker (`wire::KAFKA_API_CLOSE`), since the codec writes a
+    /// connection's answers in request order and an unanswered request
+    /// would hold every later one.
+    #[cfg(feature = "kafka")]
+    kafka_settled: bool,
+    /// Kafka requests answered with the close marker.
+    #[cfg(feature = "kafka")]
+    kafka_unanswered: u32,
     /// Per-`(producer_id, partition)` sequence state, maintained from
     /// the committed log so a producer's retry after a lost response is
     /// recognised instead of appended twice.
@@ -1035,6 +1092,11 @@ struct ModuleState {
     /// `CORRELATION_TIMEOUT_MS`. Non-zero means the substrate owes an
     /// assignment it has not delivered.
     correlations_overdue: u32,
+    /// Tagged proposals Clustor refused (MSG_PROPOSAL_REFUSED) whose
+    /// correlation was still waiting: freed at once and the operation
+    /// failed in its protocol's terms. A refusal for a correlation no
+    /// longer held is not counted.
+    proposals_refused_raft: u32,
     /// Steps whose committed-entry drain stopped because an apply
     /// output edge was full. Rising values mean commits are backing up
     /// behind a saturated messaging or topic bus.
@@ -1069,6 +1131,22 @@ struct ModuleState {
     /// The ack path keys on `(partition_id, wal_index)` for exactly
     /// this reason; the apply cursor must be keyed the same way.
     apply_index: [u64; MAX_APPLY_PARTITIONS],
+    /// Per partition, the committed log's term run the applied entries are
+    /// extending, and how much of it `flow` has been told
+    /// (MSG_ACK_APPLIED): what settles a registration whose term the
+    /// commit horizon cannot.
+    applied_runs: [term::RunTracker; MAX_APPLY_PARTITIONS],
+    /// Closed runs not yet reported, held while the forward edge is full.
+    applied_spill: term::Spill,
+    applied_notice_ms: u64,
+    /// Closed runs dropped because the spill was full: `flow` resolves the
+    /// indices they covered as unknown, failing (not acking) what waits on
+    /// them. Must stay 0.
+    applied_notice_drops: u32,
+    /// Completions `flow` answered as not committed — another term's entry
+    /// took the index, or its term is unknown here — whose operation was
+    /// failed for the client to retry.
+    acks_superseded: u32,
     /// Raft index of the entry currently being applied. See the
     /// assignment site: `apply_index` is the last COMPLETED entry.
     applying_index: u64,
@@ -1077,6 +1155,21 @@ struct ModuleState {
     /// snapshot installs / leader transfers.
     apply_resets: u32,
     last_metrics_ms: u64,
+
+    /// Client responses the codec bus refused, per output, written in
+    /// order as it takes them (`reply_hold`): a response is never lost
+    /// to a full edge.
+    hold: reply_hold::Hold,
+    /// Connections owed a DISCONNECT the bus has not taken yet: a
+    /// placement update's "server moved" for every session it released,
+    /// and a failed flow's that no ring had room for.
+    disc_owed: reply_hold::Owed,
+    /// Where the next pass over `disc_owed` starts, so every owed
+    /// connection has its turn.
+    disc_owed_from: u16,
+    /// Kafka / AMQP answers the bus had no room for when they were
+    /// decided, owed in their inflight slot and answered on a later step.
+    answers_owed: u32,
 
     in_buf: [u8; BUF_SIZE],
     out_buf: [u8; BUF_SIZE],
@@ -1163,6 +1256,8 @@ pub unsafe extern "C" fn module_new(
         s.site_refused = 0;
         s.codec_turn = 0;
         s.codec_namespace_drops = 0;
+        s.coord_reply = false;
+        s.coord_calls = 0;
         s.proposals_unkeyed_refused = 0;
         s.replay_floor_skipped = 0;
         s.faulted = 0;
@@ -1194,7 +1289,7 @@ pub unsafe extern "C" fn module_new(
             s.out_wal_request = dev_channel_port(sys, 1, 8);
             s.in_wal_reply = dev_channel_port(sys, 0, 8);
             s.cold = [ColdFetch::zero(); COLD_FETCH_SLOTS];
-            s.next_cold_id = 1;
+            s.next_cold_id = cold_id_base(s.worker_id) | 1;
         }
         s.credit_base_window = 10;
         s.keep_alive_factor_pct = 150;
@@ -1225,6 +1320,11 @@ pub unsafe extern "C" fn module_new(
         s.pid_byte_credits = 64 * 1024;
         s.follower_factor_q16 = 65536;
         s.apply_index = [0; MAX_APPLY_PARTITIONS];
+        s.applied_runs = [term::RunTracker::new(); MAX_APPLY_PARTITIONS];
+        s.applied_spill = term::Spill::new();
+        s.applied_notice_ms = 0;
+        s.applied_notice_drops = 0;
+        s.acks_superseded = 0;
         s.applying_index = 0;
         s.apply_resets = 0;
         // The allocation range must be in place before the table is
@@ -1241,6 +1341,7 @@ pub unsafe extern "C" fn module_new(
             sessions::clear_flow(&mut s.sessions, i);
         }
         correlate::init(&mut s.correlate);
+        correlate::set_namespace(&mut s.correlate, s.worker_id);
         worker::init(&mut s.worker, s.worker_id);
         // Declared last in the manifest: in[9] / out[11].
         s.worker.in_ctrl = dev_channel_port(sys, 0, 9);
@@ -1248,6 +1349,11 @@ pub unsafe extern "C" fn module_new(
         s.worker.in_ctrl2 = dev_channel_port(sys, 0, 12);
         s.worker.out_ctrl2 = dev_channel_port(sys, 1, 15);
         store::init(&mut s.store);
+        store::set_worker(&mut s.store, s.worker_id);
+        reply_hold::init(&mut s.hold);
+        reply_hold::owed_init(&mut s.disc_owed);
+        s.disc_owed_from = 0;
+        s.answers_owed = 0;
         s.sub_inflight_dropped_on_resume = 0;
         s.conn_bindings_evicted = 0;
         s.kafka_produce_rx = 0;
@@ -1286,7 +1392,11 @@ pub unsafe extern "C" fn module_new(
     }
 }
 
-/// Emit a `MSG_SESSION_RESPONSE` to out_codec via wire-envelope framing.
+use reply_hold::Reply;
+
+/// Emit a `MSG_SESSION_RESPONSE` to the connection's output via
+/// wire-envelope framing; one the bus refuses is held and written in
+/// order ([`Reply::Must`]).
 ///
 /// Channel payload (post-envelope-strip) is `[conn_id:u16 LE][proto]
 /// [pkt_type][flags][body]`. Envelope framing is required because the codec read
@@ -1295,6 +1405,7 @@ pub unsafe extern "C" fn module_new(
 /// FIFO and the consumer mis-parses everything after the first.
 ///
 /// # Safety
+/// `sys` must point at a live kernel syscall table.
 unsafe fn emit_codec_response(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -1303,6 +1414,42 @@ unsafe fn emit_codec_response(
     pkt_type: u8,
     flags: u8,
     body: &[u8],
+) -> bool {
+    emit_codec_reply(s, sys, conn_id, proto, pkt_type, flags, body, Reply::Must)
+}
+
+/// [`emit_codec_response`] for work the caller keeps and offers again
+/// ([`Reply::Offer`]): false when the output has no room for it now.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn offer_codec_response(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u16,
+    proto: u8,
+    pkt_type: u8,
+    flags: u8,
+    body: &[u8],
+) -> bool {
+    emit_codec_reply(s, sys, conn_id, proto, pkt_type, flags, body, Reply::Offer)
+}
+
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the envelope's fields and how a refusal is met; the two callers above are the API"
+)]
+unsafe fn emit_codec_reply(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u16,
+    proto: u8,
+    pkt_type: u8,
+    flags: u8,
+    body: &[u8],
+    reply: Reply,
 ) -> bool {
     let chan = codec_chan(s, conn_id);
     if chan < 0 {
@@ -1314,6 +1461,17 @@ unsafe fn emit_codec_response(
         s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
         return true;
     }
+    // A connection owed a DISCONNECT is told nothing more: nothing may go
+    // ahead of the DISCONNECT, and after it the codec closes the
+    // connection. What a delivery or a resend carried stays owed in the
+    // log for the session's next connection.
+    if reply_hold::owed(&s.disc_owed, conn_id).is_some() {
+        return true;
+    }
+    // A DISCONNECT that finds no room is owed (`disc_owed`), one per
+    // connection, rather than held: refusals and superseded verdicts fail
+    // flows from inputs that cannot wait, more of them than a ring holds.
+    let disconnect = proto == PROTO_MQTT && pkt_type == PKT_DISCONNECT;
     // A session attached as transport-migratable answers in productions:
     // numbered and retained until the anchor's horizon covers them
     // (docs/architecture/anchor_continuity.md). A full ring holds the
@@ -1334,7 +1492,7 @@ unsafe fn emit_codec_response(
         let poll = (sys.channel_poll)(chan, 0x02);
         let writable = poll > 0 && (poll as u32 & 0x02) != 0;
         let mut out = [0u8; BUF_SIZE + worker::anchor_core::PRODUCTION_INSERT];
-        return match worker::produce(&mut s.worker, conn_id, &inner[..total], &mut out) {
+        let ok = match worker::produce(&mut s.worker, conn_id, &inner[..total], &mut out) {
             worker::anchor_core::Produced::Wrapped { id, len } => {
                 let w = if writable {
                     wire::channel_write_msg(sys, chan, wire::MSG_ANCHOR_PRODUCTION, &out[..len])
@@ -1364,16 +1522,201 @@ unsafe fn emit_codec_response(
                 true
             }
         };
+        if !ok && disconnect {
+            reply_hold::owe(
+                &mut s.disc_owed,
+                conn_id,
+                body.first().copied().unwrap_or(0),
+            );
+            return true;
+        }
+        return ok;
     }
-    let ok = emit_codec_response_raw(sys, chan, conn_id, proto, pkt_type, flags, body);
-    if ok {
-        worker::note_out(
-            &mut s.worker,
+    let total = CODEC_ENV_HDR + body.len();
+    if total > BUF_SIZE {
+        return false;
+    }
+    let mut out = [0u8; BUF_SIZE];
+    out[0..2].copy_from_slice(&conn_id.to_le_bytes());
+    out[2] = proto;
+    out[3] = pkt_type;
+    out[4] = flags;
+    out[CODEC_ENV_HDR..total].copy_from_slice(body);
+    let reply = if disconnect { Reply::Kept } else { reply };
+    let taken = respond(s, sys, chan, conn_id, &out[..total], reply, true).taken();
+    if !taken && disconnect {
+        reply_hold::owe(
+            &mut s.disc_owed,
             conn_id,
-            wire::ENVELOPE_HDR + CODEC_ENV_HDR + body.len(),
+            body.first().copied().unwrap_or(0),
         );
+        return true;
     }
-    ok
+    taken
+}
+
+/// The hold ring output `chan` is held on: `codec_out`, `codec2_out`,
+/// `front_out` in that order.
+fn hold_output(s: &ModuleState, chan: i32) -> Option<usize> {
+    if chan < 0 {
+        return None;
+    }
+    [s.out_codec, s.out_codec2, s.out_front]
+        .iter()
+        .position(|&c| c == chan)
+}
+
+/// Write a `MSG_SESSION_RESPONSE` `payload` for `conn` to `chan`: at once
+/// when nothing is held ahead of it on that output and the bus takes it;
+/// otherwise met as `reply` says (`reply_hold::respond`) — held behind
+/// what is held and written in order by [`flush_holds`], or refused to a
+/// caller that keeps the work. `counted` writes count against the
+/// connection's delivery cursor (`worker::note_out`) when they are made.
+/// A [`Reply::Must`] meeting a full ring is the one loss (`hold.overflow`,
+/// `rlost=` on the heartbeat); the input gates make it unreachable.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn respond(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    chan: i32,
+    conn: u16,
+    payload: &[u8],
+    reply: Reply,
+    counted: bool,
+) -> reply_hold::Sent {
+    let Some(k) = hold_output(s, chan) else {
+        return reply_hold::Sent::Refused;
+    };
+    // A coordinator answer is the pair's, not the session's: its own type,
+    // admitted by the anchor from the coordinator whatever the binding,
+    // and in no delivery cursor.
+    let (msg_type, counted) = if s.coord_reply {
+        (wire::MSG_COORD_RESPONSE, false)
+    } else {
+        (wire::MSG_SESSION_RESPONSE, counted)
+    };
+    let w = &mut s.worker;
+    let sent = reply_hold::respond(
+        &mut s.hold.rings[k],
+        sys,
+        chan,
+        conn,
+        msg_type,
+        payload,
+        reply,
+        counted,
+        |c, bytes, counted| {
+            if counted {
+                worker::note_out(w, c, bytes);
+            }
+        },
+    );
+    match sent {
+        reply_hold::Sent::Held => s.hold.held = s.hold.held.wrapping_add(1),
+        reply_hold::Sent::Full => {
+            s.hold.overflow = s.hold.overflow.wrapping_add(1);
+            if s.hold.overflow & 0x3F == 1 {
+                dev_log(
+                    sys,
+                    1,
+                    b"[sess] response hold full: response lost".as_ptr(),
+                    40,
+                );
+            }
+        }
+        _ => {}
+    }
+    sent
+}
+
+/// Write output `k`'s held responses, oldest first, as far as the bus
+/// takes them.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn flush_hold(s: &mut ModuleState, sys: &SyscallTable, k: usize) {
+    let chan = [s.out_codec, s.out_codec2, s.out_front][k];
+    let w = &mut s.worker;
+    reply_hold::flush(&mut s.hold.rings[k], sys, chan, |conn, bytes, counted| {
+        if counted {
+            worker::note_out(w, conn, bytes);
+        }
+    });
+}
+
+/// Every output's held responses, then the DISCONNECTs owed
+/// (`disc_owed`) — each only once its output holds nothing for its
+/// connection, up to 64 a step, in turn. Run first in every step, so each
+/// input gate sees what the bus took.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn flush_holds(s: &mut ModuleState, sys: &SyscallTable) {
+    for k in 0..reply_hold::OUTPUTS {
+        if !reply_hold::is_empty(&s.hold.rings[k]) {
+            flush_hold(s, sys, k);
+        }
+    }
+    if s.disc_owed.count == 0 {
+        return;
+    }
+    let mut conns = [0u16; 64];
+    let n = reply_hold::owed_conns(&s.disc_owed, s.disc_owed_from, &mut conns);
+    if n > 0 {
+        s.disc_owed_from = conns[n - 1].wrapping_add(1);
+    }
+    for &conn in &conns[..n] {
+        let Some(reason) = reply_hold::owed(&s.disc_owed, conn) else {
+            continue;
+        };
+        let chan = codec_chan(s, conn);
+        let Some(k) = hold_output(s, chan) else {
+            reply_hold::settle(&mut s.disc_owed, conn);
+            continue;
+        };
+        // Behind whatever its output still holds for the connection.
+        if reply_hold::ring_holds_for(&s.hold.rings[k], conn) {
+            continue;
+        }
+        let mut out = [0u8; CODEC_ENV_HDR + 1];
+        out[0..2].copy_from_slice(&conn.to_le_bytes());
+        out[2] = PROTO_MQTT;
+        out[3] = PKT_DISCONNECT;
+        out[CODEC_ENV_HDR] = reason;
+        if wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out) > 0 {
+            worker::note_out(&mut s.worker, conn, wire::ENVELOPE_HDR + out.len());
+            reply_hold::settle(&mut s.disc_owed, conn);
+        }
+    }
+}
+
+/// Whether every output has room for the most one input can answer
+/// (`reply_hold::has_reserve`): the gate on reading `flow`'s completions,
+/// which `flow` holds while they are not read. Inputs that cannot wait —
+/// committed entries, Clustor's assignments and refusals, cold reads —
+/// are never gated on a client; their answers are kept instead
+/// ([`Reply::Kept`], [`answer_inflight`], the cold-fetch slot's `owed`).
+fn hold_ready(s: &ModuleState) -> bool {
+    [s.out_codec, s.out_codec2, s.out_front]
+        .iter()
+        .zip(s.hold.rings.iter())
+        .all(|(&c, r)| c < 0 || reply_hold::has_reserve(r))
+}
+
+/// Whether the output a codec envelope from `conn` (protocol `proto`,
+/// where it names one) is answered on has room for the most it can
+/// answer: the connection's own output for MQTT, `codec_out` — where
+/// every Kafka and AMQP answer goes — for the others. Only that output
+/// holds the envelope back, so a full output stops the work of the
+/// sessions it serves and no other.
+fn hold_ready_for(s: &ModuleState, conn: u16, proto: Option<u8>) -> bool {
+    let k = match proto {
+        Some(PROTO_KAFKA | PROTO_AMQP) => Some(0),
+        _ => hold_output(s, codec_chan(s, conn)),
+    };
+    k.is_none_or(|k| reply_hold::has_reserve(&s.hold.rings[k]))
 }
 
 /// Whether a seated session (`conn`) has a ring slot free beyond those
@@ -1417,9 +1760,21 @@ fn codec_waits(s: &ModuleState, mt: u8, buf: &[u8]) -> bool {
             ),
             None => return false,
         }
+    } else if mt == wire::MSG_COORD_CALL {
+        // `[conn:2][inner_mt][rest]`.
+        match buf.get(2) {
+            Some(&inner) => (inner, 3),
+            None => return false,
+        }
     } else {
         (mt, 2)
     };
+    // An envelope may be answered only with room in the response hold for
+    // its answers; it waits, and so does its input, until the bus has
+    // taken what is held. A connection-closed notice answers nothing.
+    if inner_mt != wire::MSG_CONN_CLOSED && !hold_ready_for(s, conn_id, buf.get(at).copied()) {
+        return true;
+    }
     // [proto][pkt_type][flags][packet_id:2 BE]...
     if inner_mt != wire::MSG_SESSION_PROPOSAL || buf.len() < at + 5 {
         return false;
@@ -1494,8 +1849,7 @@ fn codec_chan(s: &ModuleState, conn_id: u16) -> i32 {
     )
 }
 
-/// [`codec_chan`] over copied-out channels, for a caller that holds
-/// part of the module state.
+/// [`codec_chan`] over copied-out channels.
 #[inline]
 fn out_chan(out_codec: i32, out_codec2: i32, out_front: i32, seam: u8, conn_id: u16) -> i32 {
     if wire::is_front_conn(conn_id) {
@@ -1505,38 +1859,6 @@ fn out_chan(out_codec: i32, out_codec2: i32, out_front: i32, seam: u8, conn_id: 
     } else {
         out_codec
     }
-}
-
-/// `emit_codec_response` without the worker bookkeeping, for the one
-/// caller that cannot hold the module state: the redirect sent to a
-/// connection whose session is being released — nothing of that
-/// session is exported afterwards, so its cursor no longer matters.
-///
-/// # Safety
-unsafe fn emit_codec_response_raw(
-    sys: &SyscallTable,
-    chan: i32,
-    conn_id: u16,
-    proto: u8,
-    pkt_type: u8,
-    flags: u8,
-    body: &[u8],
-) -> bool {
-    if chan < 0 {
-        return false;
-    }
-    let total = CODEC_ENV_HDR + body.len();
-    if total > BUF_SIZE {
-        return false;
-    }
-    let mut out = [0u8; BUF_SIZE];
-    out[0..2].copy_from_slice(&conn_id.to_le_bytes());
-    out[2] = proto;
-    out[3] = pkt_type;
-    out[4] = flags;
-    out[CODEC_ENV_HDR..total].copy_from_slice(body);
-    let w = wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]);
-    w > 0
 }
 
 /// Offer the productions `conn`'s seat owes a replacement anchor again,
@@ -1873,17 +2195,38 @@ unsafe fn redeliver_owed(s: &mut ModuleState, sys: &SyscallTable, si: usize) -> 
         let ok = if e.qos == 2 && (e.released != 0 || in_rel) {
             sessions::inflight_set_phase(&mut s.sessions, si, ii, QOS2_PUBREL);
             let pubrel = e.packet_id.to_be_bytes();
-            emit_codec_response(s, sys, conn_id, PROTO_MQTT, PKT_PUBREL, 0x02, &pubrel)
+            emit_codec_reply(
+                s,
+                sys,
+                conn_id,
+                PROTO_MQTT,
+                PKT_PUBREL,
+                0x02,
+                &pubrel,
+                Reply::Spare,
+            )
         } else {
             let flags = (e.qos << 1) | 0x08; // DUP
-            emit_codec_response(s, sys, conn_id, PROTO_MQTT, PKT_PUBLISH, flags, e.body())
+            let body = e.body();
+            emit_codec_reply(
+                s,
+                sys,
+                conn_id,
+                PROTO_MQTT,
+                PKT_PUBLISH,
+                flags,
+                body,
+                Reply::Spare,
+            )
         };
-        if ok {
-            if added {
-                sessions::note_delivery(&mut s.sessions, si);
-            }
-            sent += 1;
+        if !ok {
+            // The rest stay owed, in order: none is sent ahead of this one.
+            break;
         }
+        if added {
+            sessions::note_delivery(&mut s.sessions, si);
+        }
+        sent += 1;
     }
     s.redelivered = s.redelivered.wrapping_add(sent);
     sent
@@ -1922,17 +2265,14 @@ unsafe fn try_emit_unkeyed(s: &mut ModuleState, sys: &SyscallTable, body: &[u8])
 ///
 /// # Safety
 unsafe fn emit_kafka_response(
+    s: &mut ModuleState,
     sys: &SyscallTable,
-    chan: i32,
     conn_id: u16,
     api_key: i16,
     api_ver: i16,
     kafka_corr: i32,
     body: &[u8],
 ) -> bool {
-    if chan < 0 {
-        return false;
-    }
     let total = KAFKA_ENV_HDR + body.len();
     if total > BUF_SIZE {
         return false;
@@ -1943,8 +2283,12 @@ unsafe fn emit_kafka_response(
     }
     write_kafka_env_header(&mut out, conn_id, api_key, api_ver, kafka_corr);
     out[KAFKA_ENV_HDR..total].copy_from_slice(body);
-    let w = wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]);
-    w > 0
+    let chan = s.out_codec;
+    // Counted: the anchor counts every response it relays for a bound
+    // connection, and a handoff admits the two counts only when equal.
+    let taken = respond(s, sys, chan, conn_id, &out[..total], Reply::Must, true).taken();
+    s.kafka_settled |= taken;
+    taken
 }
 
 /// One partition's ProduceResponse outcome: the request correlation it
@@ -1971,8 +2315,8 @@ struct KafkaProduceAck<'a> {
 ///
 /// # Safety
 unsafe fn emit_kafka_produce_response(
+    s: &mut ModuleState,
     sys: &SyscallTable,
-    chan: i32,
     conn_id: u16,
     ack: KafkaProduceAck<'_>,
 ) -> bool {
@@ -2015,7 +2359,7 @@ unsafe fn emit_kafka_produce_response(
         body[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
         p += 4;
     }
-    emit_kafka_response(sys, chan, conn_id, 0, api_ver, kafka_corr, &body[..p])
+    emit_kafka_response(s, sys, conn_id, 0, api_ver, kafka_corr, &body[..p])
 }
 
 #[cfg(feature = "kafka")]
@@ -2153,13 +2497,16 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
     }
 
     s.kafka_produce_rx = s.kafka_produce_rx.wrapping_add(1);
+    // acks = 0: the protocol forbids an answer, and the codec, reading
+    // the same field, expects none.
+    s.kafka_settled |= acks == 0;
 
     if !parse_ok || topic_count != 1 {
         s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
         if topic_len > 0 && acks != 0 {
             emit_kafka_produce_response(
+                s,
                 sys,
-                s.out_codec,
                 conn_id,
                 KafkaProduceAck {
                     api_ver,
@@ -2182,20 +2529,23 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
             if p_errs[pi] != 0 {
                 continue;
             }
-            let op_body_len = 1 + 2 + 2 + topic_len + p_lens[pi];
+            let op_body_len = wire::PRODUCE_BODY_HDR + topic_len + p_lens[pi];
             let hdr = wire::QPROP_HEADER_LEN;
             if hdr + op_body_len > s.out_buf.len() {
                 continue;
             }
             wire::encode_qprop_header(&mut s.out_buf[..hdr], wire::QOP_KAFKA_PRODUCE, 0, 0);
             // No client is waiting on an acks=0 produce, so no origin.
-            s.out_buf[hdr] = wire::PRODUCE_ORIGIN_NONE;
-            s.out_buf[hdr + 1..hdr + 3].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
-            s.out_buf[hdr + 3..hdr + 5].copy_from_slice(&(topic_len as u16).to_le_bytes());
-            s.out_buf[hdr + 5..hdr + 5 + topic_len].copy_from_slice(&topic[..topic_len]);
+            let rec = wire::encode_produce_body_hdr(
+                &mut s.out_buf[hdr..],
+                wire::PRODUCE_ORIGIN_NONE,
+                wire::PRODUCE_ORIGIN_NONE,
+                p_ids[pi] as u16,
+                &topic[..topic_len],
+            );
             core::ptr::copy_nonoverlapping(
                 s.in_buf.as_ptr().add(p_offs[pi]),
-                s.out_buf.as_mut_ptr().add(hdr + 5 + topic_len),
+                s.out_buf.as_mut_ptr().add(hdr + rec),
                 p_lens[pi],
             );
             // A Kafka partition is the unit of placement: its log lives
@@ -2220,8 +2570,8 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
     let Some((ki, slot)) = store::inflight_alloc(&mut s.store) else {
         s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
         emit_kafka_produce_response(
+            s,
             sys,
-            s.out_codec,
             conn_id,
             KafkaProduceAck {
                 api_ver,
@@ -2246,7 +2596,7 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
             p_errs[pi] = KERR_REQUEST_TIMED_OUT;
             continue;
         };
-        let op_body_len = 1 + 2 + 2 + topic_len + p_lens[pi];
+        let op_body_len = wire::PRODUCE_BODY_HDR + topic_len + p_lens[pi];
         let prop_total = wire::QPROP_TAGGED_HDR_LEN + op_body_len;
         if prop_total > s.out_buf.len() {
             let _ = correlate::take(&mut s.correlate, cid);
@@ -2261,15 +2611,19 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
             slot,
         );
         let ob = wire::QPROP_TAGGED_HDR_LEN;
-        // This node accepted the produce, so apply on THIS node — and
-        // only this node — may resolve the waiting inflight slot.
-        s.out_buf[ob] = s.self_id;
-        s.out_buf[ob + 1..ob + 3].copy_from_slice(&(p_ids[pi] as u16).to_le_bytes());
-        s.out_buf[ob + 3..ob + 5].copy_from_slice(&(topic_len as u16).to_le_bytes());
-        s.out_buf[ob + 5..ob + 5 + topic_len].copy_from_slice(&topic[..topic_len]);
+        // This worker of this node accepted the produce, so apply on it —
+        // and only on it — may resolve the waiting inflight slot: every
+        // worker on every node applies the entry.
+        let rec = wire::encode_produce_body_hdr(
+            &mut s.out_buf[ob..],
+            s.self_id,
+            s.worker_id,
+            p_ids[pi] as u16,
+            &topic[..topic_len],
+        );
         core::ptr::copy_nonoverlapping(
             s.in_buf.as_ptr().add(p_offs[pi]),
-            s.out_buf.as_mut_ptr().add(ob + 5 + topic_len),
+            s.out_buf.as_mut_ptr().add(ob + rec),
             p_lens[pi],
         );
         let shard = wire::shard_kafka(0, &topic[..topic_len], p_ids[pi] as u32);
@@ -2301,6 +2655,8 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
         }
     }
 
+    // Answered from the slot, now or once every partition resolves.
+    s.kafka_settled = true;
     store::inflight_open(
         &mut s.store,
         ki,
@@ -2324,8 +2680,350 @@ unsafe fn handle_kafka_produce(s: &mut ModuleState, sys: &SyscallTable, now: u64
     }
     if pending == 0 {
         // Every partition failed before proposing — respond now.
-        emit_kafka_produce_response_multi(s, sys, ki);
+        answer_inflight(s, sys, ki, store::ANSWER_PRODUCE);
+    }
+}
+
+/// MSG_PROPOSAL_REFUSED: Clustor will never assign this tagged proposal
+/// (it is in no log, or for `OUTCOME_UNKNOWN` may be in one). The
+/// correlation is freed now — waiting on it would hold its slot and the
+/// client until a timeout, and for MQTT none comes — the refusal is
+/// counted, and the operation is failed in its protocol's terms
+/// (`proposal_refusal_core.rs` says how each status maps):
+///
+/// - an MQTT PUBLISH: its inflight is released and the connection closed
+///   with the reason (DISCONNECT to MQTT 5, a close for MQTT 3.1.1); the
+///   client resends it on reconnect under the same packet id. The publish
+///   stash is left to its verdict (`fail_publisher_flow` says why);
+/// - an MQTT PUBREL: the flow keeps its QoS 2 PUBREL phase with no
+///   correlation, and the connection is closed the same way, so the
+///   resent PUBREL proposes afresh;
+/// - a Kafka Produce partition: answered with the mapped error, and the
+///   response fires once every partition has resolved;
+/// - an AMQP confirm-mode publish: Basic.Nack;
+/// - a Kafka OffsetCommit: its parked response is answered now with every
+///   partition failed (`REQUEST_TIMED_OUT`).
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn on_proposal_refused(s: &mut ModuleState, sys: &SyscallTable, r: refusal::Refusal) {
+    let Some((session_slot, packet_id, op)) = correlate::take(&mut s.correlate, r.correlation_id)
+    else {
+        return;
+    };
+    s.proposals_refused_raft = s.proposals_refused_raft.wrapping_add(1);
+    if s.proposals_refused_raft & 0x3F == 1 {
+        let mut line = [0u8; 64];
+        let mut pos = 0usize;
+        for &b in b"[sess] proposal refused by raft status=" {
+            line[pos] = b;
+            pos += 1;
+        }
+        pos += fmt_u32_raw(line.as_mut_ptr().add(pos), r.status as u32);
+        for &b in b" n=" {
+            line[pos] = b;
+            pos += 1;
+        }
+        pos += fmt_u32_raw(line.as_mut_ptr().add(pos), s.proposals_refused_raft);
+        dev_log(sys, 2, line.as_ptr(), pos);
+    }
+    match op {
+        OP_PUBLISH | OP_PUBREL => {
+            let si = session_slot as usize;
+            if si >= MAX_SESSIONS {
+                return;
+            }
+            // Only the flow this correlation was bound to: a packet id is
+            // the client's to reuse once its flow is gone.
+            let Some(ii) = sessions::inflight_find(&s.sessions, si, packet_id, INFLIGHT_PUB) else {
+                return;
+            };
+            let bound = sessions::inflight_view(&s.sessions, si, ii)
+                .is_some_and(|v| v.correlation_id == r.correlation_id);
+            if !bound {
+                return;
+            }
+            if op == OP_PUBLISH {
+                s.publishes_throttled = s.publishes_throttled.wrapping_add(1);
+            }
+            fail_publisher_flow(s, sys, si, ii, op == OP_PUBREL, r.status);
+        }
+        #[cfg(any(feature = "kafka", feature = "amqp"))]
+        OP_KPRODUCE | OP_KOFFSET => fail_kin(s, sys, session_slot, packet_id, r.status),
+        _ => {}
+    }
+}
+
+/// Fail an MQTT publisher flow whose proposal will not commit — refused by
+/// Clustor, or superseded at its index — with a refusal `status`. A
+/// PUBLISH's inflight is released; a PUBREL's flow keeps its QoS 2 PUBREL
+/// phase with no correlation and no assignment, so the resent PUBREL
+/// proposes afresh and no late completion reads as its PUBCOMP. MQTT has no
+/// negative acknowledgement that keeps the packet id, so the connection is
+/// closed with the mapped reason and the client resends on reconnect. The
+/// DISCONNECT is never lost to a full codec bus: one with no room is owed
+/// to the connection (`disc_owed`) and written once its output holds
+/// nothing ahead of it.
+///
+/// The publish stash is not the flow's to release. A stash is opened only
+/// by `apply_qop_publish`, for an entry that COMMITTED, under the
+/// correlation the flow's inflight held when it applied — so a proposal
+/// that failed never has one of its own. The only stash this flow's
+/// correlation can name is a committed entry of the same flow: an
+/// `OUTCOME_UNKNOWN` (refused or completed) whose entry did commit, or an
+/// earlier attempt of the publish committing under the resend's
+/// correlation. Its dedup key is already filed, so releasing it would lose
+/// the message — the resend reads DUPLICATE and is never fanned out. It
+/// frees on its dedup verdict and the topic bus, as every stash does
+/// (`finalise_stash`), and the failed flow's correlation is never reused.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn fail_publisher_flow(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    si: usize,
+    ii: usize,
+    pubrel: bool,
+    status: u8,
+) {
+    if pubrel {
+        sessions::inflight_set_correlation(&mut s.sessions, si, ii, 0);
+        sessions::inflight_set_wal_index(&mut s.sessions, si, ii, 0, 0, 0);
+    } else {
+        sessions::inflight_release(&mut s.sessions, si, ii);
+    }
+    if sessions::is_active(&s.sessions, si) || sessions::is_transient(&s.sessions, si) {
+        let conn_id = sessions::conn_id(&s.sessions, si);
+        let reason = refusal::mqtt_disconnect_reason(status);
+        emit_codec_response(s, sys, conn_id, PROTO_MQTT, PKT_DISCONNECT, 0, &[reason]);
+    }
+}
+
+/// Fail one partition of a Kafka Produce, a Kafka OffsetCommit or an AMQP
+/// confirm-mode publish (the inflight `session_slot` / `packet_id` name)
+/// whose proposal will not commit, with a refusal `status`: the produce
+/// partition answers the mapped error and the response fires once every
+/// partition has resolved; the OffsetCommit answers every partition with
+/// its error now; the AMQP publish is Basic.Nack'd.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[cfg(any(feature = "kafka", feature = "amqp"))]
+#[cfg_attr(
+    not(feature = "kafka"),
+    allow(
+        unused_variables,
+        reason = "the status maps only Kafka's errors and the packet id names only a Kafka produce partition; a Basic.Nack carries neither"
+    )
+)]
+unsafe fn fail_kin(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    session_slot: u32,
+    packet_id: u16,
+    status: u8,
+) {
+    if session_slot < KAFKA_SLOT_BASE {
+        return;
+    }
+    let (ki, epoch) = store::kin_decode_slot(session_slot);
+    let pidx = (packet_id >> 8) as usize;
+    if ki >= KAFKA_INFLIGHT || !store::inflight_valid(&s.store, ki, epoch) {
+        return;
+    }
+    // An answer already decided and owed stands.
+    if store::inflight_owed(&s.store, ki) != store::ANSWER_NONE {
+        return;
+    }
+    let Some(e) = store::inflight_get(&s.store, ki) else {
+        return;
+    };
+    match e.proto {
+        #[cfg(feature = "amqp")]
+        KIN_PROTO_AMQP => {
+            // A confirm-mode publisher waits on this tag indefinitely, so
+            // a Nack the codec bus has no room for keeps the slot, owed,
+            // and is answered on a later step.
+            answer_inflight(s, sys, ki, store::ANSWER_NACK);
+        }
+        #[cfg(feature = "kafka")]
+        KIN_PROTO_KAFKA_OFFSET => {
+            // Later answers for its other offsets find the slot
+            // freed (its epoch moves on) and are dropped.
+            let err = refusal::kafka_offset_error(status);
+            let n = store::inflight_response(&s.store, ki).len();
+            s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
+            if n > 0 && n <= s.out_buf.len() {
+                s.out_buf[..n].copy_from_slice(store::inflight_response(&s.store, ki));
+                if refusal::offset_commit_fail(&mut s.out_buf[..n], err)
+                    && store::inflight_set_response(&mut s.store, ki, &s.out_buf[..n])
+                {
+                    // The failed body is the answer now, owed if the bus
+                    // has no room for it.
+                    answer_inflight(s, sys, ki, store::ANSWER_OFFSET);
+                    return;
+                }
+            }
+            store::inflight_free(&mut s.store, ki);
+        }
+        #[cfg(feature = "kafka")]
+        KIN_PROTO_KAFKA => {
+            // This partition is resolved — with an error — on both
+            // counts the response waits for. Its apply is counted once
+            // however it lands: an `OUTCOME_UNKNOWN` entry may still
+            // commit and apply after this, or have applied before it.
+            if pidx >= KIN_MAX_PARTS {
+                return;
+            }
+            let err = refusal::kafka_produce_error(status);
+            store::inflight_set_part_err(&mut s.store, ki, pidx, err);
+            store::inflight_complete_part(&mut s.store, ki);
+            store::inflight_apply_part(&mut s.store, ki, pidx);
+            s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
+            if store::inflight_ready(&s.store, ki) {
+                answer_inflight(s, sys, ki, store::ANSWER_PRODUCE);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Answer inflight slot `ki` with `answer` (`store::ANSWER_*`) and free
+/// it. The answer is decided where the input cannot wait for room — a
+/// committed entry, Clustor's refusal, the expiry sweep — so it is met as
+/// [`Reply::Kept`]: when the codec bus and the hold have no room, the slot
+/// is kept with the answer owed, and [`answer_owed_inflights`] answers it
+/// on a later step. Returns whether it was answered now.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[cfg(any(feature = "kafka", feature = "amqp"))]
+unsafe fn answer_inflight(s: &mut ModuleState, sys: &SyscallTable, ki: usize, answer: u8) -> bool {
+    let Some(e) = store::inflight_get(&s.store, ki) else {
+        return false;
+    };
+    // Only the arms a variant carries read the entry.
+    let _ = &e;
+    // A coordinator call's slot is answered as one, whatever input this
+    // answer is decided on.
+    let outer_coord = s.coord_reply;
+    s.coord_reply = e.coord == 1;
+    let taken = match answer {
+        #[cfg(feature = "kafka")]
+        store::ANSWER_PRODUCE => emit_kafka_produce_response_multi(s, sys, ki),
+        #[cfg(feature = "kafka")]
+        store::ANSWER_OFFSET => {
+            let n = store::inflight_response(&s.store, ki).len();
+            if n == 0 || n > s.out_buf.len() {
+                // Nothing parked to answer with: freed, as it always was.
+                true
+            } else {
+                s.out_buf[..n].copy_from_slice(store::inflight_response(&s.store, ki));
+                kafka_outbuf_reply(
+                    s,
+                    sys,
+                    e.conn_id,
+                    8,
+                    e.api_ver,
+                    e.kafka_corr,
+                    n,
+                    Reply::Kept,
+                )
+            }
+        }
+        #[cfg(feature = "amqp")]
+        store::ANSWER_ACK | store::ANSWER_NACK => {
+            let mut rest = [0u8; 9];
+            rest[0..8].copy_from_slice(&e.delivery_tag.to_le_bytes());
+            rest[8] = u8::from(answer == store::ANSWER_NACK);
+            emit_amqp_reply(s, sys, e.conn_id, 1, e.channel, &rest, Reply::Kept)
+        }
+        _ => true,
+    };
+    s.coord_reply = outer_coord;
+    if taken {
         store::inflight_free(&mut s.store, ki);
+    } else {
+        store::inflight_owe(&mut s.store, ki, answer);
+        s.answers_owed = s.answers_owed.wrapping_add(1);
+    }
+    taken
+}
+
+/// Answer the inflight slots whose answer is owed, lowest first, until
+/// the bus has no room for the next.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[cfg(any(feature = "kafka", feature = "amqp"))]
+unsafe fn answer_owed_inflights(s: &mut ModuleState, sys: &SyscallTable) {
+    for ki in 0..KAFKA_INFLIGHT {
+        let answer = store::inflight_owed(&s.store, ki);
+        if answer != store::ANSWER_NONE && !answer_inflight(s, sys, ki, answer) {
+            return;
+        }
+    }
+}
+
+/// Answer Kafka inflight `ki` (a copy `e` of its record), expired before
+/// all its proposals resolved, as timed out: a produce partition still
+/// unresolved answers `REQUEST_TIMED_OUT`, an OffsetCommit's parked
+/// answer has every partition failed with it. Answered as
+/// [`answer_inflight`] answers (owed when the bus has no room). `false`
+/// when `ki` is not a Kafka inflight.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[cfg(feature = "kafka")]
+unsafe fn expire_kafka_inflight(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    ki: usize,
+    e: store::KafkaInflight,
+) -> bool {
+    match e.proto {
+        KIN_PROTO_KAFKA => {
+            for pi in 0..usize::from(e.n_parts).min(KIN_MAX_PARTS) {
+                if e.part_errs[pi] == KERR_NONE && e.part_offs[pi] < 0 {
+                    store::inflight_set_part_err(&mut s.store, ki, pi, KERR_REQUEST_TIMED_OUT);
+                }
+            }
+            s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
+            answer_inflight(s, sys, ki, store::ANSWER_PRODUCE);
+            true
+        }
+        KIN_PROTO_KAFKA_OFFSET => {
+            s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
+            let n = store::inflight_response(&s.store, ki).len();
+            if n > 0 && n <= s.out_buf.len() {
+                s.out_buf[..n].copy_from_slice(store::inflight_response(&s.store, ki));
+                if refusal::offset_commit_fail(&mut s.out_buf[..n], KERR_REQUEST_TIMED_OUT)
+                    && store::inflight_set_response(&mut s.store, ki, &s.out_buf[..n])
+                {
+                    answer_inflight(s, sys, ki, store::ANSWER_OFFSET);
+                    return true;
+                }
+            }
+            // No parked answer to fail: the request has none, so the
+            // codec is told, and closes the connection in its turn.
+            store::inflight_free(&mut s.store, ki);
+            s.kafka_unanswered = s.kafka_unanswered.wrapping_add(1);
+            let outer_coord = s.coord_reply;
+            s.coord_reply = e.coord == 1;
+            emit_kafka_response(
+                s,
+                sys,
+                e.conn_id,
+                wire::KAFKA_API_CLOSE,
+                e.api_ver,
+                e.kafka_corr,
+                &[],
+            );
+            s.coord_reply = outer_coord;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2373,7 +3071,16 @@ unsafe fn emit_kafka_produce_response_multi(
         s.out_buf[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
         p += 4;
     }
-    emit_kafka_response_outbuf(s, sys, e.conn_id, 0, e.api_ver, e.kafka_corr, p)
+    kafka_outbuf_reply(
+        s,
+        sys,
+        e.conn_id,
+        0,
+        e.api_ver,
+        e.kafka_corr,
+        p,
+        Reply::Kept,
+    )
 }
 
 // ── Apply-side message store ────────────────────────────────────────────────
@@ -2498,7 +3205,8 @@ unsafe fn reconcile_group_generations(s: &mut ModuleState, sys: &SyscallTable) {
 /// Apply-side QOP_KAFKA_PRODUCE: store the committed record batches and
 /// patch each baseOffset to the partition's contiguous logical offset
 /// (bytes 0..8 of a v2 batch sit OUTSIDE the batch CRC, so the patch is
-/// safe). Op-body: [partition:u16 LE][topic_len:u16 LE][topic][records].
+/// safe). Op-body: `wire::QOP_KAFKA_PRODUCE`'s
+/// ([`wire::decode_produce_body_hdr`]), then the records.
 ///
 /// `records` may hold SEVERAL v2 batches concatenated (a producer that
 /// accumulates multiple record batches for one partition sends them
@@ -2511,28 +3219,29 @@ unsafe fn apply_kafka_produce(
     body: &[u8],
     session_slot: u32,
 ) {
-    if body.len() < 5 {
+    let Some(h) = wire::decode_produce_body_hdr(body) else {
         return;
-    }
-    let origin = body[0];
-    let partition = u16::from_le_bytes([body[1], body[2]]);
-    let tl = u16::from_le_bytes([body[3], body[4]]) as usize;
-    if tl == 0 || tl > KAFKA_MAX_TOPIC || 5 + tl >= body.len() {
+    };
+    let (origin, origin_worker, partition, tl) =
+        (h.origin, h.origin_worker, h.partition, h.topic_len);
+    if tl == 0 || tl > KAFKA_MAX_TOPIC || h.records_at >= body.len() {
         return;
     }
     let mut topic = [0u8; KAFKA_MAX_TOPIC];
-    topic[..tl].copy_from_slice(&body[5..5 + tl]);
-    let records = &body[5 + tl..];
+    topic[..tl].copy_from_slice(&body[wire::PRODUCE_BODY_HDR..h.records_at]);
+    let records = &body[h.records_at..];
 
     // Resolve the client waiting on this batch, if it is ours. The
-    // origin check is what makes this safe on a follower: a replica
-    // that did not accept the produce never touches an inflight slot,
-    // so it cannot stamp an offset onto an unrelated client's request.
-    // `inflight_valid` then rejects a slot that has been freed and
-    // reused since (EPOCH TAGGING), and the topic/partition check
-    // rejects a slot whose occupant is a different request.
+    // origin check is what makes this safe on a follower and on a
+    // co-located worker, both of which apply the entry: a replica — or a
+    // worker — that did not accept the produce never touches an inflight
+    // slot, so it cannot stamp an offset onto an unrelated client's
+    // request. `inflight_valid` then rejects a slot that has been freed
+    // and reused since (EPOCH TAGGING, the epoch naming the worker too),
+    // and the topic/partition check rejects a slot whose occupant is a
+    // different request.
     let mut waiting: Option<(usize, usize)> = None;
-    if origin != wire::PRODUCE_ORIGIN_NONE && origin == s.self_id {
+    if origin != wire::PRODUCE_ORIGIN_NONE && origin == s.self_id && origin_worker == s.worker_id {
         let (ki, epoch) = store::kin_decode_slot(session_slot);
         if ki < KAFKA_INFLIGHT && store::inflight_valid(&s.store, ki, epoch) {
             if let Some(e) = store::inflight_get(&s.store, ki) {
@@ -2708,12 +3417,17 @@ unsafe fn apply_kafka_produce(
     // independent post-commit signals with no ordering between them —
     // measured: the ack routinely arrives FIRST — so whichever completes
     // last releases the response. Gating on durability alone reported an
-    // offset apply had not yet assigned.
-    if let Some((ki, _)) = waiting {
-        store::inflight_apply_part(&mut s.store, ki);
-        if store::inflight_ready(&s.store, ki) && emit_kafka_produce_response_multi(s, sys, ki) {
+    // offset apply had not yet assigned. A partition already failed
+    // (refused or superseded, `fail_kin`) counted its apply then; an
+    // `OUTCOME_UNKNOWN` one may still commit and land here, and counts
+    // nothing twice.
+    if let Some((ki, pidx)) = waiting {
+        store::inflight_apply_part(&mut s.store, ki, pidx);
+        if store::inflight_ready(&s.store, ki)
+            && store::inflight_owed(&s.store, ki) == store::ANSWER_NONE
+            && answer_inflight(s, sys, ki, store::ANSWER_PRODUCE)
+        {
             s.kafka_produce_acked = s.kafka_produce_acked.wrapping_add(1);
-            store::inflight_free(&mut s.store, ki);
             s.acks_emitted = s.acks_emitted.wrapping_add(1);
         }
     }
@@ -2760,6 +3474,38 @@ unsafe fn emit_kafka_response_outbuf(
     kafka_corr: i32,
     body_len: usize,
 ) -> bool {
+    kafka_outbuf_reply(
+        s,
+        sys,
+        conn_id,
+        api_key,
+        api_ver,
+        kafka_corr,
+        body_len,
+        Reply::Must,
+    )
+}
+
+#[cfg(feature = "kafka")]
+/// [`emit_kafka_response_outbuf`], met as `reply` says when the bus has
+/// no room for it.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the envelope's fields and how a refusal is met"
+)]
+unsafe fn kafka_outbuf_reply(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u16,
+    api_key: i16,
+    api_ver: i16,
+    kafka_corr: i32,
+    body_len: usize,
+    reply: Reply,
+) -> bool {
     let total = KAFKA_ENV_HDR + body_len;
     if total > BUF_SIZE {
         return false;
@@ -2771,13 +3517,13 @@ unsafe fn emit_kafka_response_outbuf(
         body_len,
     );
     write_kafka_env_header(&mut s.out_buf, conn_id, api_key, api_ver, kafka_corr);
-    let w = wire::channel_write_msg(
-        sys,
-        s.out_codec,
-        wire::MSG_SESSION_RESPONSE,
-        &s.out_buf[..total],
-    );
-    w > 0
+    let mut out = [0u8; BUF_SIZE];
+    out[..total].copy_from_slice(&s.out_buf[..total]);
+    let chan = s.out_codec;
+    // Counted, as every response the anchor relays (`emit_kafka_response`).
+    let taken = respond(s, sys, chan, conn_id, &out[..total], reply, true).taken();
+    s.kafka_settled |= taken;
+    taken
 }
 
 /// Try to serve a Fetch from the WAL because its offset has aged out of
@@ -2838,7 +3584,8 @@ unsafe fn try_park_cold_fetch(
         return false;
     };
     let request_id = s.next_cold_id;
-    s.next_cold_id = s.next_cold_id.wrapping_add(1).max(1);
+    s.next_cold_id =
+        cold_id_base(s.worker_id) | (s.next_cold_id.wrapping_add(1) & COLD_ID_MASK).max(1);
 
     let mut buf = [0u8; wire::WAL_ENTRY_REQUEST_LEN];
     wire::encode_wal_entry_request(&mut buf, request_id, raft_index);
@@ -2870,6 +3617,8 @@ unsafe fn try_park_cold_fetch(
     c.topic_len = tl as u8;
     c.part_idx = pi as u8;
     c.topic[..tl].copy_from_slice(&topic[..tl]);
+    // Answered from the cold slot, by the WAL's reply or its timeout.
+    s.kafka_settled = true;
     true
 }
 
@@ -2884,7 +3633,7 @@ unsafe fn emit_cold_fetch_response(
     hw: i64,
     log_start: i64,
     records: &[u8],
-) {
+) -> bool {
     let c = s.cold[slot];
     let tl = c.topic_len as usize;
     let mut p = 0usize;
@@ -2925,8 +3674,13 @@ unsafe fn emit_cold_fetch_response(
         s.out_buf[p..p + n].copy_from_slice(&records[..n]);
         p += n;
     }
-    emit_kafka_response_outbuf(s, sys, c.conn_id, 1, c.api_ver, c.corr, p);
+    // Answered from a reply that cannot wait: held while there is room,
+    // else the slot is kept with its answer owed.
+    if !kafka_outbuf_reply(s, sys, c.conn_id, 1, c.api_ver, c.corr, p, Reply::Kept) {
+        return false;
+    }
     s.cold[slot].active = 0;
+    true
 }
 
 /// Bounds on how much of a Fetch/ListOffsets request we service in one
@@ -3314,13 +4068,49 @@ unsafe fn handle_kafka_list_offsets(s: &mut ModuleState, sys: &SyscallTable, ple
 ///
 /// # Safety
 unsafe fn emit_amqp_response(
+    s: &mut ModuleState,
     sys: &SyscallTable,
-    chan: i32,
     conn_id: u16,
     op: u8,
     channel: u16,
     rest: &[u8],
 ) -> bool {
+    emit_amqp_reply(s, sys, conn_id, op, channel, rest, Reply::Must)
+}
+
+/// [`emit_amqp_response`] for work the caller keeps and offers again
+/// ([`Reply::Offer`]).
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[cfg(feature = "amqp")]
+unsafe fn offer_amqp_response(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u16,
+    op: u8,
+    channel: u16,
+    rest: &[u8],
+) -> bool {
+    emit_amqp_reply(s, sys, conn_id, op, channel, rest, Reply::Offer)
+}
+
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the envelope's fields and how a refusal is met; the two callers above are the API"
+)]
+unsafe fn emit_amqp_reply(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u16,
+    op: u8,
+    channel: u16,
+    rest: &[u8],
+    reply: Reply,
+) -> bool {
+    let chan = s.out_codec;
     if chan < 0 {
         return false;
     }
@@ -3334,7 +4124,8 @@ unsafe fn emit_amqp_response(
     out[3] = op;
     out[4..6].copy_from_slice(&channel.to_le_bytes());
     out[AMQP_ENV_HDR..total].copy_from_slice(rest);
-    wire::channel_write_msg(sys, chan, wire::MSG_SESSION_RESPONSE, &out[..total]) > 0
+    // Counted, as every response the anchor relays (`emit_kafka_response`).
+    respond(s, sys, chan, conn_id, &out[..total], reply, true).taken()
 }
 
 #[cfg(feature = "amqp")]
@@ -3366,7 +4157,7 @@ unsafe fn handle_amqp_publish(s: &mut ModuleState, sys: &SyscallTable, now: u64,
             let mut rest = [0u8; 9];
             rest[0..8].copy_from_slice(&delivery_tag.to_le_bytes());
             rest[8] = 1;
-            emit_amqp_response(sys, s.out_codec, conn_id, 1, channel, &rest);
+            emit_amqp_response(s, sys, conn_id, 1, channel, &rest);
         }
     };
 
@@ -3511,7 +4302,7 @@ unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) 
     // shape — the codec parses one fixed layout for both outcomes.
     let empty = |s: &mut ModuleState, sys: &SyscallTable| {
         let rest = [1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        emit_amqp_response(sys, s.out_codec, conn_id, 2, channel, &rest);
+        emit_amqp_response(s, sys, conn_id, 2, channel, &rest);
     };
 
     let Some(pi) = store::find(&s.store, &queue[..ql], 0) else {
@@ -3549,7 +4340,7 @@ unsafe fn handle_amqp_get(s: &mut ModuleState, sys: &SyscallTable, plen: usize) 
     rest[1..9].copy_from_slice(&(offset + 1).to_le_bytes());
     rest[9..13].copy_from_slice(&remaining_after.to_le_bytes());
     store::copy_entry_into(&s.store, pi, data_pos as usize, l, &mut rest[13..13 + l]);
-    emit_amqp_response(sys, s.out_codec, conn_id, 2, channel, &rest[..13 + l]);
+    emit_amqp_response(s, sys, conn_id, 2, channel, &rest[..13 + l]);
 }
 
 // ── Kafka consumer-group + offset APIs ──────────────────────────────────────
@@ -4167,6 +4958,8 @@ unsafe fn handle_kafka_offset_commit(
     let parked = match gate {
         Some((ki, _)) if gated_parts > 0 => {
             if store::inflight_set_response(&mut s.store, ki, &s.out_buf[..p]) {
+                // Answered from the slot once its offsets are durable.
+                s.kafka_settled = true;
                 store::inflight_open(
                     &mut s.store,
                     ki,
@@ -4185,6 +4978,10 @@ unsafe fn handle_kafka_offset_commit(
                     },
                     &[],
                 );
+                // Committed through the coordinator: answered through it.
+                if s.coord_reply {
+                    store::inflight_set_coord(&mut s.store, ki);
+                }
                 true
             } else {
                 // Larger than a slot can park. Answer now and count it.
@@ -4349,7 +5146,7 @@ unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usi
         let mut rest = [0u8; 2 + AMQP_TAG_MAX];
         rest[0..2].copy_from_slice(&(tl as u16).to_le_bytes());
         rest[2..2 + tl].copy_from_slice(&s.in_buf[toff..toff + tl]);
-        emit_amqp_response(sys, s.out_codec, conn_id, 4, channel, &rest[..2 + tl]);
+        emit_amqp_response(s, sys, conn_id, 4, channel, &rest[..2 + tl]);
         return;
     };
     let mut tag = [0u8; AMQP_TAG_MAX];
@@ -4373,6 +5170,9 @@ unsafe fn handle_amqp_consume(s: &mut ModuleState, sys: &SyscallTable, plen: usi
         &queue[..ql],
         cursor,
     );
+    if s.coord_reply {
+        consumers::consumer_set_coord(&mut s.consumers, slot);
+    }
 }
 
 #[cfg(feature = "amqp")]
@@ -4481,14 +5281,13 @@ unsafe fn amqp_delivery_pump(s: &mut ModuleState, sys: &SyscallTable) {
                 l,
                 &mut rest[11 + tl..11 + tl + l],
             );
-            if !emit_amqp_response(
-                sys,
-                s.out_codec,
-                view.conn_id,
-                3,
-                view.channel,
-                &rest[..11 + tl + l],
-            ) {
+            // A consumer registered through the coordinator is delivered
+            // to as one: wherever its connection is bound.
+            s.coord_reply = view.coord;
+            let offered =
+                offer_amqp_response(s, sys, view.conn_id, 3, view.channel, &rest[..11 + tl + l]);
+            s.coord_reply = false;
+            if !offered {
                 // Backpressure: retry next tick from the same cursor.
                 break;
             }
@@ -4779,6 +5578,9 @@ struct ColdFetch {
     fetch_offset: i64,
     request_id: u32,
     issued_ms: u64,
+    /// The answer is decided and the codec bus had no room for it
+    /// (`COLD_OWED_*`): kept, and answered on a later step.
+    owed: u8,
     topic: [u8; KAFKA_MAX_TOPIC],
 }
 
@@ -4796,9 +5598,55 @@ impl ColdFetch {
             fetch_offset: 0,
             request_id: 0,
             issued_ms: 0,
+            owed: COLD_OWED_NONE,
             topic: [0; KAFKA_MAX_TOPIC],
         }
     }
+}
+
+/// No cold-fetch answer is owed.
+#[cfg(feature = "kafka")]
+const COLD_OWED_NONE: u8 = 0;
+/// An empty Fetch is owed: the records read back had no room on the bus,
+/// so the client is told "nothing yet" and fetches the offset again.
+#[cfg(feature = "kafka")]
+const COLD_OWED_EMPTY: u8 = 1;
+/// The timeout's OFFSET_OUT_OF_RANGE is owed.
+#[cfg(feature = "kafka")]
+const COLD_OWED_TIMEOUT: u8 = 2;
+
+/// Whether this worker still owes `conn` an answer it gives later than
+/// the request: an inflight slot (Kafka Produce / OffsetCommit awaiting
+/// durability or apply, an AMQP confirm, or any of those owed for want
+/// of bus room) or a parked cold Fetch. Such an answer exists only here
+/// — its correlation, its place in the connection's request order and
+/// the partition outcome it will report — and a handoff that exported
+/// the connection now would leave it to a frozen, fenced worker: the
+/// client's request would never be answered. `worker::quiescent` waits
+/// for it, as it waits for an MQTT flow still in Raft.
+fn answer_deferred_for(s: &ModuleState, conn: u16) -> bool {
+    if store::inflight_for_conn(&s.store, conn) {
+        return true;
+    }
+    #[cfg(feature = "kafka")]
+    if s.cold.iter().any(|c| c.active == 1 && c.conn_id == conn) {
+        return true;
+    }
+    false
+}
+
+/// A cold read's request id: the worker's id in the top 3 bits, a counter
+/// below. Durability answers on one `cold_read_reply` the co-located
+/// workers share, and each takes only the ids it issued.
+#[cfg(feature = "kafka")]
+const COLD_ID_SHIFT: u32 = 29;
+#[cfg(feature = "kafka")]
+const COLD_ID_MASK: u32 = (1 << COLD_ID_SHIFT) - 1;
+
+/// The request-id namespace of worker `worker` (`COLD_ID_SHIFT`).
+#[cfg(feature = "kafka")]
+const fn cold_id_base(worker: u8) -> u32 {
+    ((worker & 0x07) as u32) << COLD_ID_SHIFT
 }
 
 /// How long a parked cold fetch waits before it is answered
@@ -5372,7 +6220,7 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
     let flags = sub_qos << 1;
     let mut body = [0u8; BUF_SIZE];
     body[..body_len].copy_from_slice(&s.out_buf[..body_len]);
-    let emitted = emit_codec_response(
+    let emitted = offer_codec_response(
         s,
         sys,
         conn_id,
@@ -5413,6 +6261,58 @@ unsafe fn try_deliver(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) -> De
             }
         }
         DeliverResult::Waits(order::Waits::Edge)
+    }
+}
+
+/// Note one applied committed entry in its partition's term run. A run
+/// the entry closes (the committed log changed term, or the index jumped)
+/// is queued for `flow` at once. Partitions past the tracked range are not
+/// reported: `flow` keeps no view of them either.
+fn note_applied_entry(s: &mut ModuleState, partition_id: u16, index: u64, entry_term: u64) {
+    let pi = partition_id as usize;
+    if pi >= MAX_APPLY_PARTITIONS {
+        return;
+    }
+    if let Some(closed) = s.applied_runs[pi].note(index, entry_term) {
+        if !s.applied_spill.push(partition_id, closed) {
+            s.applied_notice_drops = s.applied_notice_drops.wrapping_add(1);
+        }
+    }
+}
+
+/// Report the applied term runs to `flow` (MSG_ACK_APPLIED on the forward
+/// bus): every closed run held in the spill, oldest first, whenever there
+/// are any; each partition's open run once per [`APPLIED_NOTICE_MS`]. A
+/// notice the edge refuses stays owed for the next step.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn flush_applied_runs(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    if s.out_forward < 0 {
+        return;
+    }
+    while let Some((pid, run)) = s.applied_spill.front() {
+        let body = term::encode_applied(pid, run);
+        if !try_emit(sys, s.out_forward, wire::MSG_ACK_APPLIED, &body) {
+            return;
+        }
+        s.applied_spill.pop_front();
+    }
+    if now.wrapping_sub(s.applied_notice_ms) < APPLIED_NOTICE_MS {
+        return;
+    }
+    s.applied_notice_ms = now;
+    for pi in 0..MAX_APPLY_PARTITIONS {
+        let Some(run) = s.applied_runs[pi].owed() else {
+            continue;
+        };
+        let body = term::encode_applied(pi as u16, run);
+        if !try_emit(sys, s.out_forward, wire::MSG_ACK_APPLIED, &body) {
+            // The edge is full: the rest stay owed, retried next step.
+            s.applied_notice_ms = now.wrapping_sub(APPLIED_NOTICE_MS);
+            return;
+        }
+        s.applied_runs[pi].mark_sent(run.last);
     }
 }
 
@@ -5490,7 +6390,24 @@ unsafe fn apply_reset(
 /// # Safety
 /// Caller must hold an exclusive `&mut ModuleState`, supply a valid
 /// `&SyscallTable`, and guarantee `body_start <= body_end <= s.in_buf.len()`.
-/// Whether this worker applies a committed session-scoped entry.
+/// Whether committed op `op` names no session: a Kafka record batch, a
+/// committed offset, a group's generation or member, an AMQP message.
+/// Their state is the log's, not a session's, and every worker applies
+/// them (`entry_is_mine`) — whatever `session_slot` the proposal carries,
+/// which for these is a durable-publish inflight (`KAFKA_SLOT_BASE`) or 0.
+fn op_names_no_session(op: u8) -> bool {
+    matches!(
+        op,
+        wire::QOP_KAFKA_PRODUCE
+            | wire::QOP_KAFKA_OFFSET
+            | wire::QOP_KAFKA_GROUP_GEN
+            | wire::QOP_KAFKA_GROUP_MEMBER
+            | wire::QOP_AMQP_PUBLISH
+    )
+}
+
+/// Whether this worker applies a committed entry of op `op` naming
+/// `slot`.
 ///
 /// One worker per node (the default, `co_located_workers == 0`) applies
 /// everything — it must hold every session's durable record, as a Raft
@@ -5498,11 +6415,20 @@ unsafe fn apply_reset(
 /// entries of sessions it holds, or of slots it allocates and has not
 /// lent out: an entry proposed by the other worker for a session it
 /// owns must not create a second, persisted copy here, whose
-/// subscriptions and offline queue would then shadow the live one. Ops
-/// that name no session (Kafka logs, control-plane records, remote
-/// subscriptions) belong to worker 0.
-fn entry_is_mine(s: &ModuleState, slot: u32) -> bool {
-    if s.co_located_workers == 0 {
+/// subscriptions and offline queue would then shadow the live one.
+///
+/// An op that names no session (`op_names_no_session`: the Kafka log,
+/// committed offsets, group records, AMQP messages) is applied by EVERY
+/// worker, so a Kafka or AMQP connection is served by whichever worker
+/// holds it: each one reads the same log, numbers it with the same
+/// offsets and answers its own clients — a produce's origin names the
+/// node AND the worker (`wire::QOP_KAFKA_PRODUCE`), and an inflight
+/// slot's epoch names the worker (`store::inflight_alloc`), so only the
+/// worker that accepted a request resolves it. Remote subscriptions
+/// (`SESSION_SLOT_REMOTE`) and the slots past the session table still
+/// belong to worker 0.
+fn entry_is_mine(s: &ModuleState, op: u8, slot: u32) -> bool {
+    if s.co_located_workers == 0 || op_names_no_session(op) {
         return true;
     }
     if slot == SESSION_SLOT_REMOTE || slot as usize >= MAX_SESSIONS {
@@ -6783,8 +7709,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             return fault_drain(s, sys);
         }
         // The outbox toward `messaging` drains first, so every room check
-        // this step sees what the op edge took.
+        // this step sees what the op edge took; so do the held client
+        // responses, so every input gate sees what the codec bus took.
         flush_messaging(s, sys);
+        flush_holds(s, sys);
+        #[cfg(any(feature = "kafka", feature = "amqp"))]
+        answer_owed_inflights(s, sys);
 
         // ── Phase 1: drain flow signals (wire envelope) ──────────
         // flow_in is shared by admission (MSG_THROTTLE_CREDITS),
@@ -6898,6 +7828,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
             let codec_budget = if s.prop_hold_len > 0 { 0 } else { 32 };
             for _ in 0..codec_budget {
+                // Set below for the one envelope that is a coordinator
+                // call, read by every answer it makes.
+                s.coord_reply = false;
                 // Admission gate BEFORE the read. A packet taken off the
                 // channel with no credit to propose it has nowhere to go
                 // but the floor, and a QoS 1 PUBLISH on the floor is one
@@ -6955,12 +7888,43 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.codec_namespace_drops = s.codec_namespace_drops.wrapping_add(1);
                     continue;
                 }
+                // A coordinator call (`wire::MSG_COORD_CALL`): state this
+                // worker owns for the pair — a Kafka group and its offsets,
+                // an AMQP queue's cursor and consumers — whichever worker
+                // the connection is bound to. It is not the session's: no
+                // binding admits it, no cursor counts it, a frozen
+                // attachment does not drop it, and every answer it makes
+                // goes back as a coordinator answer (`coord_reply`).
+                if mt == wire::MSG_COORD_CALL {
+                    match worker::anchor_core::unwrap_coord_call_in_place(
+                        &mut s.in_buf,
+                        plen as usize,
+                    ) {
+                        Some((inner, n)) => {
+                            mt = inner;
+                            plen = n as u16;
+                            s.coord_reply = true;
+                            s.coord_calls = s.coord_calls.wrapping_add(1);
+                        }
+                        None => continue,
+                    }
+                    // The connection's close: what this worker coordinates
+                    // for it is released — its group memberships and its
+                    // queue consumers. Its binding, if this worker holds
+                    // one, ends on the session's own notice.
+                    if mt == wire::MSG_CONN_CLOSED && plen >= 2 {
+                        let c = env_conn_id(&s.in_buf);
+                        reply_hold::forget_coord(&mut s.hold, c);
+                        handle_conn_disconnect(s, c);
+                        continue;
+                    }
+                }
                 // Delivery cursor: every envelope for the attachment,
                 // header included, whatever it carries. A frozen
                 // attachment (exported, not yet detached) consumes
                 // nothing — the anchor holds its records, so one that
                 // still arrives is a stale one and is dropped.
-                if plen >= 2 {
+                if plen >= 2 && !s.coord_reply {
                     let c = env_conn_id(&s.in_buf);
                     if worker::is_frozen(&s.worker, c) {
                         s.worker.frozen_drops = s.worker.frozen_drops.wrapping_add(1);
@@ -7003,6 +7967,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // From an anchor it ends the binding as well, in order
                     // behind the client's last frames (`worker::client_gone`).
                     let c = env_conn_id(&s.in_buf);
+                    // Nothing held for the closed connection is written:
+                    // its id is the next connection's.
+                    reply_hold::forget_conn(&mut s.hold, c);
+                    reply_hold::settle(&mut s.disc_owed, c);
                     if !worker::client_gone(s, sys, c) {
                         handle_conn_disconnect(s, c);
                     }
@@ -8221,6 +9189,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                     inflight_ii,
                                     0,
                                     0,
+                                    0,
                                 );
                                 let inflight_idx = Some(inflight_ii);
 
@@ -8433,6 +9402,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // codec; the durable/data-path APIs land here.
                         if plen as usize >= KAFKA_ENV_HDR {
                             let api_key = i16::from_le_bytes([s.in_buf[3], s.in_buf[4]]);
+                            let (k_conn, k_ver, k_corr) = kafka_env_header(&s.in_buf);
+                            s.kafka_settled = false;
                             match api_key {
                                 0 => handle_kafka_produce(s, sys, now, plen as usize),
                                 1 => handle_kafka_fetch(s, sys, plen as usize),
@@ -8445,6 +9416,26 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 }
                                 14 => handle_kafka_sync_group(s, sys, plen as usize),
                                 _ => {}
+                            }
+                            if !s.kafka_settled {
+                                // No answer was made and none is owed (a
+                                // malformed request, a shape no response
+                                // fits, an API not served here): the codec
+                                // writes this connection's answers in
+                                // request order, so it is told this one
+                                // has none and closes the connection in
+                                // its turn rather than hold every later
+                                // answer behind it.
+                                s.kafka_unanswered = s.kafka_unanswered.wrapping_add(1);
+                                emit_kafka_response(
+                                    s,
+                                    sys,
+                                    k_conn,
+                                    wire::KAFKA_API_CLOSE,
+                                    k_ver,
+                                    k_corr,
+                                    &[],
+                                );
                             }
                         }
                     }
@@ -8531,6 +9522,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // body verbatim — clustor's tagged-proposal handler
                     // strips any leading correlation_id upstream).
                     let entry_partition = u16::from_le_bytes([s.in_buf[0], s.in_buf[1]]);
+                    let entry_term = u64::from_le_bytes([
+                        s.in_buf[2],
+                        s.in_buf[3],
+                        s.in_buf[4],
+                        s.in_buf[5],
+                        s.in_buf[6],
+                        s.in_buf[7],
+                        s.in_buf[8],
+                        s.in_buf[9],
+                    ]);
                     let entry_index = u64::from_le_bytes([
                         s.in_buf[10],
                         s.in_buf[11],
@@ -8644,7 +9645,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 replay_apply_ledger(s, &p, body_start, entry_end);
                                 if matches!(p.op, wire::QOP_DELIVER | wire::QOP_DELIVER_ACK) {
                                     None
-                                } else if !entry_is_mine(s, p.session_slot) {
+                                } else if op_names_no_session(p.op) {
+                                    // The log's, on every worker: no slot
+                                    // owns it, so no skip mark or import
+                                    // floor applies (a session imported at
+                                    // the slot such an entry happens to
+                                    // carry must not filter the log).
+                                    Some(p)
+                                } else if !entry_is_mine(s, p.op, p.session_slot) {
                                     let slot = p.session_slot as usize;
                                     if slot < MAX_SESSIONS {
                                         s.skip_part[slot] = entry_partition;
@@ -8679,6 +9687,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     s.apply_index[cur] = entry_index;
+                    note_applied_entry(s, entry_partition, entry_index, entry_term);
                     replay_release_floors(s);
                 } else if plen > 0 {
                     s.applied = s.applied.wrapping_add(1);
@@ -8686,15 +9695,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // ── Phase 3a: report the applied term runs to `flow` ──
+        flush_applied_runs(s, sys, now);
+
         // ── Phase 3b: drain proposal-assigned events from consensus ──
         //
         // Each MSG_PROPOSAL_ASSIGNED carries
         //   [correlation_id:u64 LE][partition_id:u16 LE][wal_index:u64 LE]
-        // (18 bytes). We forward `(partition_id, wal_index)` to
-        // the ack component via MSG_ACK_REGISTER so it can disambiguate the
-        // same wal_index arriving from different partitions —
-        // ack-on-durability matches by `(partition_id, wal_index)`,
-        // not just `wal_index`.
+        //   [term:u64 LE]
+        // (26 bytes). We forward `(partition_id, wal_index, term)` to
+        // the ack component via MSG_ACK_REGISTER: the partition id
+        // disambiguates the same wal_index arriving from different
+        // partitions, and the term names WHICH entry at that index — a
+        // leader change can commit another one there, which must fail the
+        // operation rather than acknowledge it.
         if s.in_assigned >= 0 {
             // 32/tick, matching the proposal-side burst capacity — every
             // tagged proposal produces exactly one assignment.
@@ -8707,12 +9721,20 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     worked += 1;
                     wire::channel_read_msg(sys, s.in_assigned, &mut s.in_buf)
                 };
+                if mt == wire::MSG_PROPOSAL_REFUSED {
+                    // No assignment follows a refusal: free the
+                    // correlation now and fail what waits on it.
+                    if let Some(r) = refusal::decode_refused(&s.in_buf[..plen as usize]) {
+                        on_proposal_refused(s, sys, r);
+                    }
+                    continue;
+                }
                 if mt != wire::MSG_PROPOSAL_ASSIGNED
                     || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN
                 {
                     continue;
                 }
-                let (cid, partition_id, wal_index) =
+                let (cid, partition_id, wal_index, wal_term) =
                     wire::decode_proposal_assigned(&s.in_buf[..wire::PROPOSAL_ASSIGNED_LEN]);
                 s.hb_assigned = s.hb_assigned.wrapping_add(1);
                 let issued = correlate::issued_ms(&s.correlate, cid);
@@ -8735,12 +9757,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     // the same (session_slot, packet_id) tuple. The epoch
                     // pins the completion to this session generation.
                     let reg_epoch = sessions::generation(&s.sessions, session_slot as usize);
-                    let mut reg = [0u8; wire::ACK_REGISTER_LEN];
-                    reg[0..4].copy_from_slice(&session_slot.to_le_bytes());
-                    reg[4..8].copy_from_slice(&(packet_id as u32).to_le_bytes());
-                    reg[8..10].copy_from_slice(&partition_id.to_le_bytes());
-                    reg[10..18].copy_from_slice(&wal_index.to_le_bytes());
-                    reg[18..22].copy_from_slice(&reg_epoch.to_le_bytes());
+                    let reg = term::encode_register(&term::Registration {
+                        session_slot,
+                        message_id: packet_id as u32,
+                        partition_id,
+                        wal_index,
+                        session_generation: reg_epoch,
+                        term: wal_term,
+                    });
 
                     // Stamp the wal_index onto the inflight slot regardless
                     // of register success — the publisher state machine
@@ -8757,6 +9781,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 ii,
                                 partition_id,
                                 wal_index,
+                                wal_term,
                             );
                         }
                     }
@@ -8814,6 +9839,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // drain a whole batch in the tick it lands or ack latency grows
             // by a tick per 8 acks.
             for _ in 0..32 {
+                // A completion is answered to the client at once.
+                if !hold_ready(s) {
+                    break;
+                }
                 let poll = (sys.channel_poll)(s.in_ack, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 {
                     break;
@@ -8825,6 +9854,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if plen < 8 {
                     continue;
                 }
+                // A completion names its verdict; one too short to carry
+                // it answers nothing.
+                let status = if mt == wire::MSG_ACK_EMIT {
+                    match term::emit_status(&s.in_buf[..plen as usize]) {
+                        Some(st) => st,
+                        None => continue,
+                    }
+                } else {
+                    term::STATUS_COMMITTED
+                };
                 let session_slot =
                     u32::from_le_bytes([s.in_buf[0], s.in_buf[1], s.in_buf[2], s.in_buf[3]])
                         as usize;
@@ -8841,17 +9880,30 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if mt != wire::MSG_ACK_EMIT {
                         continue;
                     }
-                    // Decode slot + epoch from session_slot; partition from
-                    // packet_id. An epoch mismatch means this durability
-                    // landed for a slot that has since been freed and
-                    // reused — drop it (EPOCH TAGGING) rather than
-                    // completing an unrelated request's publish.
+                    // Decode slot + epoch from session_slot. An epoch
+                    // mismatch means this durability landed for a slot
+                    // that has since been freed and reused — drop it
+                    // (EPOCH TAGGING) rather than completing an unrelated
+                    // request's publish. The packet id's high byte is not
+                    // bounded here: a produce's names one of its
+                    // `KIN_MAX_PARTS` partitions, but an OffsetCommit's
+                    // counts its gated proposals, up to 254, and every one
+                    // must land for the parked response to go out.
                     let (ki, epoch) = store::kin_decode_slot(session_slot as u32);
-                    let pidx = (packet_id >> 8) as usize;
-                    if ki >= KAFKA_INFLIGHT
-                        || pidx >= KIN_MAX_PARTS
-                        || !store::inflight_valid(&s.store, ki, epoch)
-                    {
+                    if ki >= KAFKA_INFLIGHT || !store::inflight_valid(&s.store, ki, epoch) {
+                        continue;
+                    }
+                    // An answer already decided and owed stands.
+                    if store::inflight_owed(&s.store, ki) != store::ANSWER_NONE {
+                        continue;
+                    }
+                    if status != term::STATUS_COMMITTED {
+                        // Not the entry committed at its index: fail the
+                        // partition / commit / confirm as a refusal with
+                        // that status would, so the client retries.
+                        s.acks_superseded = s.acks_superseded.wrapping_add(1);
+                        #[cfg(any(feature = "kafka", feature = "amqp"))]
+                        fail_kin(s, sys, session_slot as u32, packet_id, status);
                         continue;
                     }
                     // Which response shape to emit is the durable-publish
@@ -8863,20 +9915,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if store::inflight_proto(&s.store, ki) == KIN_PROTO_AMQP {
                         // Publisher confirm: Basic.Ack gated on quorum
                         // durability, mirroring the Kafka contract.
-                        if let Some(e) = store::inflight_get(&s.store, ki) {
-                            let mut rest = [0u8; 9];
-                            rest[0..8].copy_from_slice(&e.delivery_tag.to_le_bytes());
-                            rest[8] = 0;
-                            if emit_amqp_response(sys, s.out_codec, e.conn_id, 1, e.channel, &rest)
-                            {
-                                s.amqp_publish_acked = s.amqp_publish_acked.wrapping_add(1);
-                                store::inflight_free(&mut s.store, ki);
-                                s.acks_emitted = s.acks_emitted.wrapping_add(1);
-                            }
-                            // On emit failure the entry stays active; the
-                            // sweep expires it (Nack) and the publisher
-                            // retries.
+                        if answer_inflight(s, sys, ki, store::ANSWER_ACK) {
+                            s.amqp_publish_acked = s.amqp_publish_acked.wrapping_add(1);
+                            s.acks_emitted = s.acks_emitted.wrapping_add(1);
                         }
+                        // With no room on the bus the Ack is owed in the
+                        // slot and answered on a later step.
                         continue;
                     }
                     #[cfg(feature = "kafka")]
@@ -8885,25 +9929,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // until its proposals were durable. Fire the
                         // stored body once every one has landed — the
                         // client is told "committed" only now.
-                        if store::inflight_complete_part(&mut s.store, ki) {
-                            if let Some(e) = store::inflight_get(&s.store, ki) {
-                                let body = store::inflight_response(&s.store, ki);
-                                let n = body.len();
-                                if n > 0 && n <= s.out_buf.len() {
-                                    s.out_buf[..n].copy_from_slice(body);
-                                    emit_kafka_response_outbuf(
-                                        s,
-                                        sys,
-                                        e.conn_id,
-                                        8,
-                                        e.api_ver,
-                                        e.kafka_corr,
-                                        n,
-                                    );
-                                    s.acks_emitted = s.acks_emitted.wrapping_add(1);
-                                }
-                                store::inflight_free(&mut s.store, ki);
-                            }
+                        if store::inflight_complete_part(&mut s.store, ki)
+                            && answer_inflight(s, sys, ki, store::ANSWER_OFFSET)
+                        {
+                            s.acks_emitted = s.acks_emitted.wrapping_add(1);
                         }
                         continue;
                     }
@@ -8913,10 +9942,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         // durability. Respond once ALL have resolved.
                         store::inflight_complete_part(&mut s.store, ki);
                         if store::inflight_ready(&s.store, ki)
-                            && emit_kafka_produce_response_multi(s, sys, ki)
+                            && answer_inflight(s, sys, ki, store::ANSWER_PRODUCE)
                         {
                             s.kafka_produce_acked = s.kafka_produce_acked.wrapping_add(1);
-                            store::inflight_free(&mut s.store, ki);
                             s.acks_emitted = s.acks_emitted.wrapping_add(1);
                         }
                     }
@@ -8991,6 +10019,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             qos == 2 && phase == QOS2_PUBREL && inflight_wal == 0;
                         if ack_wal != 0 && (ack_wal != inflight_wal || awaiting_pubrel_assignment) {
                             s.acks_stale_epoch = s.acks_stale_epoch.wrapping_add(1);
+                            continue;
+                        }
+
+                        if status != term::STATUS_COMMITTED {
+                            // Another entry was committed at this flow's
+                            // index (or its term is unknown here): the
+                            // client must resend — DISCONNECT, as for a
+                            // refusal, and like a refusal it leaves the
+                            // publish stash alone (`fail_publisher_flow`).
+                            s.acks_superseded = s.acks_superseded.wrapping_add(1);
+                            let pubrel = qos == 2 && phase == QOS2_PUBREL;
+                            // An exported session's flow is the importer's,
+                            // which re-registers it and hears its own verdict.
+                            if worker::is_frozen(&s.worker, conn_id) {
+                                continue;
+                            }
+                            fail_publisher_flow(s, sys, session_slot, ii, pubrel, status);
                             continue;
                         }
 
@@ -9598,10 +10643,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         let out_messaging = s.out_messaging;
                         let mbox = &mut s.mbox;
                         let flow = &mut s.mflow;
-                        let out_codec = s.out_codec;
-                        let out_codec2 = s.out_codec2;
-                        let out_front = s.out_front;
-                        let w = &s.worker;
+                        let moved = &mut s.disc_owed;
                         let released = sessions::release_foreign(
                             &mut s.sessions,
                             |sh| view.is_local(sh),
@@ -9620,23 +10662,12 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 // nothing, never reaching the CONNECT
                                 // redirect. The codec spells the reason
                                 // per version and drops it for 3.1.1,
-                                // which has no server DISCONNECT.
+                                // which has no server DISCONNECT. Owed, and
+                                // written once its output holds nothing
+                                // ahead of it (`flush_holds`): one update can
+                                // release more sessions than a bus takes.
                                 if let Some(conn_id) = conn {
-                                    emit_codec_response_raw(
-                                        sys,
-                                        out_chan(
-                                            out_codec,
-                                            out_codec2,
-                                            out_front,
-                                            worker::seam(w, conn_id),
-                                            conn_id,
-                                        ),
-                                        conn_id,
-                                        PROTO_MQTT,
-                                        PKT_DISCONNECT,
-                                        0,
-                                        &[wire::MQTT_REASON_MOVED],
-                                    );
+                                    reply_hold::owe(moved, conn_id, wire::MQTT_REASON_MOVED);
                                 }
                             },
                         );
@@ -9705,14 +10736,13 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 let body = &s.in_buf[wire::WAL_ENTRY_REPLY_HDR..pl];
                 let mut records_off = 0usize;
                 let mut records_len = 0usize;
-                if !body.is_empty() {
-                    // The raft entry body is the client proposal:
-                    // [qprop header][origin:u8][partition:u16]
-                    // [topic_len:u16][topic][records].
+                if body.len() > wire::QPROP_HEADER_LEN {
+                    // The raft entry body is the client proposal: the
+                    // qprop header, then the produce op-body
+                    // (`wire::QOP_KAFKA_PRODUCE`).
                     let h = wire::QPROP_HEADER_LEN;
-                    if body.len() > h + 5 {
-                        let tl = u16::from_le_bytes([body[h + 3], body[h + 4]]) as usize;
-                        let start = h + 5 + tl;
+                    if let Some(p) = wire::decode_produce_body_hdr(&body[h..]) {
+                        let start = h + p.records_at;
                         if start <= body.len() {
                             records_off = wire::WAL_ENTRY_REPLY_HDR + start;
                             records_len = body.len() - start;
@@ -9737,7 +10767,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if n > 0 {
                     recs[..n].copy_from_slice(&s.in_buf[records_off..records_off + n]);
                 }
-                emit_cold_fetch_response(s, sys, slot, err, hw, ls, &recs[..n]);
+                if !emit_cold_fetch_response(s, sys, slot, err, hw, ls, &recs[..n]) {
+                    // No room for the records: the client is owed an
+                    // empty answer and fetches the offset again.
+                    s.cold[slot].owed = if err == KERR_NONE {
+                        COLD_OWED_EMPTY
+                    } else {
+                        COLD_OWED_TIMEOUT
+                    };
+                }
             }
         }
 
@@ -9748,14 +10786,33 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         {
             let now_ms = dev_millis(sys);
             for i in 0..COLD_FETCH_SLOTS {
-                if s.cold[i].active == 1
-                    && now_ms.wrapping_sub(s.cold[i].issued_ms) > COLD_FETCH_TIMEOUT_MS
-                {
+                if s.cold[i].active != 1 {
+                    continue;
+                }
+                // An owed answer first; then the timeout's, owed in turn
+                // when the bus has no room for it.
+                let owed = s.cold[i].owed;
+                let timed_out = now_ms.wrapping_sub(s.cold[i].issued_ms) > COLD_FETCH_TIMEOUT_MS;
+                if owed == COLD_OWED_NONE && !timed_out {
+                    continue;
+                }
+                let err = if owed == COLD_OWED_EMPTY {
+                    KERR_NONE
+                } else {
+                    KERR_OFFSET_OUT_OF_RANGE
+                };
+                let pidx = s.cold[i].part_idx as usize;
+                let hw = store::next_offset(&s.store, pidx) as i64;
+                let ls = store::log_start(&s.store, pidx) as i64;
+                if owed == COLD_OWED_NONE {
                     s.cold_refused = s.cold_refused.wrapping_add(1);
-                    let pidx = s.cold[i].part_idx as usize;
-                    let hw = store::next_offset(&s.store, pidx) as i64;
-                    let ls = store::log_start(&s.store, pidx) as i64;
-                    emit_cold_fetch_response(s, sys, i, KERR_OFFSET_OUT_OF_RANGE, hw, ls, &[]);
+                }
+                if !emit_cold_fetch_response(s, sys, i, err, hw, ls, &[]) {
+                    s.cold[i].owed = if owed == COLD_OWED_NONE {
+                        COLD_OWED_TIMEOUT
+                    } else {
+                        owed
+                    };
                 }
             }
         }
@@ -9835,6 +10892,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" reg="[..], s.hb_reg),
                 (&b" commit="[..], s.hb_commit),
                 (&b" refused="[..], s.proposals_refused),
+                (&b" rrefused="[..], s.proposals_refused_raft),
+                (&b" superseded="[..], s.acks_superseded),
                 (&b" throttled="[..], s.publishes_throttled),
                 (&b" cheld="[..], s.codec_held),
                 (&b" mbox="[..], s.mbox.used() as u32),
@@ -9891,7 +10950,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             // seats refused, productions held on a full ring, numbered
             // without bytes, released; horizon reports ignored; re-anchors
             // answered and refused; PINGRESPs held; site records out and
-            // refused; consumption reports to the anchor.
+            // refused; consumption reports to the anchor; client responses
+            // held for a full codec bus, and lost to a full hold (must stay 0).
             let seats = &s.worker.seats;
             let cont = [
                 (&b"[sess] cont seatref="[..], seats.refused),
@@ -9905,10 +10965,41 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 (&b" siteout="[..], s.site_exported),
                 (&b" siteref="[..], s.site_refused),
                 (&b" consumed="[..], s.worker.consumed_reports),
+                (&b" rheld="[..], s.hold.held),
+                (&b" rlost="[..], s.hold.overflow),
             ];
             if cont.iter().any(|&(_, v)| v != 0) {
                 let mut pos = 0usize;
                 for (label, v) in cont {
+                    for &b in label {
+                        line[pos] = b;
+                        pos += 1;
+                    }
+                    pos += fmt_u32_raw(line.as_mut_ptr().add(pos), v);
+                }
+                dev_log(sys, 3, line.as_ptr(), pos);
+            }
+            // Kafka and AMQP, once any ran on this worker, named by worker
+            // id: produces taken and answered, fetches, group calls and
+            // offset commits, AMQP publishes taken and confirmed, Basic.Get
+            // calls, consumer deliveries, coordinator calls taken, and
+            // requests answered with the close marker. Cumulative.
+            let wire_counts = [
+                (&b"[sess] kq w="[..], u32::from(s.worker_id)),
+                (&b" kprod="[..], s.kafka_produce_rx),
+                (&b" kacked="[..], s.kafka_produce_acked),
+                (&b" kfetch="[..], s.kafka_fetch_rx),
+                (&b" kgroup="[..], s.kafka_group_ops),
+                (&b" koffc="[..], s.kafka_offset_commits),
+                (&b" apub="[..], s.amqp_publish_rx),
+                (&b" aacked="[..], s.amqp_publish_acked),
+                (&b" aget="[..], s.amqp_get_rx),
+                (&b" adlv="[..], s.amqp_delivers),
+                (&b" coord="[..], s.coord_calls),
+            ];
+            if wire_counts.iter().skip(1).any(|&(_, v)| v != 0) {
+                let mut pos = 0usize;
+                for (label, v) in wire_counts {
                     for &b in label {
                         line[pos] = b;
                         pos += 1;
@@ -9927,26 +11018,43 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 {
             // Publish inflights that never resolved (lost proposal,
-            // leadership churn, codec_out saturation at ack time): reclaim
-            // the slot. Kafka producers retry on their own request timeout;
-            // AMQP confirm-mode publishers wait indefinitely, so they get
-            // an explicit Basic.Nack.
+            // leadership churn, codec_out saturation at ack time): answer
+            // and reclaim the slot. A Kafka request answers
+            // REQUEST_TIMED_OUT (the codec writes a connection's answers
+            // in request order, so one left unanswered would hold every
+            // later one); AMQP confirm-mode publishers wait indefinitely,
+            // so they get an explicit Basic.Nack.
             for i in 0..KAFKA_INFLIGHT {
                 if !store::inflight_expired(&s.store, i, now, KAFKA_INFLIGHT_TIMEOUT_MS) {
                     continue;
                 }
+                // An owed answer is decided: it is answered, not expired.
+                if store::inflight_owed(&s.store, i) != store::ANSWER_NONE {
+                    continue;
+                }
                 if let Some(e) = store::inflight_get(&s.store, i) {
-                    // Only the AMQP arm below reads the entry.
+                    // Only the AMQP and Kafka arms below read the entry.
                     let _ = &e;
-                    // Kafka producers retry on their own request timeout;
-                    // AMQP confirm-mode publishers wait indefinitely, so
-                    // they get an explicit Nack.
                     #[cfg(feature = "amqp")]
                     if e.proto == KIN_PROTO_AMQP {
-                        let mut rest = [0u8; 9];
-                        rest[0..8].copy_from_slice(&e.delivery_tag.to_le_bytes());
-                        rest[8] = 1;
-                        emit_amqp_response(sys, s.out_codec, e.conn_id, 1, e.channel, &rest);
+                        // The Nack is the publisher's only answer: freed
+                        // with the slot when written, else owed in it.
+                        s.kafka_produce_errors = s.kafka_produce_errors.wrapping_add(1);
+                        answer_inflight(s, sys, i, store::ANSWER_NACK);
+                        continue;
+                    }
+                    // A Kafka request is answered too: the codec writes a
+                    // connection's answers in request order, so one never
+                    // answered would hold every later answer on it. A
+                    // produce answers REQUEST_TIMED_OUT for each partition
+                    // whose durability never came (Kafka's own "may or
+                    // may not have been written": the producer retries,
+                    // an idempotent one exactly), an OffsetCommit fails
+                    // its parked answer the same way. Freed with the slot
+                    // when written, else owed in it.
+                    #[cfg(feature = "kafka")]
+                    if expire_kafka_inflight(s, sys, i, e) {
+                        continue;
                     }
                     // Free the slot. The NEXT allocation bumps its epoch,
                     // so any durability round-trip still outstanding for
@@ -9959,7 +11067,8 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             // Surface correlations whose MSG_PROPOSAL_ASSIGNED is overdue.
-            // The substrate emits one per accepted tagged proposal, so an
+            // The substrate answers every tagged proposal once (an
+            // assignment, or a refusal that frees it at once), so an
             // overdue correlation is a contract violation to alert on, not
             // a slot to reclaim: freeing it would strand the assignment
             // still in flight and leave the publish unacknowledged.
@@ -10105,7 +11214,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── Phase 6: metrics (wire envelope) ──
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 && s.out_metrics >= 0 {
             s.last_metrics_ms = now;
-            let mut m = [0u8; 60];
+            let mut m = [0u8; 72];
             m[0..4].copy_from_slice(&s.session_count.to_le_bytes());
             m[4..8].copy_from_slice(&s.connects.to_le_bytes());
             m[8..12].copy_from_slice(&s.disconnects.to_le_bytes());
@@ -10124,6 +11233,14 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             m[40..44].copy_from_slice(&s.apply_output_stalls.to_le_bytes());
             m[44..48].copy_from_slice(&s.acks_stale_epoch.to_le_bytes());
             m[48..52].copy_from_slice(&s.correlations_overdue.to_le_bytes());
+            // Tagged proposals Clustor refused, their operations failed
+            // at once rather than left to a timeout.
+            m[60..64].copy_from_slice(&s.proposals_refused_raft.to_le_bytes());
+            // Completions answered "not the committed entry" (its operation
+            // failed for a retry), and applied-run notices lost to a full
+            // spill (must stay 0: their indices resolve as unknown).
+            m[64..68].copy_from_slice(&s.acks_superseded.to_le_bytes());
+            m[68..72].copy_from_slice(&s.applied_notice_drops.to_le_bytes());
             // Idempotence outcomes. `duplicates` rising is the feature
             // working — producer retries that would otherwise have been
             // appended twice. `rejected` rising means a producer is

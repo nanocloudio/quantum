@@ -233,6 +233,16 @@ pub const MSG_SESSION_RESPONSE: u8 = 0x99;
 pub const MSG_SESSION_CONNECT: u8 = 0x9A;
 pub const MSG_SESSION_DISCONNECT: u8 = 0x9B;
 
+/// The `api_key` of a Kafka `MSG_SESSION_RESPONSE` that answers nothing:
+/// `[conn_id:u16 LE][proto=1][api_key=-1:i16 LE][api_ver:i16 LE]
+/// [corr:i32 LE]`, no body. `session_processor` sends it for a request it
+/// will never answer (malformed, or failed where no response shape fits).
+/// The Kafka codec answers a connection's requests in the order they
+/// arrived (`kafka_order_core.rs`), so a request left unanswered would
+/// hold every later answer for ever; the codec closes the connection when
+/// this one's turn comes instead, behind the answers ahead of it.
+pub const KAFKA_API_CLOSE: i16 = -1;
+
 // Dedupe
 //
 // MSG_DEDUP_CHECK   `[dedup_key(20)]` or `[dedup_key(20)][phase:u8]`
@@ -364,6 +374,8 @@ pub const MSG_ACK_REDELIVER: u8 = 0xC2;
 pub const MSG_BP_SIGNAL: u8 = 0xC3;
 pub const MSG_PREFETCH_CREDIT: u8 = 0xC4;
 pub const MSG_DELIVERY_LAG: u8 = 0xC5;
+/// Applied term runs, session state machine → `flow` (`ACK_APPLIED_LEN`).
+pub const MSG_ACK_APPLIED: u8 = 0xBF;
 
 // ── MQTT anchor seam (docs/architecture/mqtt_anchor.md) ─────────────────────
 //
@@ -485,6 +497,19 @@ pub const MSG_ANCHOR_QAC_RETIRE: u8 = 0xDB;
 /// [delivery_hw:u64 LE]`, sent for a seated session as its high-water
 /// moves; the anchor acknowledges to the transport only what it covers.
 pub const MSG_ANCHOR_CONSUMED: u8 = 0xDE;
+/// Data plane, anchor -> the coordinating worker: a call on state ONE
+/// worker owns for the pair whichever worker the connection is bound to
+/// — a Kafka group or its committed offsets, an AMQP queue's read cursor
+/// or consumers (`cores/mqtt_anchor_core.rs`, "Coordinator calls").
+/// Payload `[conn_id:u16 LE][inner_msg_type:u8][inner payload after
+/// conn_id]`; the inner envelope is a `MSG_SESSION_PROPOSAL` or the
+/// connection's `MSG_CONN_CLOSED`. Not counted in any delivery cursor.
+pub const MSG_COORD_CALL: u8 = 0xDF;
+/// Data plane, the coordinating worker -> anchor: the answer to a
+/// `MSG_COORD_CALL`, a `MSG_SESSION_RESPONSE` payload verbatim. Admitted
+/// from the coordinator for any connection, not counted in any delivery
+/// cursor.
+pub const MSG_COORD_RESPONSE: u8 = 0xBE;
 pub const ANCHOR_CONSUMED_LEN: usize = 16 + 4 + 8;
 /// Control, -> worker: export a session for a surviving site. Payload
 /// `[session_id:16][source_site:u32 LE][export_seq:u64 LE]`.
@@ -497,18 +522,23 @@ pub const MSG_SITE_RECORD: u8 = 0xDD;
 
 /// MSG_ACK_REGISTER body:
 /// `[session_slot:u32 LE][message_id:u32 LE][partition_id:u16 LE]
-///  [wal_index:u64 LE][session_generation:u32 LE]`.
+///  [wal_index:u64 LE][session_generation:u32 LE][term:u64 LE]`.
 ///
 /// The generation names the session incarnation the publish was
 /// accepted under. It travels back on MSG_ACK_EMIT so a completion arriving
 /// after the slot has been reused for a different client is discarded
 /// rather than matched on `(session_slot, message_id)` alone — MQTT
 /// packet ids are client-chosen and collide freely across sessions.
-pub const ACK_REGISTER_LEN: usize = 22;
+///
+/// The term is the one MSG_PROPOSAL_ASSIGNED says the entry was appended
+/// in: an index names an entry only with its term, and `flow` acks only
+/// the entry the log committed at `(wal_index, term)`
+/// (`cores/ack_term_core.rs`, which encodes and decodes this body).
+pub const ACK_REGISTER_LEN: usize = 30;
 
 /// MSG_ACK_EMIT body:
 /// `[session_slot:u32 LE][message_id:u32 LE][session_generation:u32 LE]
-///  [wal_index:u64 LE]`.
+///  [wal_index:u64 LE][status:u8]`.
 ///
 /// `wal_index` names the registration this completion answers. A QoS 2
 /// flow registers twice under one `(session_slot, packet_id)` — its
@@ -517,7 +547,21 @@ pub const ACK_REGISTER_LEN: usize = 22;
 /// late PUBLISH completion from the PUBREL's, and reading one as the
 /// other is a PUBCOMP too many. The consumer matches it against the
 /// inflight's own `wal_index`.
-pub const ACK_EMIT_LEN: usize = 20;
+///
+/// `status` is the registration's verdict: `0` committed (PUBACK /
+/// PUBREC / PUBCOMP, ProduceResponse, Basic.Ack); otherwise the entry
+/// is not the one committed at its index — `0x02` another term's entry
+/// took it, `0x07` this node cannot name the term there — and the
+/// operation fails as a refusal with that status would
+/// (`cores/proposal_refusal_core.rs`).
+pub const ACK_EMIT_LEN: usize = 21;
+
+/// MSG_ACK_APPLIED body (`session_processor` → `flow` on the forward
+/// bus): `[partition_id:u16 LE][first:u64 LE][last:u64 LE][term:u64 LE]`
+/// — the partition's committed entries `first..=last` all carry `term`
+/// and have applied on this node. What `flow` resolves a registration's
+/// term against when the commit horizon cannot (`cores/ack_term_core.rs`).
+pub const ACK_APPLIED_LEN: usize = 26;
 
 // Control plane (Quantum-specific)
 pub const MSG_TENANT_RECORD: u8 = 0xD0;
@@ -734,16 +778,18 @@ pub fn encode_tagged_proposal(dst: &mut [u8], correlation_id: u64, body: &[u8]) 
     total as i32
 }
 
-/// MSG_PROPOSAL_ASSIGNED payload size (18 bytes):
-///   correlation_id(8 LE) + partition_id(2 LE) + wal_index(8 LE)
-pub const PROPOSAL_ASSIGNED_LEN: usize = 18;
+/// MSG_PROPOSAL_ASSIGNED payload size (26 bytes):
+///   correlation_id(8 LE) + partition_id(2 LE) + wal_index(8 LE) + term(8 LE)
+pub const PROPOSAL_ASSIGNED_LEN: usize = 26;
 
-/// Decode a MSG_PROPOSAL_ASSIGNED payload (18 bytes).
-/// Returns `(correlation_id, partition_id, wal_index)`. The
+/// Decode a MSG_PROPOSAL_ASSIGNED payload (26 bytes).
+/// Returns `(correlation_id, partition_id, wal_index, term)`. The
 /// `partition_id` is needed by `flow::ack` to disambiguate the
 /// same `wal_index` arriving from different partitions when QoS 1
-/// PUBLISHes are routed through `partition_router`.
-pub fn decode_proposal_assigned(buf: &[u8]) -> (u64, u16, u64) {
+/// PUBLISHes are routed through `partition_router`; the `term` is the
+/// one the entry was appended in — a leader change can put another
+/// entry at the same index, so `flow` acks only `(wal_index, term)`.
+pub fn decode_proposal_assigned(buf: &[u8]) -> (u64, u16, u64, u64) {
     let cid = u64::from_le_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
@@ -751,8 +797,26 @@ pub fn decode_proposal_assigned(buf: &[u8]) -> (u64, u16, u64) {
     let wi = u64::from_le_bytes([
         buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
     ]);
-    (cid, pid, wi)
+    let term = u64::from_le_bytes([
+        buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25],
+    ]);
+    (cid, pid, wi, term)
 }
+
+/// Clustor's refusal of a tagged proposal, on the same
+/// `consensus.proposal_assigned` port as MSG_PROPOSAL_ASSIGNED: the
+/// proposal is in no log (or, for status `OUTCOME_UNKNOWN`, may be in one)
+/// and no assignment for it will follow. Payload
+/// `[correlation_id:u64 LE][status:u8][leader_id:u8]`
+/// ([`PROPOSAL_REFUSED_LEN`]); `status` is a `CLIENT_REJECT_*` code (see
+/// `cores/proposal_refusal_core.rs`), `leader_id` 0xFF when none is known.
+///
+/// Mirrors Clustor's value. Defined here ahead of the Clustor release that
+/// carries it: the clustor-common copy this build resolves predates it.
+pub const MSG_PROPOSAL_REFUSED: u8 = 0x27;
+/// MSG_PROPOSAL_REFUSED payload size; decoded by
+/// `proposal_refusal_core::decode_refused`.
+pub const PROPOSAL_REFUSED_LEN: usize = 10;
 
 /// MSG_DURABILITY_PROOF payload size (19 bytes):
 ///   partition_id(2 LE) + term(8 LE) + index(8 LE) + replica_id(1)
@@ -1290,12 +1354,20 @@ pub const QOP_RETAINED_CLEAR: u8 = 0x07;
 /// Tagged when `acks != 0` so the ProduceResponse is gated on quorum
 /// durability; untagged (fire-and-forget) for `acks == 0`.
 ///
-/// Op-body: `[origin:u8][partition:u16 LE][topic_len:u16 LE][topic]
+/// Op-body: `[origin:u8][origin_worker:u8][partition:u16 LE]
+///           [topic_len:u16 LE][topic]
 ///           [records: remaining bytes — the verbatim Kafka record
-///            batch (magic v2) from the ProduceRequest]`.
+///            batch (magic v2) from the ProduceRequest]`
+/// ([`PRODUCE_BODY_HDR`] bytes before the topic,
+/// [`encode_produce_body_hdr`] / [`decode_produce_body_hdr`]).
 ///
 /// `origin` is the replica id of the node that ACCEPTED the produce, or
-/// [`PRODUCE_ORIGIN_NONE`] when no client is waiting (`acks == 0`).
+/// [`PRODUCE_ORIGIN_NONE`] when no client is waiting (`acks == 0`), and
+/// `origin_worker` the id of the session worker on that node that
+/// accepted it (`session_processor`'s `worker_id`;
+/// [`PRODUCE_ORIGIN_NONE`] with no client). Every co-located worker
+/// applies the entry — the log is every worker's — so the node alone
+/// does not name the one inflight slot waiting for it.
 ///
 /// Why it is on the wire: the batch's logical offset and its
 /// idempotence verdict are both decided at APPLY, which runs on every
@@ -1314,6 +1386,59 @@ pub const QOP_KAFKA_PRODUCE: u8 = 0x08;
 /// (`acks == 0`). Chosen outside the valid replica-id range so it can
 /// never collide with a real node.
 pub const PRODUCE_ORIGIN_NONE: u8 = 0xFF;
+
+/// Bytes of a `QOP_KAFKA_PRODUCE` op-body before its topic:
+/// `[origin][origin_worker][partition:2][topic_len:2]`.
+pub const PRODUCE_BODY_HDR: usize = 6;
+
+/// A `QOP_KAFKA_PRODUCE` op-body's header, decoded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProduceBodyHdr {
+    pub origin: u8,
+    pub origin_worker: u8,
+    pub partition: u16,
+    pub topic_len: usize,
+    /// Where the records begin: past the topic.
+    pub records_at: usize,
+}
+
+/// Write a `QOP_KAFKA_PRODUCE` op-body's header and topic into `out`;
+/// returns the bytes written (where the records go). The caller sized
+/// `out` for `PRODUCE_BODY_HDR + topic.len()` and its records.
+pub fn encode_produce_body_hdr(
+    out: &mut [u8],
+    origin: u8,
+    origin_worker: u8,
+    partition: u16,
+    topic: &[u8],
+) -> usize {
+    out[0] = origin;
+    out[1] = origin_worker;
+    out[2..4].copy_from_slice(&partition.to_le_bytes());
+    out[4..6].copy_from_slice(&(topic.len() as u16).to_le_bytes());
+    out[PRODUCE_BODY_HDR..PRODUCE_BODY_HDR + topic.len()].copy_from_slice(topic);
+    PRODUCE_BODY_HDR + topic.len()
+}
+
+/// Read a `QOP_KAFKA_PRODUCE` op-body's header; `None` when `body` is
+/// shorter than the header and topic it declares.
+pub fn decode_produce_body_hdr(body: &[u8]) -> Option<ProduceBodyHdr> {
+    if body.len() < PRODUCE_BODY_HDR {
+        return None;
+    }
+    let topic_len = u16::from_le_bytes([body[4], body[5]]) as usize;
+    let records_at = PRODUCE_BODY_HDR + topic_len;
+    if records_at > body.len() {
+        return None;
+    }
+    Some(ProduceBodyHdr {
+        origin: body[0],
+        origin_worker: body[1],
+        partition: u16::from_le_bytes([body[2], body[3]]),
+        topic_len,
+        records_at,
+    })
+}
 
 /// AMQP_PUBLISH: one AMQP 0-9-1 Basic.Publish body appended to the
 /// routing key's message log (shared apply-side store with Kafka —

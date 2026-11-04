@@ -101,9 +101,11 @@ asymmetries the gating makes explicit:
   protocol to pick a response shape; a variant carrying neither Kafka
   nor AMQP compiles the whole resolution away, which is correct
   because nothing can populate the inflight table in that build.
-- The inflight expiry sweep emits a Nack only for AMQP: Kafka
-  producers retry on their own request timeout, while AMQP
-  confirm-mode publishers wait indefinitely.
+- The inflight expiry sweep answers what it expires in the
+  inflight's protocol: a Basic.Nack for AMQP, `REQUEST_TIMED_OUT` for a
+  Kafka Produce or OffsetCommit (the Kafka codec writes a connection's
+  answers in request order, so one left unanswered would hold every
+  later one — see [kafka_adapter.md](kafka_adapter.md#response-order)).
 
 The graph surface is unchanged across variants; the only
 config-visible knob is the `variant:` selector.

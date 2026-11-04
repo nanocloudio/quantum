@@ -683,6 +683,93 @@ pub fn loss_action(c: &AnchorConn, lost: u8, standby_ok: bool) -> LossAction {
     }
 }
 
+// ── Coordinator calls ───────────────────────────────────────────────────────
+//
+// Two co-located workers both apply the log (every Kafka batch, committed
+// offset and AMQP message), so a Kafka or AMQP connection is served by
+// whichever worker it is bound to. What the log does not carry is the
+// state a connection READS that some other connection changes: a Kafka
+// consumer group's membership and the offsets it commits, an AMQP queue's
+// read cursor and its consumers. Kept on both workers it would split — two
+// generations for one group, a message handed out twice — so ONE worker
+// owns it, the coordinator, and every call on it goes there whichever
+// worker the connection is bound to (`MSG_COORD_CALL`), answered on the
+// coordinator's own path (`MSG_COORD_RESPONSE`).
+//
+// A coordinator call is not part of the connection's session: neither the
+// anchor nor either worker counts it in the delivery cursors a handoff
+// admits, it is never held for a handoff, and the state it reaches never
+// moves — the swap moves the connection, the coordinator stays. The
+// connection's close is told to the coordinator too, so a consumer that
+// goes away leaves its group.
+
+/// Bytes a coordinator call inserts after the connection id:
+/// `[inner_msg_type:u8]`.
+pub const COORD_INSERT: usize = 1;
+
+/// The worker slot that coordinates for an anchor with workers `wired`
+/// and `lost`: the lowest wired worker not lost. `None` when fewer than
+/// two are wired — one worker owns everything and no call needs routing —
+/// or when none is left.
+pub fn coordinator_slot(wired: [bool; 2], lost: [bool; 2]) -> Option<usize> {
+    if !(wired[0] && wired[1]) {
+        return None;
+    }
+    (0..2).find(|&w| !lost[w])
+}
+
+/// Wrap the envelope `inner = [conn_id:2][rest]` of type `inner_mt` as a
+/// coordinator call payload `[conn_id:2][inner_mt:1][rest]` into `out`.
+/// Returns the bytes written, or 0 when `inner` has no connection id or
+/// `out` is too short.
+pub fn encode_coord_call(out: &mut [u8], inner_mt: u8, inner: &[u8]) -> usize {
+    if inner.len() < CONN_ID_LEN || out.len() < inner.len() + COORD_INSERT {
+        return 0;
+    }
+    out[0] = inner[0];
+    out[1] = inner[1];
+    out[CONN_ID_LEN] = inner_mt;
+    let rest = &inner[CONN_ID_LEN..];
+    out[CONN_ID_LEN + COORD_INSERT..CONN_ID_LEN + COORD_INSERT + rest.len()].copy_from_slice(rest);
+    inner.len() + COORD_INSERT
+}
+
+/// Unwrap the coordinator call in `buf[..n]` in place, leaving the inner
+/// envelope `[conn_id:2][rest]` at the head of `buf`. Returns its message
+/// type and length, or `None` when `buf[..n]` is too short to be one.
+pub fn unwrap_coord_call_in_place(buf: &mut [u8], n: usize) -> Option<(u8, usize)> {
+    if n > buf.len() || n < CONN_ID_LEN + COORD_INSERT {
+        return None;
+    }
+    let mt = buf[CONN_ID_LEN];
+    let from = CONN_ID_LEN + COORD_INSERT;
+    let mut k = 0usize;
+    // Byte loop: see `unwrap_delivery_in_place`.
+    while from + k < n {
+        buf[CONN_ID_LEN + k] = buf[from + k];
+        k += 1;
+    }
+    Some((mt, n - COORD_INSERT))
+}
+
+/// Whether a Kafka request of `api_key` is a coordinator call: the group
+/// APIs and the committed offsets — OffsetCommit (8), OffsetFetch (9),
+/// JoinGroup (11), Heartbeat (12), LeaveGroup (13), SyncGroup (14).
+/// Produce, Fetch and ListOffsets read and write the log, which every
+/// worker holds, and stay with the connection's worker.
+pub fn kafka_coordinator_api(api_key: i16) -> bool {
+    matches!(api_key, 8 | 9 | 11..=14)
+}
+
+/// Whether an AMQP session op (`protocol::amqp`'s op byte) is a
+/// coordinator call: Basic.Get (2), Basic.Consume (3), Basic.Cancel (4)
+/// and the client's delivery acknowledgements (5) — a queue's read cursor
+/// and its consumers. Basic.Publish (1) writes the log and stays with the
+/// connection's worker.
+pub fn amqp_coordinator_op(op: u8) -> bool {
+    matches!(op, 2..=5)
+}
+
 // ── Operator swap command ───────────────────────────────────────────────────
 
 /// `MSG_ANCHOR_SWAP` mode: move the sessions to the standby through the

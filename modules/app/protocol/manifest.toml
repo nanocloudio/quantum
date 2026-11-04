@@ -102,11 +102,15 @@ content_type = "OctetStream"
 
 [observability]
 # Per component: router (per-protocol classification counts,
-# unclassified), and each codec's decode/encode/error counters.
+# unclassified), and each codec's decode/encode/error counters; the
+# Kafka codec adds its response-order counters (answers held for their
+# turn, connections closed for a request never answered, of them for an
+# overdue answer).
 metrics = [
     "classified_mqtt", "classified_kafka", "classified_amqp",
     "unclassified",
     "packets_decoded", "packets_encoded", "parse_errors",
+    "kafka_answers_held", "kafka_unanswered_closes", "kafka_answers_overdue",
 ]
 
 # Raft leader hints (MSG_LEADER_HINT). Metadata names the current leader

@@ -7,7 +7,8 @@ hardware_targets = ["bcm2712", "linux"]
 # composite module (standards fluxor-modules.md §8).
 #
 # Components: ack (durable-publish inflight keyed by
-# `(partition_id, wal_index)`, ack emission on quorum durability,
+# `(partition_id, wal_index)` with the entry's term, ack emission once
+# that entry is committed (a failure status when another entry was),
 # redelivery with exponential backoff), backpressure (admission's credit
 # envelope → protocol-native backpressure signals + periodic gateway
 # status), prefetch (per-consumer credit windows scaled by delivery lag).
@@ -25,7 +26,8 @@ permissions = []
 # ── inputs ───────────────────────────────────────────────────
 
 # Session outbound bus. Frame types served:
-#   MSG_ACK_REGISTER → ack
+#   MSG_ACK_REGISTER → ack (an entry's (partition, index, term) to resolve)
+#   MSG_ACK_APPLIED  → ack (the committed log's applied term runs)
 #   MSG_LAG_SIGNAL   → prefetch
 # Any other frame type is ignored — this is a shared bus.
 [[ports]]
@@ -33,11 +35,14 @@ name = "forward_in"
 direction = "input"
 content_type = "OctetStream"
 
-# MSG_DURABILITY_PROOF (19 bytes), fanned in from every partition's
-# durability instance. Leave unwired only in graphs with no durable
-# publish path: the ack sweep is gated on this port being present,
-# because without proofs the per-partition high-water marks never
-# advance and no inflight entry can ever ack.
+# MSG_DURABILITY_PROOF (19 bytes) carrying each partition's COMMIT
+# horizon: wire `consensus.durable_horizon` (one per partition) here, on
+# leaders and followers alike. NOT `durability.quorum_durable`: a
+# quorum-durable entry is not yet committed (Raft §5.4.2), and an ack must
+# name the committed entry's term (cores/ack_term_core.rs). Leave unwired
+# only in graphs with no durable publish path: the ack sweep is gated on
+# this port being present, because without a horizon no inflight entry
+# can ever ack.
 [[ports]]
 name = "durability_in"
 direction = "input"
@@ -84,11 +89,13 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# Per component: ack (acks_emitted, redelivers, abandoned, inflight),
+# Per component: ack (acks_emitted, redelivers, abandoned, inflight,
+# superseded, term_unknown),
 # backpressure (rejections, signals_emitted, entry_credits,
 # byte_credits), prefetch (credit_updates, consumers_active).
 metrics = [
     "acks_emitted", "redelivers", "abandoned", "inflight",
+    "superseded", "term_unknown",
     "rejections", "signals_emitted", "entry_credits", "byte_credits",
     "credit_updates", "consumers_active",
 ]

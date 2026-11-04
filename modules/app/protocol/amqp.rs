@@ -173,7 +173,11 @@ pub struct Amqp {
 /// composite after this returns.
 /// Hand a staged envelope to the anchor, which forwards it to the
 /// worker the connection is bound to or holds it across a handoff.
-/// `false` only when the live worker's channel refused it.
+/// A queue read (Basic.Get, Basic.Consume, Basic.Cancel, a delivery
+/// acknowledgement: `anchor::amqp_coordinator_op`) goes instead to the
+/// worker coordinating for the pair, which owns every queue's read cursor
+/// and consumers whichever worker the connection is bound to.
+/// `false` only when the channel refused it.
 ///
 /// # Safety
 ///
@@ -185,8 +189,18 @@ unsafe fn forward(
     mt: u8,
     payload: &[u8],
 ) -> bool {
-    !anchor.is_null()
-        && super::anchor::forward_env(&mut *anchor, sys, super::dev_millis(sys), mt, payload)
+    if anchor.is_null() {
+        return false;
+    }
+    let now = super::dev_millis(sys);
+    // `[conn:2][proto=2][op]...`
+    if mt == wire::MSG_SESSION_PROPOSAL
+        && payload.len() > 3
+        && super::anchor::amqp_coordinator_op(payload[3])
+    {
+        return super::anchor::forward_coord(&mut *anchor, sys, now, mt, payload);
+    }
+    super::anchor::forward_env(&mut *anchor, sys, now, mt, payload)
 }
 
 pub fn init(s: &mut Amqp) {

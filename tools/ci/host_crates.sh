@@ -21,7 +21,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench" "tools/core_tests")
+CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench" "tools/core_tests" "tools/flow_tests")
 
 # Each crate is formatted BY NAME rather than with `cargo fmt --all`: a
 # future path dependency into `modules/**` would otherwise reformat the PIC
@@ -36,6 +36,11 @@ declare -A PKG=(
   # that crate, and the only place their invariants are exercised —
   # `fluxor ci` fmt/clippies `modules/**` but runs no test over it.
   ["tools/core_tests"]="core_tests"
+  # Host module tests: `flow`'s ack component mounted verbatim against a
+  # mock syscall table (its entry points are unsafe, which `core_tests`
+  # forbids), and `session_processor`'s correlation / durable-publish
+  # tables driven through what a failed proposal frees.
+  ["tools/flow_tests"]="flow_tests"
 )
 
 fail=0

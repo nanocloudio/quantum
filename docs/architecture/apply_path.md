@@ -65,7 +65,7 @@ there are authoritative for body shape.
 | 0x05 | `QOP_UNSUBSCRIBE` | `[stream_hash:u64 LE][topic_len:u16 BE][topic]` |
 | 0x06 | `QOP_PUBREL` | `[packet_id:u16 BE][stream_hash:u64 LE][session_generation:u32 LE]`. The generation is a trailing field, so an entry logged without one replays against the session's current generation |
 | 0x07 | `QOP_RETAINED_CLEAR` | `[topic_len:u16 BE][topic]` |
-| 0x08 | `QOP_KAFKA_PRODUCE` | `[origin:u8][partition:u16 LE][topic_len:u16 LE][topic][records — the verbatim Kafka record batch]`; tagged when `acks != 0`, untagged for `acks == 0`. `origin` is the replica id that accepted the produce, so only that node stamps the offset back onto a waiting client |
+| 0x08 | `QOP_KAFKA_PRODUCE` | `[origin:u8][origin_worker:u8][partition:u16 LE][topic_len:u16 LE][topic][records — the verbatim Kafka record batch]`; tagged when `acks != 0`, untagged for `acks == 0`. `origin` is the replica id and `origin_worker` the session worker that accepted the produce, so only that worker of that node stamps the offset back onto a waiting client — every worker applies the entry |
 | 0x09 | `QOP_AMQP_PUBLISH` | `[rk_len:u16 LE][routing_key][payload]`; tagged when the channel is in confirm mode |
 | 0x0A | `QOP_KAFKA_OFFSET` | `[group_len:u16 LE][group][topic_len:u16 LE][topic][partition:u16 LE][offset:i64 LE]` |
 
@@ -186,10 +186,10 @@ this surface.
 |---|---|---|
 | `proposals` (untagged) | `QOP_CONNECT`, `QOP_DISCONNECT`, `QOP_SUBSCRIBE`, `QOP_UNSUBSCRIBE`, `QOP_RETAINED_CLEAR`, QoS 0 `QOP_PUBLISH`, `acks=0` `QOP_KAFKA_PRODUCE`, non-confirm `QOP_AMQP_PUBLISH`, `QOP_KAFKA_OFFSET` | `session_processor` |
 | `proposals_tagged` | QoS 1+ `QOP_PUBLISH`, `QOP_PUBREL`, `acks!=0` `QOP_KAFKA_PRODUCE`, confirm-mode `QOP_AMQP_PUBLISH` | `session_processor` |
-| `proposal_assigned` (echo) | Binds `correlation_id → (session_slot, packet_id, op)`; emits `MSG_ACK_REGISTER` | `session_processor` → `flow`'s ack component |
+| `proposal_assigned` (echo) | Binds `correlation_id → (session_slot, packet_id, op)`; emits `MSG_ACK_REGISTER`. A `MSG_PROPOSAL_REFUSED` `[correlation_id][status][leader]` instead frees the correlation at once and fails the operation (MQTT: DISCONNECT with the mapped reason, the client resends; Kafka: the partition's error; AMQP: Basic.Nack; OffsetCommit: every partition `REQUEST_TIMED_OUT`), counted as `proposals_refused_raft` | `session_processor` → `flow`'s ack component (assignments only) |
 | `committed_entries` | Sole apply-side translation of session / dedup / retained / offline / topic state | `session_processor.committed_in` — the stream's ONLY consumer |
 | `session_processor.cp_out` | Every committed entry that is not a Quantum op (epoch, migration, admin, config records), re-emitted verbatim as `MSG_COMMITTED_ENTRY` | `control_plane.committed_entries` |
-| `quorum_durable` (proof) | Drives `MSG_ACK_EMIT` → PUBACK / PUBREC / PUBCOMP | `flow`'s ack component |
+| `durable_horizon` (commit horizon) | With the applied term runs `session_processor` reports (`MSG_ACK_APPLIED`), resolves each registration's `(wal_index, term)`: drives `MSG_ACK_EMIT` → PUBACK / PUBREC / PUBCOMP, or a failure status when another term's entry committed at the index | `flow`'s ack component |
 | `MSG_APPLY_PIPELINE_RESET` | Clears apply-derived arenas and fans out the reset | `session_processor` |
 | Snapshot install / export | Quantum-owned payload (design target, above) | `session_processor` + apply-state modules |
 
@@ -221,6 +221,8 @@ A single Quantum process hosts multiple PRGs (see
 [partitioning.md](partitioning.md)), and `wal_index` is per-PRG — two
 proposals on different PRGs can share a `wal_index`. `flow`'s ack component
 therefore matches durability proofs by the `(partition_id, wal_index)`
-tuple. Both `MSG_PROPOSAL_ASSIGNED` and `MSG_DURABILITY_PROOF` carry the
+tuple — and with the entry's term, which `MSG_PROPOSAL_ASSIGNED` also
+carries, since one index can name different entries across a leader
+change. Both `MSG_PROPOSAL_ASSIGNED` and `MSG_DURABILITY_PROOF` carry the
 partition id for this reason; it is the one place Quantum's contract is
 strictly wider than the single-PRG primitive description.

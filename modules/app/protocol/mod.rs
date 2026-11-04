@@ -87,6 +87,12 @@ mod wire;
 #[path = "../../common/cores/kafka_metadata_core.rs"]
 mod kafka_metadata;
 
+/// The order a Kafka connection's responses leave in: its requests' —
+/// what the protocol requires, whichever component answers each.
+#[cfg(feature = "kafka")]
+#[path = "../../common/cores/kafka_order_core.rs"]
+mod kafka_order;
+
 /// The transport anchor is `quantum_mqtt_anchor`'s, mounted here so the
 /// multi-protocol front door and the MQTT anchor are one implementation
 /// (docs/architecture/mqtt_anchor.md).
@@ -301,6 +307,9 @@ struct ModuleState {
     resp_held_len: u16,
     /// Worker slot the held response came from.
     resp_held_w: u8,
+    /// The held response is a coordinator answer (`MSG_COORD_RESPONSE`):
+    /// relayed, but counted in no delivery cursor.
+    resp_held_coord: bool,
     resp_held: [u8; router::READ_BUF],
     /// Per-second accounting for the `[proto] hb` line: raw records
     /// taken off `raw_in` and responses taken off `responses_in` since
@@ -342,10 +351,7 @@ unsafe fn dispatch_response(s: &mut ModuleState, sys: &SyscallTable, n: usize) -
         #[cfg(feature = "mqtt")]
         SESSION_PROTO_MQTT => mqtt::on_response(&mut s.mqtt, sys, &s.buf[..n]),
         #[cfg(feature = "kafka")]
-        SESSION_PROTO_KAFKA => {
-            kafka::on_response(&mut s.kafka, sys, &s.buf[..n]);
-            true
-        }
+        SESSION_PROTO_KAFKA => kafka::on_response(&mut s.kafka, sys, &s.buf[..n]),
         #[cfg(feature = "amqp")]
         SESSION_PROTO_AMQP => {
             amqp::on_response(&mut s.amqp, sys, &s.buf[..n]);
@@ -482,6 +488,7 @@ pub unsafe extern "C" fn module_new(
         s.anchor.dir_in = dev_channel_port(sys, 0, 6);
         s.anchor.dir_out = dev_channel_port(sys, 1, 6);
         s.resp_held_w = 0;
+        s.resp_held_coord = false;
         let anchor_ptr: *mut anchor::Anchor = &mut s.anchor;
 
         #[cfg(feature = "mqtt")]
@@ -582,6 +589,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
             let rx_open = mqtt::flush_held(&mut s.mqtt, sys);
             #[cfg(not(feature = "mqtt"))]
             let rx_open = true;
+            // Kafka answers whose turn came, requests that waited for
+            // room, and a raw record held for a connection that had none
+            // (`kafka::step`): none is taken while it is held.
+            #[cfg(feature = "kafka")]
+            let rx_open = kafka::step(&mut s.kafka, sys) && rx_open;
             // A hold at its high-water mark stops the read: not reading
             // is the backpressure (anchor::read_paused).
             let rx_open = rx_open && !anchor::read_paused(&mut s.anchor);
@@ -612,7 +624,11 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         }
                     }
                     #[cfg(feature = "kafka")]
-                    PROTO_KAFKA => kafka::on_frame(&mut s.kafka, sys, mtype, &s.buf[..n]),
+                    PROTO_KAFKA => {
+                        if kafka::on_frame(&mut s.kafka, sys, mtype, &s.buf[..n]) {
+                            break;
+                        }
+                    }
                     #[cfg(feature = "amqp")]
                     PROTO_AMQP => amqp::on_frame(&mut s.amqp, sys, mtype, &s.buf[..n]),
                     // PROTO_UNKNOWN (needs more bytes), PROTO_UNSUPPORTED,
@@ -641,7 +657,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 if dispatch_response(s, sys, held) {
                     let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
                     let w = usize::from(s.resp_held_w);
-                    anchor::note_relayed(&mut s.anchor, w, conn, wire::ENVELOPE_HDR + held, now);
+                    if !s.resp_held_coord {
+                        anchor::note_relayed(
+                            &mut s.anchor,
+                            w,
+                            conn,
+                            wire::ENVELOPE_HDR + held,
+                            now,
+                        );
+                    }
                     s.resp_held_len = 0;
                 } else {
                     resp_open = false;
@@ -659,23 +683,40 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     let (mtype, plen) = wire::channel_read_msg(sys, chan, &mut s.buf);
                     let n = plen as usize;
-                    if mtype != wire::MSG_SESSION_RESPONSE || n < 3 || n > s.buf.len() {
+                    let coord = mtype == wire::MSG_COORD_RESPONSE;
+                    if !(coord || mtype == wire::MSG_SESSION_RESPONSE) || n < 3 || n > s.buf.len() {
                         continue;
                     }
                     worked += 1;
                     s.hb_resp = s.hb_resp.wrapping_add(1);
                     let conn = u16::from_le_bytes([s.buf[0], s.buf[1]]);
                     // Only the worker the connection is bound to may emit
-                    // for it; a stale emitter is fenced here.
-                    if !anchor::response_admitted(&mut s.anchor, w, conn) {
+                    // for it, and only the coordinator answers a
+                    // coordinator call; a stale emitter is fenced here.
+                    let admitted = if coord {
+                        anchor::coord_admitted(&mut s.anchor, w)
+                    } else {
+                        anchor::response_admitted(&mut s.anchor, w, conn)
+                    };
+                    if !admitted {
                         continue;
                     }
                     if dispatch_response(s, sys, n) {
-                        anchor::note_relayed(&mut s.anchor, w, conn, wire::ENVELOPE_HDR + n, now);
+                        // A coordinator answer is in no session's cursor.
+                        if !coord {
+                            anchor::note_relayed(
+                                &mut s.anchor,
+                                w,
+                                conn,
+                                wire::ENVELOPE_HDR + n,
+                                now,
+                            );
+                        }
                     } else {
                         s.resp_held[..n].copy_from_slice(&s.buf[..n]);
                         s.resp_held_len = n as u16;
                         s.resp_held_w = w as u8;
+                        s.resp_held_coord = coord;
                         resp_open = false;
                         break;
                     }

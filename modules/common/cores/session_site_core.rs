@@ -27,9 +27,9 @@
 //     topic, payload), as QSR2 carries them;
 //   - SUBSCRIPTIONS — filter, QoS and an options byte per entry (0: the
 //     broker applies no MQTT 5 subscription options);
-//   - the QoS 1/2 IN-FLIGHT ledger, entry for entry in QSR2's 28-byte
+//   - the QoS 1/2 IN-FLIGHT ledger, entry for entry in QSR2's 36-byte
 //     layout (packet id, QoS, phase, direction, generation, wal index,
-//     correlation, partition, PUBREC-sent);
+//     correlation, partition, PUBREC-sent, wal term);
 //   - the OWED outbound deliveries (`QOP_DELIVER` entries not yet
 //     complete: packet id, QoS, released, generation, PUBLISH body), so a
 //     redelivery keeps its packet id and a released QoS 2 delivery is
@@ -89,7 +89,7 @@ pub const SITE_WILL_PAYLOAD_MAX: usize = 512;
 /// `flags` bit: the session was opened with clean start.
 pub const SITE_FLAG_CLEAN_START: u8 = 1 << 0;
 /// One in-flight entry, QSR2's layout.
-pub const SITE_INFLIGHT_LEN: usize = 2 + 1 + 1 + 1 + 4 + 8 + 8 + 2 + 1;
+pub const SITE_INFLIGHT_LEN: usize = 2 + 1 + 1 + 1 + 4 + 8 + 8 + 2 + 1 + 8;
 /// In-flight direction: the client's own PUBLISH flow (QSR2's
 /// `INFLIGHT_PUB`); 1 is a delivery to it.
 pub const SITE_DIR_PUBLISH: u8 = 0;
@@ -156,6 +156,8 @@ pub struct SiteInflight {
     pub correlation_id: u64,
     pub partition_id: u16,
     pub rec_sent: u8,
+    /// The term `wal_index`'s entry was appended in.
+    pub wal_term: u64,
 }
 
 /// One owed outbound delivery, as the delivery ledger holds it.
@@ -268,6 +270,7 @@ impl SiteSession {
                 correlation_id: 0,
                 partition_id: 0,
                 rec_sent: 0,
+                wal_term: 0,
             }; SITE_INFLIGHT_MAX],
             owed_count: 0,
             owed: [SiteOwed::zero(); SITE_OWED_MAX],
@@ -427,6 +430,7 @@ impl SiteSession {
             w.put(&e.correlation_id.to_le_bytes());
             w.put(&e.partition_id.to_le_bytes());
             w.put(&[e.rec_sent]);
+            w.put(&e.wal_term.to_le_bytes());
             j += 1;
         }
         w.put(&[self.owed_count]);
@@ -544,6 +548,7 @@ impl SiteSession {
                 correlation_id: r.u64()?,
                 partition_id: r.u16()?,
                 rec_sent: r.u8()?,
+                wal_term: r.u64()?,
             };
             if e.qos == 0 || e.qos > 2 {
                 return Err(SS_CORRUPT);

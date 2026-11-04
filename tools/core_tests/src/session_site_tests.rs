@@ -52,6 +52,7 @@ fn session() -> SiteSession {
         correlation_id: 5,
         partition_id: 2,
         rec_sent: 1,
+        wal_term: 3,
     }));
     // A QoS 1 delivery to the client, unanswered, and a QoS 2 one whose
     // PUBREL already went out.

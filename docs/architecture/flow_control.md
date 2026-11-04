@@ -98,6 +98,51 @@ slot it reserved, and both sides retry on later ticks. Saturation
 therefore shows up as bounded backpressure and rising latency, never
 as a publish that was acknowledged and then forgotten.
 
+## Ack resolution: the entry, not the index
+
+A registration names the entry its proposal was appended as: the
+`(partition_id, wal_index)` MSG_PROPOSAL_ASSIGNED gave it AND the term
+it carries. An index alone names no entry — a leader deposed before its
+entry commits leaves the index to the next leader, which may commit a
+different entry there; with follower writes forwarded to the leader the
+node waiting on the entry need not even be the one that appended it.
+Acknowledging once the log merely passes the index would tell the
+client "committed" for a write no log holds.
+
+So the ack component resolves each registration
+(`modules/common/cores/ack_term_core.rs`) against:
+
+- the partition's COMMIT horizon on `durability_in`
+  (`consensus.durable_horizon`: commit index and current term). An
+  entry at or below the horizon whose term equals the horizon's is
+  committed — the steady-state case, acked with no added latency. The
+  ledger's `quorum_durable` proof is not a commit and is not wired here.
+- the APPLIED term runs `session_processor` reports on the forward bus
+  (MSG_ACK_APPLIED `[partition][first][last][term]`: the committed log's
+  entries `first..=last` carry `term`), at once when the committed log
+  changes term and otherwise every 10 ms. A run covering the index with
+  the entry's term commits it (once the horizon has reached it too); a
+  run with any other term means it was SUPERSEDED; an index applied past
+  with no run naming its term (the last eight term changes are kept per
+  partition) is UNKNOWN.
+
+MSG_ACK_EMIT carries the verdict as a status byte in Clustor's refusal
+vocabulary — `0` committed, `0x02` superseded (`NOT_LEADER`), `0x07`
+unknown (`OUTCOME_UNKNOWN`) — and `session_processor` fails a
+non-committed operation exactly as it fails a refused proposal: MQTT
+DISCONNECT (the client resends), the Kafka partition's error
+(`NOT_LEADER_OR_FOLLOWER` / `REQUEST_TIMED_OUT`), AMQP Basic.Nack,
+OffsetCommit `REQUEST_TIMED_OUT`. A retry is always correct; an unproven
+ack never is. Neither a failed verdict nor a refusal touches the publish
+stash: a stash is opened by the apply path for an entry that committed,
+so a failed proposal has none of its own, and the one its flow's
+correlation can name is a committed entry of the same flow (an
+`OUTCOME_UNKNOWN` entry that did commit, or an earlier attempt committing
+late). That one is delivered on its dedup verdict like any other — its
+dedup key is filed, so dropping it would lose the message for good when
+the resend reads DUPLICATE. Counted as `superseded` / `term_unknown` (flow) and
+`acks_superseded` (session_processor).
+
 A completion is released only once its MSG_ACK_EMIT has been written in
 full; a short or refused write leaves the entry active for a later step.
 Registrations carry the session generation the publish was accepted
@@ -209,7 +254,59 @@ edge waits only for the worker to read `deliver_in`, which waits on
 outbox room and a free park slot; a slot not held by a drain's answer
 frees on something shared, or its delivery moves to its session's queue.
 Only drains' answers and offline queues wait on clients, and nothing
-waits on them but the deliveries to those clients.
+waits on them but the deliveries to those clients — and, through the
+response hold, codec input and `flow`'s completions, which the client's
+own output must have room to answer; nothing a commit waits on waits
+on them.
+
+## Client responses (`session_processor`)
+
+A response — PUBACK / PUBREC / PUBCOMP, SUBACK, CONNACK, a DISCONNECT
+failing a refused or superseded flow, a Kafka response, an AMQP
+Basic.Ack or Nack — is the client's only word about work it handed over,
+so none is lost to a full codec bus. One the bus refuses is held
+(`session_processor/reply_hold.rs`), one bounded ring per output
+(`codec_out`, `codec2_out`, `front_out`), and written oldest first as the
+bus has room. Everything a session is told leaves on one output, so a
+response made while its output holds anything goes behind it: nothing
+overtakes a held response, and a delivery or a Basic.Deliver — work the
+worker keeps and offers again — is refused while anything is held ahead
+of it. A resend a reconnect owes is held behind its CONNACK only while
+the ring keeps its reserve; the rest stay owed in the log.
+
+What keeps a ring from filling depends on whether the input that
+answers can wait:
+
+- **Inputs whose sender holds them** — a client's codec envelopes and
+  `flow`'s completions — are read only while the ring they answer on has
+  room for the most one input can answer (one response of any size and a
+  few small ones). The pressure goes back up the codec input to the
+  client; a full output stops only the sessions it serves.
+- **Inputs that cannot wait** are never gated on a client: a committed
+  entry (no commit waits on a client), Clustor's assignments and
+  refusals (consensus drops what a full edge refuses), a cold WAL read,
+  the expiry sweep. Their answers are kept where the operation lives: a
+  Kafka produce / OffsetCommit or AMQP confirm answer is owed in its
+  inflight slot and answered on a later step (the sweep never expires an
+  owed slot); a cold Fetch whose records find no room owes an empty
+  answer, and the consumer fetches the offset again; a DISCONNECT with no
+  room is owed to its connection — as is the "server moved" one a
+  placement update owes every session it releases — and written once its
+  output holds nothing for that connection. Nothing later is written for
+  a connection owed a DISCONNECT.
+
+Order on an output is the order responses were made in. For Kafka that
+is not yet request order — a Produce is answered after a later Fetch —
+so the Kafka codec puts each connection's answers back in request order
+before they reach the client, with its own bounded slots and a bound on
+the requests in flight per connection
+([kafka_adapter.md](kafka_adapter.md#response-order)).
+
+A closed connection's held responses and owed DISCONNECT are dropped
+unwritten (its id is the next connection's), and a session with anything
+held or owed is not quiescent for a handoff. `rheld=` / `rlost=` on the
+`[sess] cont` heartbeat count responses held and lost to a full ring;
+`rlost` must stay 0.
 
 ## Backpressure translation (`flow`'s backpressure component)
 

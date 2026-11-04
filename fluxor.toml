@@ -72,6 +72,14 @@ reason = """PIC modules mount the fluxor SDK wholesale via include!/#[path], so 
 prefix = "modules/common/"
 reason = """Shared definitions #[path]-mounted into every consumer; each uses a different subset, so no item is dead in all of them and none can carry #[expect]."""
 
+# Host module tests: a PIC module's sources and the fluxor SDK mounted
+# verbatim (include!/#[path]) against a mock syscall table. The mounted
+# items live in modules/** and target/fluxor/**, the test drives a subset of
+# them, and the module's entry points are unsafe by its ABI.
+[[ci.hygiene.allow_crate_root]]
+prefix = "tools/flow_tests/tests/"
+reason = """Host module tests mount PIC module sources and the fluxor SDK wholesale against a mock SyscallTable; the unused and unsafe items are the mounted module's, not this file's, so there is no item here to carry #[expect]."""
+
 [ci.test]
 # Shadow-checkout hard-fail guard:
 # tests/ and examples/ are shadow-tracked in .git-shadow/, so a checkout

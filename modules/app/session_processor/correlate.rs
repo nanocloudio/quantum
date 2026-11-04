@@ -108,6 +108,35 @@ pub struct Correlate {
     /// never overtaken.
     stash_ready: [u64; STASH_SLOTS],
     stash_next_ready: u64,
+    /// The top byte of every correlation id this worker issues
+    /// (`set_namespace`). Consensus answers a tagged proposal on
+    /// `proposal_assigned` / `MSG_PROPOSAL_REFUSED`, which is fanned to
+    /// every proposer on the node — both co-located workers, clustor's
+    /// `session_directory` (`replica_id << 56`) and `operations` (bit 63) —
+    /// and each takes only the ids it issued, so the ids must not overlap:
+    /// two workers counting from 1 bound each other's assignments. Not
+    /// touched by `init`/`reset`: it is the worker's identity, not
+    /// apply-derived state.
+    namespace: u64,
+}
+
+/// The top byte of a worker's correlation ids: `CID_NAMESPACE | worker`.
+/// Disjoint from `session_directory`'s (the node's replica id, a small
+/// number) and from `operations`' (bit 63 set).
+pub const CID_NAMESPACE: u8 = 0x40;
+/// The bits below the namespace byte: the per-worker counter.
+pub const CID_COUNTER_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+/// Issue this worker's correlation ids under `CID_NAMESPACE | worker`
+/// (worker ids are 0..=7, `co_located_workers` being a bitmask of them).
+/// Called once at construction, after `init`.
+pub fn set_namespace(s: &mut Correlate, worker: u8) {
+    s.namespace = u64::from(CID_NAMESPACE | (worker & 0x07)) << 56;
+}
+
+/// The worker namespace byte correlation id `cid` was issued under.
+pub fn cid_namespace(cid: u64) -> u8 {
+    (cid >> 56) as u8
 }
 
 // ── Commit-gating stash ─────────────────────────────────────────────
@@ -300,11 +329,11 @@ pub fn allocate(
     }
     for i in 0..MAX_PENDING_CORRELATIONS {
         if s.pending[i].active == 0 {
-            s.next_correlation_id = s.next_correlation_id.wrapping_add(1);
+            s.next_correlation_id = s.next_correlation_id.wrapping_add(1) & CID_COUNTER_MASK;
             if s.next_correlation_id == 0 {
                 s.next_correlation_id = 1;
             }
-            let cid = s.next_correlation_id;
+            let cid = s.namespace | s.next_correlation_id;
             s.pending[i] = PendingCorrelation {
                 correlation_id: cid,
                 session_slot,
@@ -349,11 +378,12 @@ pub fn take(s: &mut Correlate, cid: u64) -> Option<(u32, u16, u8)> {
 /// Count correlations older than `timeout_ms` without touching them.
 ///
 /// A live correlation names a proposal the substrate accepted, and the
-/// substrate emits `proposal_assigned` exactly once for every accepted
-/// tagged proposal. The assignment is therefore always still in flight,
-/// however late it is, and reclaiming the slot would consume it with
-/// nowhere to bind it — the publish would be accepted and then never
-/// acknowledged. Capacity is bounded at the other end instead:
+/// substrate answers every tagged proposal exactly once on
+/// `proposal_assigned` — an assignment, or a refusal
+/// (`MSG_PROPOSAL_REFUSED`, which `take`s the correlation at once). The
+/// answer is therefore always still in flight, however late it is, and
+/// reclaiming the slot would consume it with nowhere to bind it — the
+/// publish would be accepted and then never acknowledged. Capacity is bounded at the other end instead:
 /// `allocate` refuses while the publish is still the client's to retry.
 ///
 /// The count is a leak detector. A non-zero value means an assignment
@@ -524,7 +554,8 @@ pub fn dlv_release(s: &mut Correlate, slot: usize) {
 
 // ── Ack stash ───────────────────────────────────────────────────────
 
-/// Park an 18-byte ack registration whose emission was backpressured.
+/// Park an ack registration (`wire::ACK_REGISTER_LEN`) whose emission was
+/// backpressured.
 /// The slot was reserved when the correlation was allocated, so this
 /// succeeds for every registration the broker owes; false means the
 /// reservation invariant was violated and the caller must say so

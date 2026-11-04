@@ -5,11 +5,30 @@
 //! wire. Holds per-connection reassembly state and the advertised
 //! host/port used in Metadata responses.
 //!
+//! ## Response order
+//!
+//! A connection's responses leave in the order its requests arrived, as
+//! the protocol requires (`kafka_order_core.rs`): this codec answers
+//! ApiVersions, Metadata, FindCoordinator and InitProducerId itself and
+//! `session_processor` answers the rest, some at once and some once they
+//! are durable, so an answer ready ahead of its turn waits in a slot
+//! until the answers before it are written. At most `kafka_order::DEPTH`
+//! requests are in flight per connection, and a request beyond that, or
+//! one no slot is free for, stays in the connection's reassembly buffer
+//! until there is room; the raw record that would overflow that buffer
+//! is held and no raw bytes are taken while it is (`step`), which is the
+//! backpressure. A request that will never be answered — malformed, an
+//! API this broker does not serve, one `session_processor` marks with
+//! `wire::KAFKA_API_CLOSE`, or one whose answer is overdue — closes the
+//! connection in its turn: no later answer may pass it.
+//!
 //! ## Per-step bound
 //!
-//! `RX_QUOTA` records off `in_raw` and `RESP_QUOTA` off `in_responses`.
+//! `RX_QUOTA` records off `in_raw` and `RESP_QUOTA` off `in_responses`;
+//! `step` is O(`KCONNS` × `kafka_order::DEPTH`).
 
 use super::abi::SyscallTable;
+use super::kafka_order as order;
 use super::{dev_channel_port, dev_log, dev_millis, wire};
 
 /// Per-connection reassembly capacity. Bounds the largest single Kafka
@@ -65,6 +84,26 @@ const API_SYNC_GROUP: i16 = 14;
 const API_API_VERSIONS: i16 = 18;
 const API_INIT_PRODUCER_ID: i16 = 22;
 
+/// A request whose answer has not come this long after it became its
+/// connection's oldest closes the connection. Every request is answered
+/// or marked never to be — `session_processor` answers its own expiry
+/// (8 s) — so this is the backstop for an answer lost on the way, which
+/// would otherwise hold every later answer on the connection for ever.
+/// Java's `request.timeout.ms` defaults to 30 s, so the client has not
+/// given up on it first.
+const HEAD_TIMEOUT_MS: u64 = 15_000;
+/// How often the overdue scan runs.
+const OVERDUE_SCAN_MS: u64 = 1_000;
+
+/// `KConn::closing`: open.
+const OPEN: u8 = 0;
+/// A request will never be answered: nothing more is taken, and the
+/// connection is closed once the answers ahead of it are written.
+const CLOSING: u8 = 1;
+/// The close was asked of the transport; what the client still sends is
+/// dropped until `MSG_CONN_CLOSED`.
+const CLOSED: u8 = 2;
+
 const MAX_TOPICS_SEEN: usize = 8;
 const MAX_TOPIC_LEN: usize = 64;
 const MAX_HOST_LEN: usize = 48;
@@ -74,7 +113,14 @@ const MAX_HOST_LEN: usize = 48;
 struct KConn {
     conn_id: wire::ConnId,
     active: u8,
+    /// A complete request is in `buf` that could not be taken yet (no
+    /// room in flight, or the session edge refused it).
+    stalled: u8,
+    /// `OPEN`, `CLOSING` or `CLOSED`.
+    closing: u8,
     len: u16,
+    /// The requests in flight, in arrival order.
+    seq: order::Seq,
     buf: [u8; RASM],
 }
 
@@ -83,7 +129,10 @@ impl KConn {
         Self {
             conn_id: 0,
             active: 0,
+            stalled: 0,
+            closing: OPEN,
             len: 0,
+            seq: order::Seq::zero(),
             buf: [0; RASM],
         }
     }
@@ -133,6 +182,22 @@ pub struct Kafka {
     topics_seen_count: u8,
 
     conns: [KConn; KCONNS],
+    /// Answers waiting for their turn (`kafka_order_core.rs`).
+    pub pool: order::Pool,
+    /// A raw record that would have overflowed a stalled connection's
+    /// reassembly buffer, held whole until the buffer has room for it;
+    /// no raw record is taken while one is held. Length 0 = none.
+    rx_held_len: u16,
+    rx_held: [u8; OUT_BUF],
+    /// Answers kept for their turn, connections closed for a request
+    /// never answered, of them for an overdue one, answers for no request
+    /// in flight (dropped), requests that waited for room.
+    order_held: u32,
+    order_closed: u32,
+    order_timeouts: u32,
+    order_unmatched: u32,
+    order_stalls: u32,
+    last_scan_ms: u64,
     frame: [u8; OUT_BUF],
     scratch: [u8; OUT_BUF],
 }
@@ -189,10 +254,32 @@ unsafe fn forward(
         && super::anchor::forward_env(&mut *anchor, sys, super::dev_millis(sys), mt, payload)
 }
 
+/// Hand a coordinator call (a group API or a committed-offset request,
+/// `anchor::kafka_coordinator_api`) to the anchor, which sends it to the
+/// worker coordinating for the pair whichever worker the connection is
+/// bound to — with one worker, to that one. `false` only when that
+/// channel refused it.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+#[inline]
+unsafe fn forward_coord(
+    anchor: *mut super::anchor::Anchor,
+    sys: &SyscallTable,
+    mt: u8,
+    payload: &[u8],
+) -> bool {
+    !anchor.is_null()
+        && super::anchor::forward_coord(&mut *anchor, sys, super::dev_millis(sys), mt, payload)
+}
+
 pub fn init(s: &mut Kafka) {
     for c in s.conns.iter_mut() {
         *c = KConn::zero();
     }
+    order::pool_init(&mut s.pool);
+    s.rx_held_len = 0;
     s.topics_seen_count = 0;
     s.next_producer_id = 0;
     s.node_id = 0;
@@ -222,6 +309,19 @@ pub fn finish_init(s: &mut Kafka) {
 /// rationale.
 /// # Safety
 unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: wire::ConnId, bytes: &[u8]) -> bool {
+    write_conn_mtype(sys, chan, conn_id, wire::MSG_CLIENT_FRAME, bytes)
+}
+
+/// [`write_conn`] with the envelope type named: `MSG_CONN_CLOSE_REQUEST`
+/// with no bytes asks the transport to close the connection.
+/// # Safety
+unsafe fn write_conn_mtype(
+    sys: &SyscallTable,
+    chan: i32,
+    conn_id: wire::ConnId,
+    mtype: u8,
+    bytes: &[u8],
+) -> bool {
     if chan < 0 {
         return false;
     }
@@ -232,30 +332,37 @@ unsafe fn write_conn(sys: &SyscallTable, chan: i32, conn_id: wire::ConnId, bytes
     let mut out = [0u8; OUT_BUF];
     out[..CID].copy_from_slice(&conn_id.to_le_bytes());
     out[CID..total].copy_from_slice(bytes);
-    let w = wire::channel_write_msg(sys, chan, wire::MSG_CLIENT_FRAME, &out[..total]);
+    let w = wire::channel_write_msg(sys, chan, mtype, &out[..total]);
     w > 0
 }
 
+/// The slot connection `conn_id` holds, if it holds one.
+fn lookup_conn(s: &Kafka, conn_id: wire::ConnId) -> Option<usize> {
+    (0..KCONNS).find(|&i| s.conns[i].active == 1 && s.conns[i].conn_id == conn_id)
+}
+
+/// Free slot `ci`: its requests in flight are forgotten (their answers,
+/// should any come, match nothing and are dropped) and its slots given
+/// back.
+fn release_conn(s: &mut Kafka, ci: usize) {
+    order::reset(&mut s.conns[ci].seq, &mut s.pool);
+    s.conns[ci].active = 0;
+    s.conns[ci].stalled = 0;
+    s.conns[ci].closing = OPEN;
+    s.conns[ci].len = 0;
+}
+
 fn find_conn(s: &mut Kafka, conn_id: wire::ConnId) -> usize {
-    for i in 0..KCONNS {
-        if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
-            return i;
-        }
-    }
-    for i in 0..KCONNS {
-        if s.conns[i].active == 0 {
-            s.conns[i].conn_id = conn_id;
-            s.conns[i].active = 1;
-            s.conns[i].len = 0;
-            return i;
-        }
+    if let Some(i) = lookup_conn(s, conn_id) {
+        return i;
     }
     // Table full: evict slot 0. Only a fraction of peer_router's client
     // conns speak Kafka; the bench profile stays well inside 32.
-    s.conns[0].conn_id = conn_id;
-    s.conns[0].active = 1;
-    s.conns[0].len = 0;
-    0
+    let i = (0..KCONNS).find(|&i| s.conns[i].active == 0).unwrap_or(0);
+    release_conn(s, i);
+    s.conns[i].conn_id = conn_id;
+    s.conns[i].active = 1;
+    i
 }
 
 fn remember_topic(s: &mut Kafka, name: &[u8]) {
@@ -277,26 +384,61 @@ fn remember_topic(s: &mut Kafka, name: &[u8]) {
 
 // ── Response builders ───────────────────────────────────────────────────────
 
-/// Frame `[size][corr][body]` into `s.frame` and send to the client.
-/// # Safety
-unsafe fn send_response(
-    s: &mut Kafka,
-    sys: &SyscallTable,
-    conn_id: wire::ConnId,
-    corr: i32,
-    body_len: usize,
-) {
-    // Body was built in s.scratch[..body_len].
+/// Frame `[size][corr][body]` into `s.frame` from the body in
+/// `s.scratch[..body_len]`. Returns the frame's length, or `None` when
+/// no codec frame can carry it.
+fn frame_response(s: &mut Kafka, corr: i32, body_len: usize) -> Option<usize> {
     let total = 8 + body_len;
-    if total > OUT_BUF {
-        return;
+    if total + CID > OUT_BUF || body_len > s.scratch.len() {
+        return None;
     }
     s.frame[0..4].copy_from_slice(&((4 + body_len) as i32).to_be_bytes());
     s.frame[4..8].copy_from_slice(&corr.to_be_bytes());
     s.frame[8..total].copy_from_slice(&s.scratch[..body_len]);
-    let out_frames = s.out_frames;
-    if write_conn(sys, out_frames, conn_id, &s.frame[..total]) {
-        s.responses_encoded = s.responses_encoded.wrapping_add(1);
+    Some(total)
+}
+
+/// A request on connection `ci` will never be answered: nothing more is
+/// taken from it, what it buffered is dropped, and it is closed once the
+/// answers ahead are written ([`settle`]).
+fn fail_conn(s: &mut Kafka, ci: usize) {
+    if s.conns[ci].closing == OPEN {
+        s.conns[ci].closing = CLOSING;
+    }
+    s.conns[ci].len = 0;
+    s.conns[ci].stalled = 0;
+}
+
+/// Write connection `ci`'s answers that are in order, then close it if
+/// its turn to close has come: a request marked never to be answered is
+/// at the front, or the connection is closing and nothing is in flight.
+///
+/// # Safety
+/// `sys` must point at a live kernel syscall table.
+unsafe fn settle(s: &mut Kafka, sys: &SyscallTable, ci: usize, now: u64) {
+    let conn_id = s.conns[ci].conn_id;
+    let out = s.out_frames;
+    let encoded = &mut s.responses_encoded;
+    let front = order::flush(&mut s.conns[ci].seq, &mut s.pool, now, |f| {
+        // SAFETY: caller guarantees `sys` is live.
+        let w = unsafe { write_conn(sys, out, conn_id, f) };
+        if w {
+            *encoded = encoded.wrapping_add(1);
+        }
+        w
+    });
+    if front == order::Front::Close {
+        // Nothing after it may be written: the client is told by the
+        // close, and resends what it still wants on a new connection.
+        order::reset(&mut s.conns[ci].seq, &mut s.pool);
+        fail_conn(s, ci);
+    }
+    if s.conns[ci].closing == CLOSING && order::is_idle(&s.conns[ci].seq) {
+        // SAFETY: caller guarantees `sys` is live.
+        if unsafe { write_conn_mtype(sys, out, conn_id, wire::MSG_CONN_CLOSE_REQUEST, &[]) } {
+            s.conns[ci].closing = CLOSED;
+            s.order_closed = s.order_closed.wrapping_add(1);
+        }
     }
 }
 
@@ -539,6 +681,10 @@ fn build_metadata(s: &mut Kafka, v: i16, req: &[u8]) -> usize {
 // ── Step ────────────────────────────────────────────────────────────────────
 
 /// Process one complete Kafka request sitting at `conn.buf[off..off+total]`.
+/// `false` when it cannot be taken yet — no room in flight on its
+/// connection, no slot for its answer, or the edge refused it: it stays
+/// where it is and is offered again ([`step`]). A request that can never
+/// be answered fails the connection ([`fail_conn`]) and is taken.
 /// # Safety
 unsafe fn handle_request(
     s: &mut Kafka,
@@ -547,11 +693,13 @@ unsafe fn handle_request(
     ci: usize,
     off: usize,
     total: usize,
-) {
+    now: u64,
+) -> bool {
     let req = &s.conns[ci].buf[off..off + total];
     if total < 12 {
         s.parse_errors = s.parse_errors.wrapping_add(1);
-        return;
+        fail_conn(s, ci);
+        return true;
     }
     let api_key = i16::from_be_bytes([req[4], req[5]]);
     let api_ver = i16::from_be_bytes([req[6], req[7]]);
@@ -566,139 +714,224 @@ unsafe fn handle_request(
             body_off += cl as usize;
             if body_off > total {
                 s.parse_errors = s.parse_errors.wrapping_add(1);
-                return;
+                fail_conn(s, ci);
+                return true;
             }
         }
     } else {
         s.parse_errors = s.parse_errors.wrapping_add(1);
-        return;
+        fail_conn(s, ci);
+        return true;
     }
-    s.requests_decoded = s.requests_decoded.wrapping_add(1);
+    let local = matches!(
+        api_key,
+        API_API_VERSIONS | API_METADATA | API_FIND_COORDINATOR | API_INIT_PRODUCER_ID
+    );
+    let forwarded = matches!(
+        api_key,
+        API_PRODUCE
+            | API_FETCH
+            | API_LIST_OFFSETS
+            | API_OFFSET_COMMIT
+            | API_OFFSET_FETCH
+            | API_JOIN_GROUP
+            | API_HEARTBEAT
+            | API_LEAVE_GROUP
+            | API_SYNC_GROUP
+    );
+    if !local && !forwarded {
+        // An API this broker does not serve has no answer here, and a
+        // request left unanswered would hold every later answer: the
+        // connection closes in its turn, as a Kafka broker closes one on
+        // an unsupported request.
+        s.unsupported_dropped = s.unsupported_dropped.wrapping_add(1);
+        fail_conn(s, ci);
+        return true;
+    }
+    let answered = order::answered(api_key, api_ver, &req[body_off..]);
+    // Its place in the connection's order, and the slot its answer
+    // waits in if it is not the oldest.
+    let slot = if answered {
+        match order::reserve(&s.conns[ci].seq, &mut s.pool, order::class_for(api_key)) {
+            Some(slot) => slot,
+            None => return false,
+        }
+    } else {
+        order::NO_SLOT
+    };
 
-    match api_key {
-        API_API_VERSIONS => {
-            let blen = build_api_versions(s, api_ver);
-            send_response(s, sys, conn_id, corr, blen);
-        }
-        API_METADATA => {
-            // Copy the request body into `frame` (as scratch input) so
-            // build_metadata can borrow it while writing s.scratch.
-            let body_len = total - body_off;
-            if body_len > OUT_BUF {
-                s.parse_errors = s.parse_errors.wrapping_add(1);
-                return;
+    if local {
+        let blen = match api_key {
+            API_API_VERSIONS => build_api_versions(s, api_ver),
+            API_METADATA => {
+                // Copy the request body into `frame` (as scratch input) so
+                // build_metadata can borrow it while writing s.scratch.
+                let body_len = total - body_off;
+                if body_len > OUT_BUF {
+                    order::unreserve(&mut s.pool, slot);
+                    s.parse_errors = s.parse_errors.wrapping_add(1);
+                    fail_conn(s, ci);
+                    return true;
+                }
+                core::ptr::copy_nonoverlapping(
+                    s.conns[ci].buf.as_ptr().add(off + body_off),
+                    s.frame.as_mut_ptr(),
+                    body_len,
+                );
+                // SAFETY: build_metadata writes only s.scratch; req_copy
+                // aliases s.frame, which build_metadata never touches.
+                let req_copy: &[u8] = core::slice::from_raw_parts(s.frame.as_ptr(), body_len);
+                build_metadata(s, api_ver, req_copy)
             }
-            core::ptr::copy_nonoverlapping(
-                s.conns[ci].buf.as_ptr().add(off + body_off),
-                s.frame.as_mut_ptr(),
-                body_len,
-            );
-            // SAFETY: build_metadata writes only s.scratch; req_copy
-            // aliases s.frame, which build_metadata never touches.
-            let req_copy: &[u8] = core::slice::from_raw_parts(s.frame.as_ptr(), body_len);
-            let blen = build_metadata(s, api_ver, req_copy);
-            send_response(s, sys, conn_id, corr, blen);
-        }
-        API_FIND_COORDINATOR => {
-            // Single logical broker: the coordinator is always us.
-            // v0: [err][node_id][host][port]
-            // v1: [throttle][err][error_message null][node_id][host][port]
-            let hlen = s.advertised_host_len as usize;
-            let host = s.advertised_host;
-            let port = s.advertised_port as i32;
-            let mut p = 0usize;
-            if api_ver >= 1 {
+            API_FIND_COORDINATOR => {
+                // Single logical broker: the coordinator is always us.
+                // v0: [err][node_id][host][port]
+                // v1: [throttle][err][error_message null][node_id][host][port]
+                let hlen = s.advertised_host_len as usize;
+                let host = s.advertised_host;
+                let port = s.advertised_port as i32;
+                let mut p = 0usize;
+                if api_ver >= 1 {
+                    s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+                    p += 4;
+                }
+                s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+                p += 2;
+                if api_ver >= 1 {
+                    s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+                    p += 2;
+                }
+                s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
+                p += 4; // node 0
+                s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes());
+                p += 2;
+                s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]);
+                p += hlen;
+                s.scratch[p..p + 4].copy_from_slice(&port.to_be_bytes());
+                p += 4;
+                p
+            }
+            // API_INIT_PRODUCER_ID, the one local API left.
+            _ => {
+                // Producer id issuance. Sequence enforcement IS implemented:
+                // `session_processor` checks `(producer_id, epoch, sequence)`
+                // on the APPLY side, so a retried batch is recognised and not
+                // appended twice, and a gap answers
+                // OUT_OF_ORDER_SEQUENCE_NUMBER. See
+                // `modules/common/cores/kafka_idem_core.rs`.
+                //
+                // Ids are issued from a per-connection counter, NOT a
+                // cluster-wide one: two nodes will hand out the same id, so
+                // this is single-node-correct only. A cluster needs the id
+                // allocated through the control plane.
+                // v0/v1: [throttle][err][producer_id i64][producer_epoch i16]
+                // `[node_id:16][counter:40]`, so ids from different nodes can
+                // never collide. 40 bits is ~1.1e12 producers per node, and
+                // the whole value stays well inside a positive i64 — which
+                // matters because a non-positive producer id means "not
+                // idempotent" to the apply-side check.
+                //
+                // KNOWN GAP: the counter restarts at 1 when a node restarts,
+                // so a node CAN reissue an id it previously handed out. A
+                // producer holding the old one would then share sequence
+                // state with the new holder. Closing that needs the id
+                // allocated through the control plane (or persisted), which
+                // is control-plane work this does not pretend to do.
+                s.next_producer_id = s.next_producer_id.wrapping_add(1);
+                let pid =
+                    (((s.node_id as u64) << 40) | (s.next_producer_id & 0x00FF_FFFF_FFFF)) as i64;
+                let mut p = 0usize;
                 s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
                 p += 4;
-            }
-            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
-            p += 2;
-            if api_ver >= 1 {
-                s.scratch[p..p + 2].copy_from_slice(&(-1i16).to_be_bytes());
+                s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
                 p += 2;
+                s.scratch[p..p + 8].copy_from_slice(&pid.to_be_bytes());
+                p += 8;
+                s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
+                p += 2;
+                p
             }
-            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-            p += 4; // node 0
-            s.scratch[p..p + 2].copy_from_slice(&(hlen as i16).to_be_bytes());
-            p += 2;
-            s.scratch[p..p + hlen].copy_from_slice(&host[..hlen]);
-            p += hlen;
-            s.scratch[p..p + 4].copy_from_slice(&port.to_be_bytes());
-            p += 4;
-            send_response(s, sys, conn_id, corr, p);
-        }
-        API_INIT_PRODUCER_ID => {
-            // Producer id issuance. Sequence enforcement IS implemented:
-            // `session_processor` checks `(producer_id, epoch, sequence)`
-            // on the APPLY side, so a retried batch is recognised and not
-            // appended twice, and a gap answers
-            // OUT_OF_ORDER_SEQUENCE_NUMBER. See
-            // `modules/common/cores/kafka_idem_core.rs`.
-            //
-            // Ids are issued from a per-connection counter, NOT a
-            // cluster-wide one: two nodes will hand out the same id, so
-            // this is single-node-correct only. A cluster needs the id
-            // allocated through the control plane.
-            // v0/v1: [throttle][err][producer_id i64][producer_epoch i16]
-            // `[node_id:16][counter:40]`, so ids from different nodes can
-            // never collide. 40 bits is ~1.1e12 producers per node, and
-            // the whole value stays well inside a positive i64 — which
-            // matters because a non-positive producer id means "not
-            // idempotent" to the apply-side check.
-            //
-            // KNOWN GAP: the counter restarts at 1 when a node restarts,
-            // so a node CAN reissue an id it previously handed out. A
-            // producer holding the old one would then share sequence
-            // state with the new holder. Closing that needs the id
-            // allocated through the control plane (or persisted), which
-            // is control-plane work this does not pretend to do.
-            s.next_producer_id = s.next_producer_id.wrapping_add(1);
-            let pid = (((s.node_id as u64) << 40) | (s.next_producer_id & 0x00FF_FFFF_FFFF)) as i64;
-            let mut p = 0usize;
-            s.scratch[p..p + 4].copy_from_slice(&0i32.to_be_bytes());
-            p += 4;
-            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
-            p += 2;
-            s.scratch[p..p + 8].copy_from_slice(&pid.to_be_bytes());
-            p += 8;
-            s.scratch[p..p + 2].copy_from_slice(&0i16.to_be_bytes());
-            p += 2;
-            send_response(s, sys, conn_id, corr, p);
-        }
-        API_PRODUCE | API_FETCH | API_LIST_OFFSETS | API_OFFSET_COMMIT | API_OFFSET_FETCH
-        | API_JOIN_GROUP | API_HEARTBEAT | API_LEAVE_GROUP | API_SYNC_GROUP => {
-            // Envelope: [conn_id:u16 LE][proto=1][api_key LE][api_ver LE]
-            //           [corr LE][body]
-            let body_len = total - body_off;
-            let env_len = SESSION_HDR + body_len;
-            if env_len > OUT_BUF {
-                s.parse_errors = s.parse_errors.wrapping_add(1);
-                return;
+        };
+        let Some(n) = frame_response(s, corr, blen) else {
+            order::unreserve(&mut s.pool, slot);
+            s.parse_errors = s.parse_errors.wrapping_add(1);
+            fail_conn(s, ci);
+            return true;
+        };
+        if slot == order::NO_SLOT {
+            // Nothing in flight ahead of it: answered now, or offered
+            // again once the edge takes it.
+            let out = s.out_frames;
+            if !write_conn(sys, out, conn_id, &s.frame[..n]) {
+                return false;
             }
-            s.scratch[0..2].copy_from_slice(&conn_id.to_le_bytes());
-            s.scratch[2] = 1; // PROTO_KAFKA
-            s.scratch[3..5].copy_from_slice(&api_key.to_le_bytes());
-            s.scratch[5..7].copy_from_slice(&api_ver.to_le_bytes());
-            s.scratch[7..11].copy_from_slice(&corr.to_le_bytes());
-            core::ptr::copy_nonoverlapping(
-                s.conns[ci].buf.as_ptr().add(off + body_off),
-                s.scratch.as_mut_ptr().add(SESSION_HDR),
-                body_len,
-            );
-            if !forward(
-                s.anchor,
-                sys,
-                wire::MSG_SESSION_PROPOSAL,
-                &s.scratch[..env_len],
-            ) {
-                // codec_in saturated — drop; producer retries on timeout.
-                s.parse_errors = s.parse_errors.wrapping_add(1);
-            }
+            s.responses_encoded = s.responses_encoded.wrapping_add(1);
+        } else if order::push_answered(
+            &mut s.conns[ci].seq,
+            &mut s.pool,
+            corr,
+            slot,
+            &s.frame[..n],
+            now,
+        ) {
+            s.order_held = s.order_held.wrapping_add(1);
+        } else {
+            // The answer outgrew its slot class (unreachable by
+            // `class_for`): unanswerable, so the connection closes.
+            fail_conn(s, ci);
         }
-        _ => {
-            s.unsupported_dropped = s.unsupported_dropped.wrapping_add(1);
-        }
+        s.requests_decoded = s.requests_decoded.wrapping_add(1);
+        return true;
     }
+
+    // Envelope: [conn_id:u16 LE][proto=1][api_key LE][api_ver LE]
+    //           [corr LE][body]
+    let body_len = total - body_off;
+    let env_len = SESSION_HDR + body_len;
+    if env_len > OUT_BUF {
+        order::unreserve(&mut s.pool, slot);
+        s.parse_errors = s.parse_errors.wrapping_add(1);
+        fail_conn(s, ci);
+        return true;
+    }
+    s.scratch[0..2].copy_from_slice(&conn_id.to_le_bytes());
+    s.scratch[2] = 1; // PROTO_KAFKA
+    s.scratch[3..5].copy_from_slice(&api_key.to_le_bytes());
+    s.scratch[5..7].copy_from_slice(&api_ver.to_le_bytes());
+    s.scratch[7..11].copy_from_slice(&corr.to_le_bytes());
+    core::ptr::copy_nonoverlapping(
+        s.conns[ci].buf.as_ptr().add(off + body_off),
+        s.scratch.as_mut_ptr().add(SESSION_HDR),
+        body_len,
+    );
+    // Group membership and committed offsets are one worker's for the
+    // pair (the coordinator); the log the others read is every worker's.
+    let taken = if super::anchor::kafka_coordinator_api(api_key) {
+        forward_coord(
+            s.anchor,
+            sys,
+            wire::MSG_SESSION_PROPOSAL,
+            &s.scratch[..env_len],
+        )
+    } else {
+        forward(
+            s.anchor,
+            sys,
+            wire::MSG_SESSION_PROPOSAL,
+            &s.scratch[..env_len],
+        )
+    };
+    if !taken {
+        // codec_in saturated: the request stays in the buffer and is
+        // offered again, rather than dropped and left unanswered.
+        order::unreserve(&mut s.pool, slot);
+        return false;
+    }
+    if answered {
+        order::push(&mut s.conns[ci].seq, corr, slot, now);
+    }
+    s.requests_decoded = s.requests_decoded.wrapping_add(1);
+    true
 }
 
 /// Drain raft leader hints so Metadata can name the real leader.
@@ -729,35 +962,46 @@ pub unsafe fn drain_leader_state(s: &mut Kafka, sys: &SyscallTable) {
 
 /// Handle one client record: `[conn_id:u16 LE][tcp chunk]` framed as
 /// MSG_CLIENT_FRAME, or MSG_CONN_CLOSED carrying just the conn id.
-/// Appends to the connection's reassembly buffer and drains every
-/// complete size-delimited request from it.
+/// Appends to the connection's reassembly buffer and takes every
+/// complete size-delimited request from it that there is room for.
+/// `true` when the record is HELD: it would overflow a connection whose
+/// requests are waiting for room, so the caller must take no more raw
+/// records until [`step`] lands it.
 ///
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[u8]) {
+pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[u8]) -> bool {
+    // Stage the record exactly as the channel read did:
+    // `frame` holds `[conn_id][tcp chunk]`.
+    let n = payload.len();
+    if n > s.frame.len() {
+        return false;
+    }
+    s.frame[..n].copy_from_slice(payload);
+    // SAFETY: caller guarantees `sys` is live.
+    unsafe { on_staged(s, sys, mtype, n) }
+}
+
+/// [`on_frame`] for the record staged in `s.frame[..n]`.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+unsafe fn on_staged(s: &mut Kafka, sys: &SyscallTable, mtype: u8, n: usize) -> bool {
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-        // Stage the record exactly as the channel read did:
-        // `frame` holds `[conn_id][tcp chunk]`.
-        let n = payload.len();
-        if n > s.frame.len() {
-            return;
-        }
-        s.frame[..n].copy_from_slice(payload);
         if n < CID {
-            return;
+            return false;
         }
         let conn_id = u16::from_le_bytes([s.frame[0], s.frame[1]]);
+        let now = dev_millis(sys);
 
         // Connection closed: release this conn's reassembly slot and
         // tell session_processor to drop conn-keyed state (groups).
         if mtype == wire::MSG_CONN_CLOSED {
-            for i in 0..KCONNS {
-                if s.conns[i].active == 1 && s.conns[i].conn_id == conn_id {
-                    s.conns[i] = KConn::zero();
-                    break;
-                }
+            if let Some(ci) = lookup_conn(s, conn_id) {
+                release_conn(s, ci);
             }
             // Forward as MSG_CONN_CLOSED (NOT MSG_SESSION_DISCONNECT —
             // that type already means "MQTT DISCONNECT packet" on this
@@ -765,35 +1009,78 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             // path). session_processor releases conn-keyed state on it.
             let cb = conn_id.to_le_bytes();
             forward(s.anchor, sys, wire::MSG_CONN_CLOSED, &cb);
-            return;
+            return false;
         }
         if n <= CID {
-            return;
+            return false;
         }
-        let data_len = n - CID;
         let ci = find_conn(s, conn_id);
-
-        // Append to the conn's reassembly buffer.
-        let have = s.conns[ci].len as usize;
-        if have + data_len > RASM {
-            // Overflow — protocol desync or oversize request.
-            // Fail closed: drop buffered bytes, resync from empty.
-            s.conns[ci].len = 0;
-            s.resync_resets = s.resync_resets.wrapping_add(1);
-            return;
+        if s.conns[ci].closing != OPEN {
+            // Nothing more is taken from a connection that is closing.
+            return false;
         }
-        core::ptr::copy_nonoverlapping(
-            s.frame.as_ptr().add(CID),
-            s.conns[ci].buf.as_mut_ptr().add(have),
-            data_len,
-        );
-        s.conns[ci].len = (have + data_len) as u16;
 
-        // Extract every complete frame currently buffered.
+        // Append to the conn's reassembly buffer as far as it has room,
+        // taking the requests that completes; a chunk larger than the
+        // room left goes in as the requests ahead of it make room.
+        let mut src = CID;
+        while src < n {
+            let have = s.conns[ci].len as usize;
+            let take = (RASM - have).min(n - src);
+            core::ptr::copy_nonoverlapping(
+                s.frame.as_ptr().add(src),
+                s.conns[ci].buf.as_mut_ptr().add(have),
+                take,
+            );
+            s.conns[ci].len = (have + take) as u16;
+            src += take;
+            drain_conn(s, sys, ci, now);
+            settle(s, sys, ci, now);
+            if src == n || s.conns[ci].closing != OPEN {
+                break;
+            }
+            if usize::from(s.conns[ci].len) < RASM {
+                continue;
+            }
+            if s.conns[ci].stalled != 0 {
+                // Its requests are waiting for room: hold the rest of the
+                // record, and with it every later one, until they are
+                // taken.
+                let rest = n - src;
+                s.rx_held[..CID].copy_from_slice(&conn_id.to_le_bytes());
+                s.rx_held[CID..CID + rest].copy_from_slice(&s.frame[src..n]);
+                s.rx_held_len = (CID + rest) as u16;
+                return true;
+            }
+            // A full buffer holding no complete request: a size field
+            // past what this buffer can carry got through, so the stream
+            // cannot be trusted. The connection closes once the answers
+            // ahead are written.
+            s.resync_resets = s.resync_resets.wrapping_add(1);
+            fail_conn(s, ci);
+            settle(s, sys, ci, now);
+            break;
+        }
+        false
+    }
+}
+
+/// Take every complete request at the front of connection `ci`'s
+/// reassembly buffer that there is room for, leaving the rest there:
+/// `stalled` says whether a complete one is left.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+unsafe fn drain_conn(s: &mut Kafka, sys: &SyscallTable, ci: usize, now: u64) {
+    // SAFETY: caller guarantees `sys` is live.
+    unsafe {
+        let conn_id = s.conns[ci].conn_id;
+        s.conns[ci].stalled = 0;
         let mut off = 0usize;
         let mut avail = s.conns[ci].len as usize;
         loop {
-            if avail < 4 {
+            if avail < 4 || s.conns[ci].closing != OPEN {
                 break;
             }
             let size = i32::from_be_bytes([
@@ -804,19 +1091,25 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
             ]);
             if size <= 0 || size as usize > MAX_KREQ {
                 // Unrecoverable desync for a stream protocol.
-                s.conns[ci].len = 0;
                 s.resync_resets = s.resync_resets.wrapping_add(1);
-                off = 0;
-                avail = 0;
+                fail_conn(s, ci);
                 break;
             }
             let total = 4 + size as usize;
             if avail < total {
                 break;
             }
-            handle_request(s, sys, conn_id, ci, off, total);
+            if !handle_request(s, sys, conn_id, ci, off, total, now) {
+                s.conns[ci].stalled = 1;
+                s.order_stalls = s.order_stalls.wrapping_add(1);
+                break;
+            }
             off += total;
             avail -= total;
+        }
+        if s.conns[ci].closing != OPEN {
+            // `fail_conn` dropped the buffer.
+            return;
         }
         // Compact leftover fragment to the front.
         if off > 0 && avail > 0 {
@@ -832,44 +1125,161 @@ pub unsafe fn on_frame(s: &mut Kafka, sys: &SyscallTable, mtype: u8, payload: &[
     }
 }
 
-/// Encode one session response into a Kafka response frame.
+/// Once per step, ahead of the raw read: write the answers whose turn
+/// came, take the requests that were waiting for room, close the
+/// connections whose turn to close came or whose oldest answer is
+/// overdue, then land the held raw record. `true` when the caller may
+/// take raw records; `false` while the held one still has no room.
+///
+/// # Safety
+///
+/// `sys` must point at a live kernel syscall table.
+pub unsafe fn step(s: &mut Kafka, sys: &SyscallTable) -> bool {
+    // SAFETY: caller guarantees `sys` is live.
+    unsafe {
+        let now = dev_millis(sys);
+        let scan = now.wrapping_sub(s.last_scan_ms) >= OVERDUE_SCAN_MS;
+        if scan {
+            s.last_scan_ms = now;
+        }
+        for ci in 0..KCONNS {
+            if s.conns[ci].active == 0 {
+                continue;
+            }
+            if scan && order::overdue(&s.conns[ci].seq, now, HEAD_TIMEOUT_MS) {
+                s.order_timeouts = s.order_timeouts.wrapping_add(1);
+                order::reset(&mut s.conns[ci].seq, &mut s.pool);
+                fail_conn(s, ci);
+            }
+            let c = &s.conns[ci];
+            if c.stalled == 0 && c.closing != CLOSING && !order::has_work(&c.seq) {
+                continue;
+            }
+            settle(s, sys, ci, now);
+            if s.conns[ci].stalled != 0 {
+                drain_conn(s, sys, ci, now);
+                settle(s, sys, ci, now);
+            }
+        }
+        let n = s.rx_held_len as usize;
+        if n == 0 {
+            return true;
+        }
+        s.rx_held_len = 0;
+        s.frame[..n].copy_from_slice(&s.rx_held[..n]);
+        !on_staged(s, sys, wire::MSG_CLIENT_FRAME, n)
+    }
+}
+
+/// Encode one session response into a Kafka response frame and write it
+/// in its turn.
 ///
 /// Payload is the session envelope
 /// `[conn_id:u16 LE][proto=1][api_key:i16 LE][api_ver:i16 LE][corr_id:i32 LE][body]`
 /// (see session_processor's `emit_kafka_response`). The body is already a
 /// complete, correctly-versioned response body for `api_key`/`api_ver`;
-/// this only reframes it as the wire form `[size:i32 BE][corr:i32 BE][body]`
-/// and writes it to the originating connection.
+/// this reframes it as the wire form `[size:i32 BE][corr:i32 BE][body]`,
+/// writes it to the originating connection if it answers the oldest
+/// request in flight there, and otherwise keeps it until it does. An
+/// `api_key` of `wire::KAFKA_API_CLOSE` answers nothing: the request
+/// will never be answered, and the connection closes in its turn.
+/// `false` when the response answers the oldest request and the frame
+/// edge refused it: nothing changed, and it must be offered again.
 ///
 /// # Safety
 ///
 /// `sys` must point at a live kernel syscall table.
-pub unsafe fn on_response(s: &mut Kafka, sys: &SyscallTable, payload: &[u8]) {
+pub unsafe fn on_response(s: &mut Kafka, sys: &SyscallTable, payload: &[u8]) -> bool {
     let plen = payload.len();
     // conn(2) + proto(1) + api_key(2) + api_ver(2) + corr(4)
     if plen < SESSION_HDR {
-        return;
+        return true;
     }
     let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
     // payload[2] is the PROTO_KAFKA discriminator; the dispatch table has
     // already matched it.
+    let api_key = i16::from_le_bytes([payload[3], payload[4]]);
     let corr = i32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
-    let body_len = plen - SESSION_HDR;
-    if body_len > s.scratch.len() {
-        s.parse_errors = s.parse_errors.wrapping_add(1);
-        return;
+    let Some(ci) = lookup_conn(s, conn_id) else {
+        // The connection is gone: nothing to answer.
+        return true;
+    };
+    if s.conns[ci].closing == CLOSED {
+        return true;
     }
-    s.scratch[..body_len].copy_from_slice(&payload[SESSION_HDR..plen]);
+    let body_len = plen - SESSION_HDR;
+    let framed = if api_key == wire::KAFKA_API_CLOSE || body_len > s.scratch.len() {
+        if api_key != wire::KAFKA_API_CLOSE {
+            s.parse_errors = s.parse_errors.wrapping_add(1);
+        }
+        None
+    } else {
+        s.scratch[..body_len].copy_from_slice(&payload[SESSION_HDR..plen]);
+        let f = frame_response(s, corr, body_len);
+        if f.is_none() {
+            s.parse_errors = s.parse_errors.wrapping_add(1);
+        }
+        f
+    };
     // SAFETY: caller guarantees `sys` is live.
     unsafe {
-        send_response(s, sys, conn_id, corr, body_len);
+        let now = dev_millis(sys);
+        let out = s.out_frames;
+        let encoded = &mut s.responses_encoded;
+        let r = order::answer(
+            &mut s.conns[ci].seq,
+            &mut s.pool,
+            corr,
+            framed.map(|n| &s.frame[..n]),
+            now,
+            |f| {
+                let w = write_conn(sys, out, conn_id, f);
+                if w {
+                    *encoded = encoded.wrapping_add(1);
+                }
+                w
+            },
+        );
+        match r {
+            order::Answered::Refused => return false,
+            order::Answered::Unmatched => {
+                // Writing it would put it out of order (or answer a
+                // connection that never asked): dropped, counted.
+                s.order_unmatched = s.order_unmatched.wrapping_add(1);
+                if s.order_unmatched & 0x3F == 1 {
+                    dev_log(sys, 2, b"[kafka] response for no request".as_ptr(), 31);
+                }
+                return true;
+            }
+            order::Answered::Overflow => {
+                s.parse_errors = s.parse_errors.wrapping_add(1);
+            }
+            order::Answered::Kept => {
+                if framed.is_some() {
+                    s.order_held = s.order_held.wrapping_add(1);
+                }
+            }
+            order::Answered::Written => {}
+        }
+        settle(s, sys, ci, now);
+        if s.conns[ci].stalled != 0 {
+            drain_conn(s, sys, ci, now);
+            settle(s, sys, ci, now);
+        }
     }
+    true
 }
 
-/// Fill the component's metric payload. Returns the byte count.
+/// Fill the component's metric payload. Returns the byte count:
+/// `[requests_decoded][responses_encoded][parse_errors][answers held for
+/// their turn][connections closed for an unanswered request][of them for
+/// an overdue answer]`, each `u32 LE`.
 pub fn metrics(s: &Kafka, m: &mut [u8; 24]) -> usize {
     m[0..4].copy_from_slice(&s.requests_decoded.to_le_bytes());
     m[4..8].copy_from_slice(&s.responses_encoded.to_le_bytes());
     m[8..12].copy_from_slice(&s.parse_errors.to_le_bytes());
-    12
+    m[12..16].copy_from_slice(&s.order_held.to_le_bytes());
+    m[16..20].copy_from_slice(&s.order_closed.to_le_bytes());
+    m[20..24].copy_from_slice(&s.order_timeouts.to_le_bytes());
+    24
 }

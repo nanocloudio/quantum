@@ -4,8 +4,10 @@
 //! `fluxor-modules.md` §8):
 //!
 //!   - [`ack`]          — durable-publish inflight tracking keyed by
-//!     `(partition_id, wal_index)`, ack emission on quorum durability,
-//!     and redelivery with exponential backoff.
+//!     `(partition_id, wal_index)` with the entry's term, ack emission
+//!     once the entry is committed at that `(index, term)` (a failure
+//!     status when another entry was), and redelivery with exponential
+//!     backoff.
 //!   - [`backpressure`] — admission's credit envelope translated into
 //!     protocol-native backpressure signals, plus a periodic status
 //!     summary to the gateway.
@@ -32,17 +34,23 @@
 //!
 //!   1. `forward_in` drain (≤[`FORWARD_BUDGET`]), demuxed by frame type:
 //!      MSG_ACK_REGISTER → `ack::on_register` (≤16/step),
+//!      MSG_ACK_APPLIED  → `ack::on_applied` (≤16/step): the committed
+//!      log's applied term runs, which settle an entry the commit
+//!      horizon's term cannot,
 //!      MSG_LAG_SIGNAL   → `prefetch::on_lag` (≤16/step, emits the
 //!      credit update inline as the standalone module did). The drain
 //!      stops before reading whenever the ack table is full, so a
 //!      registration is never consumed without a slot to hold it; the
 //!      records stay in the channel as backpressure.
-//!   2. `durability_in` drain (≤64/step) → `ack::on_durability`.
+//!   2. `durability_in` drain (≤64/step) → `ack::on_durability`: each
+//!      partition's commit horizon.
 //!   3. `ack::step_acks` — emit MSG_ACK_EMIT for every inflight entry
-//!      its partition's durable high-water mark has reached. Runs ONLY
-//!      when `durability_in` is wired: without proofs the high-water
-//!      marks never advance, and the standalone module gated the same
-//!      sweep behind the same condition.
+//!      its partition's view resolves: committed at its `(wal_index,
+//!      term)`, or superseded / unknown (a failure status the session
+//!      state machine fails the operation on). Runs ONLY when
+//!      `durability_in` is wired: without a horizon nothing can be
+//!      acknowledged, and the standalone module gated the same sweep
+//!      behind the same condition.
 //!   4. `envelope_in` drain (≤16/step) → `backpressure::on_envelope`.
 //!   5. `rejected_in` drain (≤16/step) → `backpressure::on_rejected`.
 //!   6. `ack::step_timeouts` — redelivery scan, at most once per
@@ -82,6 +90,14 @@ mod wire;
 #[path = "../../common/types.rs"]
 mod types;
 
+/// Whether a registered entry is the one committed at its index.
+mod term {
+    include!("../../common/cores/ack_term_core.rs");
+}
+const _: () = assert!(term::REGISTER_LEN == wire::ACK_REGISTER_LEN);
+const _: () = assert!(term::APPLIED_LEN == wire::ACK_APPLIED_LEN);
+const _: () = assert!(term::EMIT_LEN == wire::ACK_EMIT_LEN);
+
 mod ack;
 mod backpressure;
 mod prefetch;
@@ -94,8 +110,8 @@ mod prefetch;
 const STEP_BURST: i32 = 2;
 
 /// Records drained from `forward_in` per step. Sized to the sum of the
-/// two consumers' budgets so neither type starves the other.
-const FORWARD_BUDGET: u8 = 32;
+/// consumers' budgets so no type starves another.
+const FORWARD_BUDGET: u8 = 48;
 
 /// Largest record any of the four inputs carries, with headroom.
 const READ_BUF: usize = 256;
@@ -216,7 +232,9 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
     if chan < 0 {
         return;
     }
-    let mut env = [0u8; 9 + 24];
+    // Sized to the largest component payload (ack's 36 bytes): a payload
+    // that does not fit is not emitted at all.
+    let mut env = [0u8; 9 + 36];
     env[0] = 1; // dimensional
                 // tenant/protocol/prg are unset here: these are node-scoped component
                 // counters, not per-tenant series.
@@ -255,6 +273,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // ── 1: session outbound bus, demuxed to ack and prefetch ─────
         let mut registers = 0u8;
+        let mut applied = 0u8;
         let mut lags = 0u8;
         let mut worked = 0u32;
         if s.in_forward >= 0 {
@@ -275,7 +294,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 // rather than take a record it might not be able to
                 // handle. The record stays in the channel for the next
                 // step; nothing is read and discarded.
-                if registers >= ack::REGISTER_BUDGET || lags >= prefetch::LAG_BUDGET {
+                if registers >= ack::REGISTER_BUDGET
+                    || applied >= ack::APPLIED_BUDGET
+                    || lags >= prefetch::LAG_BUDGET
+                {
                     break;
                 }
                 let poll = (sys.channel_poll)(s.in_forward, 0x01);
@@ -292,6 +314,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     wire::MSG_ACK_REGISTER => {
                         registers += 1;
                         let _ = ack::on_register(&mut s.ack, &s.buf[..plen], now);
+                    }
+                    wire::MSG_ACK_APPLIED => {
+                        applied += 1;
+                        ack::on_applied(&mut s.ack, &s.buf[..plen]);
                     }
                     wire::MSG_LAG_SIGNAL => {
                         lags += 1;
@@ -361,9 +387,10 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         // ── 8: component-tagged telemetry ────────────────────────────
         if now.wrapping_sub(s.last_metrics_ms) >= METRICS_INTERVAL_MS {
             s.last_metrics_ms = now;
+            let mut am = [0u8; 36];
+            let n = ack::metrics(&s.ack, &mut am);
+            emit_metrics(sys, s.out_metrics, METRIC_ID_ACK, &am[..n]);
             let mut m = [0u8; 28];
-            let n = ack::metrics(&s.ack, &mut m);
-            emit_metrics(sys, s.out_metrics, METRIC_ID_ACK, &m[..n]);
             let n = backpressure::metrics(&s.backpressure, &mut m);
             emit_metrics(sys, s.out_metrics, METRIC_ID_BACKPRESSURE, &m[..n]);
             let n = prefetch::metrics(&s.prefetch, &mut m);

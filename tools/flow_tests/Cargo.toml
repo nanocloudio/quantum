@@ -1,0 +1,63 @@
+[package]
+name         = "flow_tests"
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.81"            # reason = "..." attribute + #[expect]; see standards/lints.md
+license      = "MIT OR Apache-2.0"
+publish      = false
+description  = "Host-side module tests for Quantum's flow composite and session_processor tables, mounted verbatim"
+
+# The `flow` module's ack component (`modules/app/flow/ack.rs`) mounted
+# verbatim, as the composite mounts it, against a mock `SyscallTable` with
+# byte-FIFO channels — so its registration, resolution and ack emission are
+# exercised exactly as the PIC build runs them. `core_tests` covers the
+# pure cores and forbids unsafe code; a module's entry points are unsafe,
+# so they are driven from this crate instead. `session_processor`'s
+# correlation and durable-publish tables (`correlate.rs`, `store.rs`) are
+# mounted the same way to pin what a failed proposal frees. The tests live
+# under `tests/`; the library is empty.
+[lib]
+path = "src/lib.rs"
+
+# The mounted `session_processor` sources gate their Kafka halves on the
+# module's `kafka` feature; the tests build them as the Kafka-enabled
+# variants do.
+[features]
+default = ["kafka"]
+kafka   = []
+
+# Quantum has no root Cargo workspace (the deployable surface is modules/,
+# and host crates stand alone under tools/), so the standards/lints.md §1
+# baseline is inlined here rather than inherited. Keep in sync with the
+# sibling tools; `tools/ci/host_crates.sh` is what enforces it in CI.
+[lints.rust]
+unsafe_code               = "deny"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+# priority = -1 makes the group enables apply before per-lint overrides.
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "warn",  priority = -1 }
+
+# #[allow] discipline — bans bare #[allow] and requires reason = "...".
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+
+# Hardened defaults beyond clippy::all
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+unwrap_used   = "deny"
+expect_used   = "warn"
+panic         = "warn"
+print_stdout  = "deny"
+print_stderr  = "deny"
+
+# Pedantic carve-outs (universally noisy lints).
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+missing_const_for_fn    = "allow"
+too_many_lines          = "allow"

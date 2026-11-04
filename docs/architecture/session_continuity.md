@@ -141,8 +141,11 @@ the gates' record-count trigger for the same swap. Per connection:
 2. The worker drains to quiescent — no proposal of the session awaits
    its Raft assignment, nothing of its is parked, no retained read or
    offline drain of its is owed by `messaging` (those answers reach only
-   the worker that asked), and it has been quiet for `QUIET_STEPS` —
-   then declares `DRAINED` and exports.
+   the worker that asked), no answer the worker gives after its request
+   is still owed to the connection (a Kafka Produce, OffsetCommit or
+   cold Fetch, an AMQP confirm: only this worker can give it, and the
+   anchor fences this worker once the connection moves), and it has
+   been quiet for `QUIET_STEPS` — then declares `DRAINED` and exports.
 3. The anchor admits the cursors and relays `EXPORT_BEGIN / CHUNK… /
    END` verbatim to the standby.
 4. The standby answers `IMPORT_BEGIN / IMPORT_END`; on success the
@@ -263,7 +266,12 @@ one session at once:
 - **Ownership at apply.** With `co_located_workers` set, a worker
   applies only the committed entries of sessions it holds or of slots
   it allocates and has not lent; a single-worker node applies
-  everything, as a Raft follower must.
+  everything, as a Raft follower must. An op that names no session —
+  a Kafka record batch, a committed offset, a group's generation or
+  member, an AMQP message — is applied by every worker: the log is
+  every worker's, so a Kafka or AMQP connection is served by whichever
+  worker it is bound to, and a Fetch on one reads what was produced on
+  the other at the same offsets.
 - **One recipient per reply.** `topic_engine` records the worker
   holding each subscription (byte 9 of the subscribe record) and
   delivers on that worker's port (`deliver_out` / `deliver_out2`);
@@ -272,6 +280,33 @@ one session at once:
   `result_out`, `op_in2` / `result_out2`). `flow`'s completions are
   teed, and carry the `wal_index` of the registration they answer, so
   a stale completion cannot be read as another registration's.
+- **Every id a worker matches an answer by is its own.** Clustor's
+  assignments and refusals, `flow`'s completions and durability's
+  cold-read replies reach both workers, so each issues its correlation
+  ids under its own namespace byte (`0x40 | worker_id`, apart from
+  `session_directory`'s replica id and `operations`' bit 63), carries its
+  id in the top bits of every durable-publish slot's epoch, stamps its id
+  beside the node's in a produce's origin (`QOP_KAFKA_PRODUCE`
+  `[origin][origin_worker]`), and numbers its cold reads apart. Only the
+  worker that accepted a request answers it.
+- **One coordinator for the pair.** State a connection reads that other
+  connections change — a Kafka consumer group and its committed offsets,
+  an AMQP queue's read cursor and its consumers — would split if each
+  worker kept its own, so one worker owns it: the anchor's coordinator,
+  the lowest wired worker not lost. The anchor sends those calls there
+  (`MSG_COORD_CALL`: OffsetCommit, OffsetFetch, JoinGroup, Heartbeat,
+  LeaveGroup, SyncGroup; Basic.Get, Basic.Consume, Basic.Cancel and the
+  client's acks) whichever worker the connection is bound to, and relays
+  the coordinator's answers (`MSG_COORD_RESPONSE`) for any connection.
+  Neither counts in a delivery cursor or is held for a handoff, so a swap
+  moves the connection and leaves its group and its consumers where they
+  are; a connection that made a call has its close told to the
+  coordinator. The codec's sequencer still writes a Kafka connection's
+  answers in request order, whichever worker gives them. A worker loss
+  moves the role to the survivor, which holds the replicated group
+  generations, members and offsets (clients rejoin, as after any
+  coordinator change); AMQP queue cursors are the coordinator's memory
+  and start again from the log there.
 
 **Frozen sessions.** Between export and `DETACH` a session is
 `Exported` on the exporting worker: held, but neither consumed nor
@@ -404,6 +439,25 @@ not the server.
 All three run under `make test-mqtt-suite`, sequentially with the other
 broker smokes, because each boots a broker on a fixed port. That keeps
 them out of `fluxor ci`, which builds and lints but boots nothing.
+
+The co-located protocol evidence: the end-to-end script runs on its own
+(it binds 9090 too); the flow tests run in `fluxor ci` (`tools/ci/host_crates.sh`).
+
+- `tests/integration/co_located_protocols.sh` — Kafka and AMQP on
+  either worker: `examples/linux/co_located.yaml` (the `protocol` anchor,
+  two full workers) with a Kafka and an AMQP connection moved to worker 1
+  and back by operator swaps. Produce answered with the next contiguous
+  offset and Fetch reading worker 0's records on worker 1; JoinGroup /
+  SyncGroup / Heartbeat / OffsetCommit / OffsetFetch consistent across
+  the workers and connections (the coordinator); an AMQP confirm-mode
+  publish confirmed on each worker and Basic.Get handing each message out
+  once; five produces in flight across a swap answered once each, in
+  order, and in the log once each. The broker's `[sess] kq w=N` lines
+  witness which worker served what.
+- `tools/flow_tests/tests/co_located_workers.rs` — the ids each worker
+  matches by (slot epochs, correlation namespaces, the produce origin),
+  coordinator answers outside the session's holds and slots, and source
+  guards on apply ownership and counted responses.
 
 ## Parameters
 

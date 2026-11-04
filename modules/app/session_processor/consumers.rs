@@ -132,7 +132,10 @@ struct AmqpConsumer {
     conn_id: u16,
     tag_len: u8,
     queue_len: u8,
-    _pad: u8,
+    /// Registered by a coordinator call (`wire::MSG_COORD_CALL`): its
+    /// deliveries go back as coordinator answers, whichever worker the
+    /// connection is bound to.
+    coord: u8,
     channel: u16,
     prefetch: u16,
     unacked: u16,
@@ -159,7 +162,7 @@ impl AmqpConsumer {
             no_ack: 0,
             tag_len: 0,
             queue_len: 0,
-            _pad: 0,
+            coord: 0,
             channel: 0,
             prefetch: 0,
             unacked: 0,
@@ -556,6 +559,8 @@ pub struct ConsumerView {
     pub no_ack: bool,
     pub cursor: u64,
     pub next_dtag: u64,
+    /// Registered through the coordinator (`consumer_set_coord`).
+    pub coord: bool,
 }
 
 pub fn consumer_active(s: &Consumers, ci: usize) -> bool {
@@ -573,6 +578,7 @@ pub fn consumer_view(s: &Consumers, ci: usize) -> Option<ConsumerView> {
         no_ack: c.no_ack == 1,
         cursor: c.cursor,
         next_dtag: c.next_dtag,
+        coord: c.coord == 1,
     })
 }
 
@@ -652,6 +658,14 @@ pub fn consumer_register(
     c.tag[..tl].copy_from_slice(&tag[..tl]);
     c.queue[..ql].copy_from_slice(&queue[..ql]);
     c.cursor = cursor;
+}
+
+/// Mark consumer `ci` as registered by a coordinator call: its deliveries
+/// are coordinator answers.
+pub fn consumer_set_coord(s: &mut Consumers, ci: usize) {
+    if ci < ACONSUMERS {
+        s.amqp[ci].coord = 1;
+    }
 }
 
 pub fn consumer_set_cursor(s: &mut Consumers, ci: usize, cursor: u64) {

@@ -1,19 +1,30 @@
 //! ack — durable-publish inflight tracking, ack emission and redelivery.
 //!
 //! Inflight entries are keyed by `(partition_id, wal_index)` so durability
-//! proofs from different partitions can't alias each other. An entry acks
-//! once its partition's durable high-water mark reaches its `wal_index`;
-//! entries that age past their backoff are redelivered with exponential
+//! proofs from different partitions can't alias each other, and carry the
+//! term their entry was appended in: an index names an entry only with its
+//! term, and a leader change can commit another entry at the same index.
+//! An entry acks once its partition's commit horizon has reached its
+//! `wal_index` AND the entry committed there is provably its own — the
+//! horizon's term equals the entry's, or the applied runs
+//! `session_processor` reports name that term at that index
+//! (`cores/ack_term_core.rs` says why each is proof). An entry another
+//! term's entry superseded, or whose term this node cannot name once it has
+//! applied past it, is answered with a failure status instead, and the
+//! session state machine fails the operation so the client retries.
+//! Entries that age past their backoff are redelivered with exponential
 //! backoff, and abandoned after `max_attempts`.
 //!
 //! ## Per-step bound
 //!
-//! `on_register` and `on_durability` each handle ONE frame per call
-//! ([`REGISTER_BUDGET`] / [`DURABILITY_BUDGET`] per step). `step_acks` and
+//! `on_register`, `on_applied` and `on_durability` each handle ONE frame
+//! per call ([`REGISTER_BUDGET`] / [`APPLIED_BUDGET`] /
+//! [`DURABILITY_BUDGET`] per step). `step_acks` and
 //! `step_timeouts` each sweep all [`MAX_INFLIGHT`] slots; `step_timeouts`
 //! runs at most once per `scan_interval_ms`.
 
 use super::abi::SyscallTable;
+use super::term;
 use super::wire;
 use super::{dev_log, dev_millis, fmt_u32_raw};
 
@@ -29,6 +40,9 @@ const MAX_PARTITIONS: usize = 64;
 
 /// Registrations admitted per step. Matches the standalone drain bound.
 pub const REGISTER_BUDGET: u8 = 16;
+/// Applied-run notices admitted per step. The session state machine sends
+/// at most one per partition per flush, plus one per term change.
+pub const APPLIED_BUDGET: u8 = 16;
 /// Durability proofs admitted per step. Proofs are monotone high-water
 /// marks, so deferring the tail to the next step loses nothing and
 /// keeps the composite step bounded (standards fluxor-modules.md §8
@@ -45,6 +59,8 @@ struct InflightEntry {
     session_generation: u32,
     partition_id: u16,
     wal_index: u64,
+    /// The term the entry was appended in (MSG_PROPOSAL_ASSIGNED).
+    term: u64,
     sent_ms: u64,
     backoff_ms: u32,
     attempts: u8,
@@ -59,6 +75,7 @@ impl InflightEntry {
             session_generation: 0,
             partition_id: 0,
             wal_index: 0,
+            term: 0,
             sent_ms: 0,
             backoff_ms: 1000,
             attempts: 0,
@@ -93,12 +110,18 @@ pub struct Ack {
     /// it there.
     register_refused: u32,
     full_stalls: u32,
+    /// Entries answered as not committed: another term's entry took the
+    /// index, or this node applied past it without a run naming its term.
+    /// Each is an operation failed for the client to retry; `superseded`
+    /// rising follows leader changes, `term_unknown` should stay near 0.
+    superseded: u32,
+    term_unknown: u32,
 
-    /// Per-partition high-water mark of durable wal_index. An inflight
-    /// entry acks when `durable_per_partition[entry.partition_id] >=
-    /// entry.wal_index`. Indexed by partition_id; out-of-range proofs
-    /// are dropped.
-    durable_per_partition: [u64; MAX_PARTITIONS],
+    /// Per-partition commit horizon and applied term runs, indexed by
+    /// partition_id; out-of-range frames are dropped. An inflight entry
+    /// resolves against its partition's view (`term::PartitionTerms::
+    /// resolve`).
+    parts: [term::PartitionTerms; MAX_PARTITIONS],
 }
 
 pub fn init(a: &mut Ack) {
@@ -115,11 +138,13 @@ pub fn init(a: &mut Ack) {
     a.abandoned = 0;
     a.register_refused = 0;
     a.full_stalls = 0;
+    a.superseded = 0;
+    a.term_unknown = 0;
     for i in 0..MAX_INFLIGHT {
         a.entries[i] = InflightEntry::zero();
     }
     for i in 0..MAX_PARTITIONS {
-        a.durable_per_partition[i] = 0;
+        a.parts[i] = term::PartitionTerms::new();
     }
 }
 
@@ -136,55 +161,48 @@ pub fn is_full(a: &Ack) -> bool {
     !(0..MAX_INFLIGHT).any(|i| a.entries[i].active == 0)
 }
 
-/// MSG_ACK_REGISTER: `[session_slot:u32][message_id:u32]`
-/// `[partition_id:u16][wal_index:u64]` (18 bytes).
+/// MSG_ACK_REGISTER (`wire::ACK_REGISTER_LEN`, encoded by
+/// `term::encode_register`): `[session_slot:u32][message_id:u32]
+/// [partition_id:u16][wal_index:u64][session_generation:u32][term:u64]`.
 ///
 /// The session state machine receives MSG_PROPOSAL_ASSIGNED from
-/// consensus carrying `(correlation_id, partition_id, wal_index)` and
-/// forwards `(session_slot, packet_id, partition_id, wal_index)` here.
+/// consensus carrying `(correlation_id, partition_id, wal_index, term)`
+/// and forwards `(session_slot, packet_id, partition_id, wal_index, term)`
+/// here.
+///
+/// A proposal Clustor REFUSED (MSG_PROPOSAL_REFUSED on the same port) is
+/// never registered: no assignment follows a refusal, so the session state
+/// machine frees its correlation and fails the operation itself
+/// (`session_processor::on_proposal_refused`) and nothing reaches this
+/// table to wait for a durability proof that cannot come. Registration
+/// therefore stays exactly "one per assignment", and a refusal costs this
+/// component no slot and no redelivery.
 ///
 /// Returns false when the registration was not recorded. A malformed
-/// or unroutable payload is refused (there is nothing to track); a
-/// full table is refused too, and counted, though the dispatch gate
-/// above means a caller should never see it.
+/// or unroutable payload is refused (there is nothing to track) — index 0
+/// is reserved as "the proposer never received an assignment back", and
+/// no Raft entry has term 0, so neither can name an entry to wait for and
+/// acking one against partition 0's first proof would be a phantom; the
+/// proposer times out and retries. A full table is refused too, and
+/// counted, though the dispatch gate above means a caller should never
+/// see it.
 pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) -> bool {
-    if payload.len() < wire::ACK_REGISTER_LEN {
+    let Some(r) = term::decode_register(payload) else {
         return false;
-    }
-    let session_slot = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    let message_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    let partition_id = u16::from_le_bytes([payload[8], payload[9]]);
-    let wal_index = u64::from_le_bytes([
-        payload[10],
-        payload[11],
-        payload[12],
-        payload[13],
-        payload[14],
-        payload[15],
-        payload[16],
-        payload[17],
-    ]);
-    let session_generation =
-        u32::from_le_bytes([payload[18], payload[19], payload[20], payload[21]]);
-    if (partition_id as usize) >= MAX_PARTITIONS {
-        return false;
-    }
-    // wal_index == 0 is reserved as "the proposer never received an
-    // assignment back" — drop the register rather than create a phantom
-    // inflight that could ack against partition 0's first proof. The
-    // proposer will time out and retry.
-    if wal_index == 0 {
+    };
+    if (r.partition_id as usize) >= MAX_PARTITIONS {
         return false;
     }
 
     for i in 0..MAX_INFLIGHT {
         if a.entries[i].active == 0 {
             a.entries[i] = InflightEntry {
-                session_slot,
-                message_id,
-                session_generation,
-                partition_id,
-                wal_index,
+                session_slot: r.session_slot,
+                message_id: r.message_id,
+                session_generation: r.session_generation,
+                partition_id: r.partition_id,
+                wal_index: r.wal_index,
+                term: r.term,
                 sent_ms: now,
                 backoff_ms: a.backoff_base_ms,
                 attempts: 1,
@@ -197,24 +215,39 @@ pub fn on_register(a: &mut Ack, payload: &[u8], now: u64) -> bool {
     false
 }
 
-/// MSG_DURABILITY_PROOF (19 bytes), fanned in from every partition's
-/// durability instance. Advances that partition's high-water mark.
+/// MSG_ACK_APPLIED (`wire::ACK_APPLIED_LEN`) from the session state
+/// machine: the partition's committed entries `first..=last` carry `term`
+/// and have applied. Recorded in that partition's term runs; a malformed
+/// or out-of-range frame is dropped.
+pub fn on_applied(a: &mut Ack, payload: &[u8]) {
+    let Some((pid, run)) = term::decode_applied(payload) else {
+        return;
+    };
+    if (pid as usize) < MAX_PARTITIONS {
+        a.parts[pid as usize].note_applied(run);
+    }
+}
+
+/// MSG_DURABILITY_PROOF (19 bytes) carrying a partition's COMMIT horizon
+/// — `consensus.durable_horizon`: `[partition_id][current_term]
+/// [commit_index][replica]`, one per partition on this node. Advances that
+/// partition's horizon. A quorum-durability proof from the ledger is not
+/// a commit and must not be wired here (`cores/ack_term_core.rs`).
 pub fn on_durability(a: &mut Ack, payload: &[u8]) {
     if payload.len() < wire::DURABILITY_PROOF_LEN {
         return;
     }
-    let (partition_id, _term, index, _replica) =
+    let (partition_id, term, index, _replica) =
         wire::decode_durability_proof(&payload[..wire::DURABILITY_PROOF_LEN]);
     if (partition_id as usize) >= MAX_PARTITIONS {
         return;
     }
-    if index > a.durable_per_partition[partition_id as usize] {
-        a.durable_per_partition[partition_id as usize] = index;
-    }
+    a.parts[partition_id as usize].note_horizon(index, term);
 }
 
-/// Emit MSG_ACK_EMIT for every inflight entry whose partition has reached
-/// or surpassed its `wal_index`.
+/// Emit MSG_ACK_EMIT for every inflight entry its partition's view has
+/// resolved: status `term::STATUS_COMMITTED` for an entry committed at its
+/// `(wal_index, term)`, a failure status for one superseded or unknown.
 ///
 /// # Safety
 ///
@@ -228,15 +261,18 @@ pub unsafe fn step_acks(a: &mut Ack, sys: &SyscallTable) {
         if pid >= MAX_PARTITIONS {
             continue;
         }
-        if a.entries[i].wal_index > a.durable_per_partition[pid] {
+        let verdict = a.parts[pid].resolve(a.entries[i].wal_index, a.entries[i].term);
+        let Some(status) = verdict.status() else {
             continue;
-        }
+        };
 
-        let mut ack = [0u8; wire::ACK_EMIT_LEN];
-        ack[0..4].copy_from_slice(&a.entries[i].session_slot.to_le_bytes());
-        ack[4..8].copy_from_slice(&a.entries[i].message_id.to_le_bytes());
-        ack[8..12].copy_from_slice(&a.entries[i].session_generation.to_le_bytes());
-        ack[12..20].copy_from_slice(&a.entries[i].wal_index.to_le_bytes());
+        let ack = term::encode_emit(
+            a.entries[i].session_slot,
+            a.entries[i].message_id,
+            a.entries[i].session_generation,
+            a.entries[i].wal_index,
+            status,
+        );
         if a.out_ack >= 0 {
             // The entry is released only once the ACK is provably on the
             // channel. `channel_poll` reports writability, not success —
@@ -252,6 +288,17 @@ pub unsafe fn step_acks(a: &mut Ack, sys: &SyscallTable) {
                     if wrote == want {
                         a.entries[i].active = 0;
                         a.acks_emitted = a.acks_emitted.wrapping_add(1);
+                        match verdict {
+                            term::Verdict::Superseded => {
+                                a.superseded = a.superseded.wrapping_add(1);
+                                dev_log(sys, 2, b"[flow] ack superseded".as_ptr(), 21);
+                            }
+                            term::Verdict::Unknown => {
+                                a.term_unknown = a.term_unknown.wrapping_add(1);
+                                dev_log(sys, 2, b"[flow] ack term unknown".as_ptr(), 23);
+                            }
+                            _ => {}
+                        }
                         // One in 32: register-to-ack age, the wait for the
                         // durable mark to pass the entry's index.
                         if a.acks_emitted & 31 == 0 {
@@ -326,7 +373,7 @@ pub unsafe fn step_timeouts(a: &mut Ack, sys: &SyscallTable, now: u64) {
 }
 
 /// Fill the component's metric payload. Returns the byte count.
-pub fn metrics(a: &Ack, m: &mut [u8; 28]) -> usize {
+pub fn metrics(a: &Ack, m: &mut [u8; 36]) -> usize {
     m[0..4].copy_from_slice(&a.acks_emitted.to_le_bytes());
     m[4..8].copy_from_slice(&a.redelivers.to_le_bytes());
     m[8..12].copy_from_slice(&a.abandoned.to_le_bytes());
@@ -340,5 +387,7 @@ pub fn metrics(a: &Ack, m: &mut [u8; 28]) -> usize {
     m[16..20].copy_from_slice(&a.register_refused.to_le_bytes());
     m[20..24].copy_from_slice(&a.full_stalls.to_le_bytes());
     m[24..28].copy_from_slice(&a.emit_retries.to_le_bytes());
-    28
+    m[28..32].copy_from_slice(&a.superseded.to_le_bytes());
+    m[32..36].copy_from_slice(&a.term_unknown.to_le_bytes());
+    36
 }

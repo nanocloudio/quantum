@@ -67,6 +67,21 @@
 //! otherwise its PINGRESP is owed until one is. PUBLISH, SUBSCRIBE,
 //! UNSUBSCRIBE and AUTH are never acknowledged here.
 //!
+//! ## The coordinator
+//!
+//! With two workers wired, both apply the log, so a Kafka or AMQP
+//! connection is served by the worker it is bound to — except for the
+//! state one worker owns for the pair (`mqtt_anchor_core.rs`,
+//! "Coordinator calls"): a Kafka group and its committed offsets, an AMQP
+//! queue's read cursor and consumers. A call on it goes to the
+//! coordinator — the lowest wired worker not lost — as `MSG_COORD_CALL`,
+//! whichever worker the connection is bound to, and its answer
+//! (`MSG_COORD_RESPONSE`) is relayed from the coordinator for any
+//! connection. Neither is counted in a delivery cursor or held for a
+//! handoff: a swap moves the connection and leaves the coordinator where
+//! it is. A connection that made a call has its close told to the
+//! coordinator, in order behind its calls.
+//!
 //! ## Worker loss
 //!
 //! The bound worker checkpoints each session it serves through the
@@ -174,6 +189,14 @@ pub struct Anchor {
     aliases: [Option<(u16, u16)>; GATE_SEATS],
     /// Workers declared lost: fenced for good.
     lost: [u8; 2],
+    /// Connections that made a coordinator call, one bit each: their
+    /// close is told to the coordinator.
+    coord_conns: [u8; CONN_ID_SPACE / 8],
+    /// Closes owed to the coordinator, oldest first: written before any
+    /// later call, so a reused connection id never overtakes its
+    /// predecessor's close.
+    coord_close: [u16; COORD_CLOSE_SLOTS],
+    coord_close_len: usize,
     last_ack_ms: [u64; 2],
     probe_seq: u32,
     last_probe_ms: u64,
@@ -257,7 +280,17 @@ pub struct Anchor {
     pub reanchored: u32,
     pub reanchor_refused: u32,
     pub gate_full: u32,
+    /// Coordinator calls forwarded, coordinator answers relayed, closes
+    /// told to the coordinator, and closes it could not be told for a full
+    /// queue (each one a group member left until its session times out).
+    pub coord_calls: u32,
+    pub coord_answers: u32,
+    pub coord_closes: u32,
+    pub coord_close_lost: u32,
 }
+
+/// Closes owed to the coordinator a full edge can hold back at once.
+pub const COORD_CLOSE_SLOTS: usize = 256;
 
 /// Connections one anchor runs under continuity at once.
 pub const GATE_SEATS: usize = 16;
@@ -356,6 +389,13 @@ pub fn init(a: &mut Anchor) {
     a.worker_loss_ms = 0;
     a.replay_bytes = 0;
     a.lost = [0; 2];
+    a.coord_conns = [0; CONN_ID_SPACE / 8];
+    a.coord_close = [0; COORD_CLOSE_SLOTS];
+    a.coord_close_len = 0;
+    a.coord_calls = 0;
+    a.coord_answers = 0;
+    a.coord_closes = 0;
+    a.coord_close_lost = 0;
     a.last_ack_ms = [0; 2];
     a.probe_seq = 0;
     a.last_probe_ms = 0;
@@ -893,6 +933,126 @@ pub unsafe fn forward_env(
     }
 }
 
+// ── The coordinator ──────────────────────────────────────────────────
+
+/// The worker slot coordinating for this anchor (`coordinator_slot`):
+/// `None` unless two workers are wired.
+pub fn coordinator(a: &Anchor) -> Option<usize> {
+    coordinator_slot(
+        [standby_wired(a, 0), standby_wired(a, 1)],
+        [a.lost[0] != 0, a.lost[1] != 0],
+    )
+}
+
+/// Hand the coordinator call `payload` (an envelope of type `mt` for its
+/// connection) to the coordinator as `MSG_COORD_CALL`. With one worker
+/// there is no coordinator and the envelope is forwarded as any other
+/// ([`forward_env`]). `false` when the coordinator's channel refused it
+/// (or a close owed to it is still held back): the codec keeps it and
+/// offers it again.
+///
+/// # Safety
+/// `sys` must be the live kernel syscall table.
+pub unsafe fn forward_coord(
+    a: &mut Anchor,
+    sys: &SyscallTable,
+    now: u64,
+    mt: u8,
+    payload: &[u8],
+) -> bool {
+    let Some(w) = coordinator(a) else {
+        return forward_env(a, sys, now, mt, payload);
+    };
+    if payload.len() < 2 {
+        return true;
+    }
+    let conn = u16::from_le_bytes([payload[0], payload[1]]);
+    if a.conns[usize::from(conn)].phase == Phase::Closing {
+        return true;
+    }
+    if !coord_close_flush(a, sys) {
+        return false;
+    }
+    if payload.len() + COORD_INSERT > WRAP_MAX {
+        a.oversize_closed = a.oversize_closed.wrapping_add(1);
+        close_conn(a, sys, conn);
+        return true;
+    }
+    let n = encode_coord_call(&mut a.wrap_buf, mt, payload);
+    if n == 0 {
+        return true;
+    }
+    let ch = a.prop_out[w];
+    if wire::channel_write_msg(sys, ch, wire::MSG_COORD_CALL, &a.wrap_buf[..n]) <= 0 {
+        return false;
+    }
+    a.conns[usize::from(conn)].last_in_ms = now;
+    a.coord_conns[usize::from(conn) / 8] |= 1 << (conn % 8);
+    a.coord_calls = a.coord_calls.wrapping_add(1);
+    true
+}
+
+/// Whether a `MSG_COORD_RESPONSE` from worker `w` may reach its client:
+/// only the coordinator answers coordinator calls.
+pub fn coord_admitted(a: &mut Anchor, w: usize) -> bool {
+    if coordinator(a) == Some(w) {
+        a.coord_answers = a.coord_answers.wrapping_add(1);
+        return true;
+    }
+    a.stale_responses = a.stale_responses.wrapping_add(1);
+    false
+}
+
+/// `conn` closed: a connection that made a coordinator call has its close
+/// told to the coordinator, behind its calls.
+unsafe fn coord_conn_closed(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
+    let (byte, bit) = (usize::from(conn) / 8, 1u8 << (conn % 8));
+    if a.coord_conns[byte] & bit == 0 {
+        return;
+    }
+    a.coord_conns[byte] &= !bit;
+    if a.coord_close_len == COORD_CLOSE_SLOTS {
+        a.coord_close_lost = a.coord_close_lost.wrapping_add(1);
+        return;
+    }
+    a.coord_close[a.coord_close_len] = conn;
+    a.coord_close_len += 1;
+    let _ = coord_close_flush(a, sys);
+}
+
+/// Write the closes owed to the coordinator, oldest first, as far as its
+/// channel takes them. True when none is left. With no coordinator left
+/// (every worker lost) there is no one to tell and they are dropped.
+unsafe fn coord_close_flush(a: &mut Anchor, sys: &SyscallTable) -> bool {
+    if a.coord_close_len == 0 {
+        return true;
+    }
+    let Some(w) = coordinator(a) else {
+        a.coord_close_len = 0;
+        return true;
+    };
+    let ch = a.prop_out[w];
+    let mut done = 0usize;
+    while done < a.coord_close_len {
+        let conn = a.coord_close[done];
+        let mut p = [0u8; CONN_ID_LEN + COORD_INSERT];
+        let n = encode_coord_call(&mut p, wire::MSG_CONN_CLOSED, &conn.to_le_bytes());
+        if wire::channel_write_msg(sys, ch, wire::MSG_COORD_CALL, &p[..n]) <= 0 {
+            break;
+        }
+        a.coord_closes = a.coord_closes.wrapping_add(1);
+        done += 1;
+    }
+    let left = a.coord_close_len - done;
+    let mut k = 0usize;
+    while k < left {
+        a.coord_close[k] = a.coord_close[done + k];
+        k += 1;
+    }
+    a.coord_close_len = left;
+    left == 0
+}
+
 /// A response envelope from worker `w` for `conn` was accepted onto the
 /// frame edge: the inbound cursor advances, and so does the production
 /// id the response was relayed under.
@@ -1127,6 +1287,7 @@ unsafe fn release_attachment(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
 /// # Safety
 /// `sys` must be the live kernel syscall table.
 pub unsafe fn conn_closed(a: &mut Anchor, sys: &SyscallTable, conn: u16) {
+    coord_conn_closed(a, sys, conn);
     match a.conns[usize::from(conn)].phase {
         Phase::Idle => return,
         Phase::Closing => {}
@@ -1744,6 +1905,7 @@ pub unsafe fn step(a: &mut Anchor, sys: &SyscallTable, now: u64) {
     if !enabled(a) {
         return;
     }
+    let _ = coord_close_flush(a, sys);
     if a.hello_sent == 0 {
         let mut hello = [0u8; 10];
         hello[0] = sc::ROLE_ANCHOR;
@@ -1874,7 +2036,7 @@ pub fn metrics(a: &Anchor, m: &mut [u8; 24]) -> usize {
 /// # Safety
 /// `sys` must be the live kernel syscall table.
 pub unsafe fn log_hb(a: &Anchor, sys: &SyscallTable) {
-    let mut line = [0u8; 384];
+    let mut line = [0u8; 512];
     let mut pos = 0usize;
     for (label, v) in [
         (&b"[anchor] hb att="[..], a.attached),
@@ -1894,6 +2056,10 @@ pub unsafe fn log_hb(a: &Anchor, sys: &SyscallTable) {
         (&b" ckrel="[..], a.ckpt_relayed),
         (&b" ckack="[..], a.ckpt_acked),
         (&b" rgap="[..], a.replay_gaps),
+        (&b" coord="[..], a.coord_calls),
+        (&b" coordans="[..], a.coord_answers),
+        (&b" coordcls="[..], a.coord_closes),
+        (&b" coordlost="[..], a.coord_close_lost),
     ] {
         for &b in label {
             line[pos] = b;
