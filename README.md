@@ -110,7 +110,7 @@ For production installs (systemd, `/opt/quantum`) see
 | Path | Contents |
 |---|---|
 | `modules/app/` | `no_std` PIC module source, one directory per module (`mod.rs` + `manifest.toml`): the seven broker modules, `mqtt_quic_adapter`, the MQTT transport anchor (`quantum_mqtt_anchor`), the outbound clients (`mqtt_client`, `kafka_client`, `amqp_client`, `nats_client`), the message sinks (`mqtt_sink`, `kafka_sink`, `amqp_sink`), the broker's in-graph exchange fronts (`broker_front`), and `capability_registry` |
-| `packaging/` | What quantum ships: `stack/quantum_broker.yaml` is the `quantum_broker` stack, the broker and its in-graph fronts for an application to include ([docs/architecture/broker_front.md](docs/architecture/broker_front.md)) |
+| `packaging/` | What quantum ships: `stack/quantum_broker.yaml` is the `quantum_broker` stack, the broker and its in-graph fronts for an application to include ([docs/architecture/broker_front.md](docs/architecture/broker_front.md)); `service/quantum-tenant-broker/` is one tenant's broker behind mutual TLS, admitting only its devices' certificates ([docs/architecture/tenant_broker.md](docs/architecture/tenant_broker.md)) |
 | `modules/common/` | Shared source `#[path]`-mounted by the modules that use it: wire constants and proposal encoding (`wire.rs`), shared types, and the protocol cores under `cores/` |
 | `tools/` | Standalone host crates (`quantum-bench`, `telemetry_guard`, `wire_lint`) and repository scripts; see [tools/README.md](tools/README.md) |
 | `wire/` | Wire schemas: `mqtt.json`, `kafka.json`, `amqp.json`, `quic.json`, `catalog.json` |

@@ -214,7 +214,7 @@ unsafe extern "C" fn mock_provider_close(_handle: i32) -> i32 {
 }
 unsafe extern "C" fn mock_provider_call(_h: i32, op: u32, arg: *mut u8, len: usize) -> i32 {
     // TIMER::MILLIS: the mock clock. Everything else (logging) is taken.
-    if op == 0x0602 && len >= 8 {
+    if op == abi::registry::timer::MILLIS && len >= 8 {
         let b = mock().now_ms.to_le_bytes();
         for (i, v) in b.iter().enumerate() {
             // SAFETY: the caller's buffer holds `len >= 8` bytes.

@@ -17,8 +17,7 @@
 // The single mount of the SDK contract for this file. A connector that
 // needs the contract's opcodes reaches them through its own `abi`
 // mount; nothing of this module's `net_proto` crosses the boundary.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/net/net_proto.rs"]
-pub mod net_proto;
+pub use super::abi::contracts::net::net_proto;
 
 use net_proto::{write_connect_to, RequesterTag, Target, SOCK_TYPE_STREAM};
 

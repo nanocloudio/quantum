@@ -1,0 +1,95 @@
+# The quantum-tenant-broker service graph: one tenant's MQTT broker behind
+# mutual TLS.
+#
+#   linux_net ⇄ tls ⇄ broker (quantum_broker: peer_router ⇄ protocol ⇄ …)
+#
+# `tls` is the only door. A client is admitted when its chain verifies to
+# `client_ca`, its leaf is within its validity on the platform's trusted
+# clock, and it carries a URI SAN equal to `device_uri` or strictly under it
+# when it ends in `/` (`spiffe://<trust-domain>/device/<namespace>/` admits
+# every device of one namespace). A client with no certificate, one from
+# another CA, or one under another namespace's prefix fails the handshake and
+# never reaches the broker. The broker's own certificate is `server_cert` and
+# `server_key`; devices verify it as their deployment decides.
+#
+# Graph pods share their node's network, so two tenants' brokers on one node
+# differ by `listen_port`. The credentials are paths read where the graph
+# runs, at runtime (a volume lent to the workload), so an image carries none
+# and rotated files are taken without a restart. The broker's WAL lives in
+# the working directory.
+#
+# The stack's in-graph fronts are left unwired: MQTT over TLS is this graph's
+# only surface.
+target: linux
+tick_us: 1000
+
+# The Raft commit loop and the session round trips are feedback edges.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+params:
+  listen_port:
+    type: integer
+    default: 8883
+    min: 1
+    max: 65535
+    description: TCP port the broker accepts MQTT over TLS on; unique per node
+  server_cert:
+    type: string
+    required: true
+    example: /var/lib/quantum/tls/server.crt
+    description: "Path of the broker's certificate chain, leaf first (PEM or DER)"
+  server_key:
+    type: string
+    required: true
+    example: /var/lib/quantum/tls/server.key
+    description: "Path of the broker's private key (PEM or DER)"
+  client_ca:
+    type: string
+    required: true
+    example: /var/lib/quantum/tls/devices-ca.crt
+    description: "Path of the CA certificate (or bundle) device certificates must chain to"
+  device_uri:
+    type: string
+    required: true
+    example: "spiffe://cell.example/device/tenant-a/"
+    description: "URI SAN a device certificate must carry: this URI, or any under it when it ends in '/'"
+  client_id:
+    type: string
+    default: quantum-tenant
+    description: "The broker front's MQTT client id (unused while the fronts are unwired)"
+
+include:
+  - stack: ../../stack/quantum_broker.yaml
+    as: broker
+    params:
+      listen_port: "${param:listen_port}"
+      client_id: "${param:client_id}"
+
+modules:
+  - name: tls
+    mode: 1                         # server
+    verify_peer: 1
+    peer_auth: ca_uri
+    trust: "${param:client_ca}"
+    verify_uri: "${param:device_uri}"
+    cert_file: "${param:server_cert}"
+    key_file: "${param:server_key}"
+    alpn: mqtt
+
+wiring:
+  - from: linux_net.net_out
+    to: tls.cipher_in
+    buffer_bytes: 65536
+  - from: tls.cipher_out
+    to: linux_net.net_in
+    buffer_bytes: 65536
+  - from: tls.clear_out
+    to: broker.net_in
+    buffer_bytes: 65536
+  - from: broker.net_out
+    to: tls.clear_in
+    buffer_bytes: 65536

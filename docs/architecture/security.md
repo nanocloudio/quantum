@@ -10,6 +10,13 @@ audit — with no optional authentication methods.
 - **Transport TLS.** The bare-metal graph terminates TLS 1.3 in the
   fluxor `tls` foundation module in front of `peer_router`. The Linux
   development graphs serve cleartext.
+- **Client certificates, per deployment.** The `quantum-tenant-broker`
+  bundle admits a client only when its certificate chains to the
+  tenant's CA and carries a URI SAN under the tenant's SPIFFE prefix,
+  refusing everything else in `tls` before the broker sees a byte
+  ([tenant_broker.md](tenant_broker.md)). The broker itself still reads
+  no identity: inside that deployment any admitted client reaches any
+  topic.
 - **Role gating.** clustor's `operations` module gates admin
   operations by role (Operator / TenantAdmin / Observer /
   BreakGlass); the default role is Operator, which preserves
@@ -20,7 +27,7 @@ audit — with no optional authentication methods.
   within a run but not against an attacker who can re-derive the
   key; durable key material is part of the design below.
 
-Not implemented: client authentication of any kind (MQTT CONNECT,
+Not implemented: client authentication inside the broker (MQTT CONNECT,
 Kafka SASL, and AMQP `Connection.StartOk` are accepted without
 credential validation — AMQP advertises `PLAIN` but does not verify
 it), per-tenant ACLs, at-rest encryption (the WAL's AEAD parameter is

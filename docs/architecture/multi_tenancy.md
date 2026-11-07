@@ -106,6 +106,12 @@ derivable:
 - The two correlation-keyed handlers, which work off a stash keyed
   by correlation id, not by session.
 
+Until then, tenants are separated by deployment: the
+`quantum-tenant-broker` bundle runs one broker per tenant and admits only
+certificates under that tenant's SPIFFE prefix
+([tenant_broker.md](tenant_broker.md)), so tenant 0 inside each broker is
+the one tenant it serves.
+
 Closing the three needs two things Quantum cannot supply on its own:
 real tenant records from the control plane (a clustor concern), and
 a decision about what a CONNECT is keyed on — client credential,

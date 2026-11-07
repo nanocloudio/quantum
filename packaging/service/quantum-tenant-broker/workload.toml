@@ -1,0 +1,23 @@
+# quantum-tenant-broker: one tenant's MQTT broker, reached only over mutual TLS
+# by that tenant's devices.
+#
+#   fluxor publish                           # in this project
+#   # in the consumer: [dependencies] quantum = "…", [uses] bundles = ["quantum-tenant-broker"]
+#   fluxor update && fluxor sync
+#   fluxor run quantum-tenant-broker --params tenant.toml
+#
+# Fluxor's `tls` terminates the connection in front of an include of the
+# `quantum_broker` stack (packaging/stack/quantum_broker.yaml) and admits a
+# client only when its certificate chains to the CA the graph is given and
+# carries a URI SAN under the tenant's device prefix. Isolation between
+# tenants is one broker per tenant; within a tenant every device reaches every
+# topic until the broker reads the peer identity (ACLs). Its params are the
+# graph's (linux.yaml).
+[workload]
+name = "quantum-tenant-broker"
+version = "0.1.0"
+role = "service"
+
+[[implementation]]
+target = "linux"
+graph = "linux.yaml"
