@@ -12,6 +12,10 @@
 #   * Phase 2 is omitted (no root manifest, no `host_tools_crate`), so the
 #     three tool crates are built and tested by nothing.
 #
+# `tests/harness` (shadow-tracked, as in the sibling projects) is the host
+# test harness: its `cargo-test (harness)` phase, built into `fluxor ci`,
+# runs its suites, so it is fmt/clippy'd here and not tested a second time.
+#
 # This closes both holes. Without it CI would summarise GREEN with the
 # loadgens unbuilt and no host crate linted (standards/make.md §5 — the loam
 # trap): exactly the failure mode Chronicle hit when it removed its crates.
@@ -21,7 +25,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench" "tools/core_tests" "tools/flow_tests")
+CRATES=("tools/telemetry_guard" "tools/wire_lint" "tools/quantum-bench" "tests/harness")
 
 # Each crate is formatted BY NAME rather than with `cargo fmt --all`: a
 # future path dependency into `modules/**` would otherwise reformat the PIC
@@ -31,17 +35,15 @@ declare -A PKG=(
   ["tools/telemetry_guard"]="telemetry_guard"
   ["tools/wire_lint"]="wire_lint"
   ["tools/quantum-bench"]="quantum-bench"
-  # Host test bed for `modules/common/cores/*`. The cores are written to
-  # be `include!`d by a host crate as well as by the PIC modules; this is
-  # that crate, and the only place their invariants are exercised —
-  # `fluxor ci` fmt/clippies `modules/**` but runs no test over it.
-  ["tools/core_tests"]="core_tests"
-  # Host module tests: `flow`'s ack component mounted verbatim against a
-  # mock syscall table (its entry points are unsafe, which `core_tests`
-  # forbids), and `session_processor`'s correlation / durable-publish
-  # tables driven through what a failed proposal frees.
-  ["tools/flow_tests"]="flow_tests"
+  # The host test harness: the module cores' tests, and under `mods/` the
+  # modules mounted verbatim against a mock syscall table. A workspace
+  # whose `default-members` reach every crate, so one clippy pass here
+  # covers them all; each package is formatted by name.
+  ["tests/harness"]="quantum-test-harness quantum-mod-app"
 )
+
+# Crates whose tests `fluxor ci` runs itself (`cargo-test (harness)`).
+declare -A TESTED_BY_FLUXOR=(["tests/harness"]=1)
 
 fail=0
 
@@ -54,7 +56,9 @@ for c in "${CRATES[@]}"; do
   fi
 
   echo "== $c: fmt =="
-  if ! (cd "$dir" && cargo fmt -p "${PKG[$c]}" -- --check); then
+  fmt_pkgs=()
+  for p in ${PKG[$c]}; do fmt_pkgs+=(-p "$p"); done
+  if ! (cd "$dir" && cargo fmt "${fmt_pkgs[@]}" -- --check); then
     echo "FAIL $c: rustfmt"
     fail=1
   fi
@@ -65,6 +69,9 @@ for c in "${CRATES[@]}"; do
     fail=1
   fi
 
+  if [ -n "${TESTED_BY_FLUXOR[$c]:-}" ]; then
+    continue
+  fi
   echo "== $c: test =="
   if ! (cd "$dir" && cargo test --all-targets --all-features); then
     echo "FAIL $c: cargo test"

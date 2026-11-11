@@ -77,7 +77,7 @@ reason = """Shared definitions #[path]-mounted into every consumer; each uses a 
 # items live in modules/** and target/fluxor/**, the test drives a subset of
 # them, and the module's entry points are unsafe by its ABI.
 [[ci.hygiene.allow_crate_root]]
-prefix = "tools/flow_tests/tests/"
+prefix = "tests/harness/mods/app_modules/tests/"
 reason = """Host module tests mount PIC module sources and the fluxor SDK wholesale against a mock SyscallTable; the unused and unsafe items are the mounted module's, not this file's, so there is no item here to carry #[expect]."""
 
 [ci.test]

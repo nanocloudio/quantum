@@ -292,7 +292,7 @@ side is a routing loop, not a delivery.
 
 ## Gates
 
-- `tools/core_tests/src/edge_routing_tests.rs` — placement epochs under
+- `tests/harness/src/edge_routing_tests.rs` — placement epochs under
   load: ten thousand sessions keyed across three PRGs resolve to the
   same owner on every node; a shard-map epoch overriding 64 shards moves
   exactly the sessions on those shards and nothing else; a replayed or

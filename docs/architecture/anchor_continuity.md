@@ -462,7 +462,7 @@ pongheld= siteout= siteref= consumed=`.
 
 ## Gates
 
-- `tools/core_tests/src/anchor_continuity_tests.rs` — the production
+- `tests/harness/src/anchor_continuity_tests.rs` — the production
   envelope round-trips and is never truncated; a production is accepted
   only once the byte horizon reaches its last byte, reported once, never
   past what was written, and an over-report places nothing as held; a
@@ -483,7 +483,7 @@ pongheld= siteout= siteref= consumed=`.
   through the last production applies every delivery once, and the
   client reads every response once, whole, in order; a worker that
   released past the standby's horizon is refused.
-- `tools/core_tests/src/production_seat_tests.rs` — the worker's seats
+- `tests/harness/src/production_seat_tests.rs` — the worker's seats
   against the anchor's real gate: numbering, release by the horizon, a
   full ring and a full table, an oversize response, a crash takeover's
   re-offers with new productions held behind them, an id given back for
@@ -491,7 +491,7 @@ pongheld= siteout= siteref= consumed=`.
   horizon report whose bytes go back or past what was produced ignored,
   a session moved to another worker numbering on from the anchor's gate,
   and a repeated re-anchor answered again.
-- `tools/core_tests/src/session_site_tests.rs` — a session round-trips
+- `tests/harness/src/session_site_tests.rs` — a session round-trips
   whole; every flipped bit and truncation is refused; bounds refuse at
   export; a recorded QoS 2 flow makes the retry a duplicate; the epoch,
   generation and cursor rules decide the import, a lagging site taking a

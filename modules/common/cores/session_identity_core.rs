@@ -3,7 +3,7 @@
 //
 // Written to be `include!`d by the PIC modules (`protocol` as the
 // anchor, `session_processor` as the worker) and by the host test bed
-// under `tools/core_tests`, so the rule below has ONE definition and a
+// under `tests/harness`, so the rule below has ONE definition and a
 // test that fails if the two identities can drift.
 //
 // ── Two counters, two names ──────────────────────────────────────────

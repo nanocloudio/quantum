@@ -77,7 +77,7 @@ rule:
    after an import is the rebind.
 
 The `Binding` in the core carries no generation field at all, so there
-is nothing a rebind could bump by mistake; `tools/core_tests` holds the
+is nothing a rebind could bump by mistake; `tests/harness` holds the
 rule.
 
 ## The seam
@@ -196,7 +196,7 @@ or PUBREL is still in Raft is not, and the drain waits for it.
 ## Exact replay
 
 Source: `modules/common/cores/session_replay_core.rs`, gated by
-`tools/core_tests/src/session_replay_tests.rs`.
+`tests/harness/src/session_replay_tests.rs`.
 
 **The cursor.** Both workers consume the same committed stream, but
 while the session is the exporter's the importer skips its entries. So
@@ -403,10 +403,10 @@ not the server.
 
 ## Gates
 
-- `tools/core_tests/src/session_identity_tests.rs` — the identity rule:
+- `tests/harness/src/session_identity_tests.rs` — the identity rule:
   fails if a rebind could move the generation, a CONNECT could move the
   epoch, or a stale epoch could be resumed.
-- `tools/core_tests/src/session_replay_tests.rs` — exact replay: the
+- `tests/harness/src/session_replay_tests.rs` — exact replay: the
   tail round-trips; a record behind an entry the importer skipped is a
   cursor mismatch; an importer behind the record replays from the
   record's cursor and no earlier; the log rebuilds exactly the owed
@@ -454,7 +454,7 @@ The co-located protocol evidence: the end-to-end script runs on its own
   once; five produces in flight across a swap answered once each, in
   order, and in the log once each. The broker's `[sess] kq w=N` lines
   witness which worker served what.
-- `tools/flow_tests/tests/co_located_workers.rs` — the ids each worker
+- `tests/harness/mods/app_modules/tests/co_located_workers.rs` — the ids each worker
   matches by (slot epochs, correlation namespaces, the produce origin),
   coordinator answers outside the session's holds and slots, and source
   guards on apply ownership and counted responses.

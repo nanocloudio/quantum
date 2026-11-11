@@ -14,9 +14,9 @@
     reason = "shared dial helper; each connector uses one protocol port and a subset of the surface"
 )]
 
-// The single mount of the SDK contract for this file. A connector that
-// needs the contract's opcodes reaches them through its own `abi`
-// mount; nothing of this module's `net_proto` crosses the boundary.
+// The net contract, from the SDK its parent mounts as `abi`: the
+// contract names the message registry through the SDK's own tree, so it
+// is not mounted on its own here.
 pub use super::abi::contracts::net::net_proto;
 
 use net_proto::{write_connect_to, RequesterTag, Target, SOCK_TYPE_STREAM};

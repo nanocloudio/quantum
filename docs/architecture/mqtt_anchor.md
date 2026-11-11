@@ -4,7 +4,7 @@ Source: `modules/app/quantum_mqtt_anchor/` (the module and the anchor
 role, `anchor.rs`), `modules/common/cores/mqtt_anchor_core.rs` (every
 decision that needs no syscall), `modules/app/protocol/mqtt.rs` (the
 MQTT codec, mounted), `modules/app/session_processor/worker.rs` (the
-worker's half of the seam), `tools/core_tests/src/mqtt_anchor_tests.rs`
+worker's half of the seam), `tests/harness/src/mqtt_anchor_tests.rs`
 (the gates on the core).
 
 The anchor is the client-facing half of an `edge_anchored` MQTT session.
@@ -273,7 +273,7 @@ gate only, `fault_stop_on_ping` on `session_processor`.
 
 ## Gates
 
-- `tools/core_tests/src/mqtt_anchor_tests.rs`: the delivery envelope
+- `tests/harness/src/mqtt_anchor_tests.rs`: the delivery envelope
   round-trips and is never truncated; the worker accepts new work at the
   bound epoch and refuses old epochs, future epochs, retried ids and
   foreign sessions; delivery and production ids are stable until
