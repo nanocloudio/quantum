@@ -11,7 +11,7 @@
 
 use super::abi::SyscallTable;
 use super::sha256;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::{dev_millis, wire};
 
 /// HMAC-SHA256 per RFC 2104.
 /// Key is padded/hashed to 64 bytes, then:

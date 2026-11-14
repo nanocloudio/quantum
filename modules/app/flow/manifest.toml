@@ -21,8 +21,6 @@ hardware_targets = ["bcm2712", "linux"]
 # session inputs — `ack_out` on the ack input, `flow_out` on the flow
 # input.
 
-permissions = []
-
 # ── inputs ───────────────────────────────────────────────────
 
 # Session outbound bus. Frame types served:

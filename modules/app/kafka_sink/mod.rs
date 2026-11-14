@@ -30,12 +30,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // The exchange contract, through the provider core's own mount of it.
 #[path = "../../common/publish_exchange.rs"]
@@ -180,7 +178,7 @@ mod params_def {
     use super::MAX_TOPIC_LEN;
     use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         SinkState;
 
         // Tags 1 and 2 are retired.
@@ -754,11 +752,7 @@ unsafe fn enter_reconnect(s: &mut SinkState) {
 
 // ── PIC module ABI ───────────────────────────────────────────────────
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<SinkState>() as u32
-}
+fluxor_rt::module_facts! { state: SinkState }
 
 /// # Safety
 /// `syscalls` is a kernel-owned table valid for the process lifetime.
@@ -839,14 +833,14 @@ pub unsafe extern "C" fn module_new(
 /// borrowed for the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut SinkState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let sys_ptr = s.syscalls;
         let sys = &*sys_ptr;
@@ -867,7 +861,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.net_out_chan < 0 {
                         log_err(s, b"[kafkasink] no net_out");
                         s.phase = Phase::Error;
-                        return -1;
+                        return StepReturn::error(-1);
                     }
                     let mut payload = [0u8; CONNECT_TO_MAX];
                     let n = s
@@ -876,7 +870,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if n == 0 {
                         log_err(s, b"[kafkasink] authority does not fit a connect record");
                         s.phase = Phase::Error;
-                        return -1;
+                        return StepReturn::error(-1);
                     }
                     let wrote = net_write_frame(
                         sys,
@@ -888,15 +882,15 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         NET_BUF_SIZE,
                     );
                     if wrote == 0 {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.state_start_ms = dev_millis(sys);
                     s.phase = Phase::WaitConnect;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 Phase::WaitConnect => {
                     if s.net_in_chan < 0 {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
                     if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
@@ -919,7 +913,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             let (_id, _errno, tag) = error_parts(pl);
                             if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
                                 enter_reconnect(s);
-                                return 0;
+                                return StepReturn::Continue;
                             }
                         }
                     }
@@ -927,7 +921,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_err(s, b"[kafkasink] connect timeout");
                         enter_reconnect(s);
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 Phase::Metadata => {
                     // Register the topic (auto-create by mention) and
@@ -938,7 +932,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         || bput_str(&mut body, &mut p, &s.topic[..s.topic_len as usize]).is_none()
                     {
                         s.phase = Phase::Error;
-                        return -1;
+                        return StepReturn::error(-1);
                     }
                     s.kcorr = s.kcorr.wrapping_add(1);
                     if s.kcorr <= 0 {
@@ -955,19 +949,19 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         &mut req,
                     ) else {
                         s.phase = Phase::Error;
-                        return -1;
+                        return StepReturn::error(-1);
                     };
                     s.tx_buf[..rlen].copy_from_slice(&req[..rlen]);
                     if !start_send(s, rlen) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     s.state_start_ms = dev_millis(sys);
                     s.phase = Phase::WaitMetadata;
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 Phase::WaitMetadata => {
                     if !flush_tx(s) {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     handle_rx(s);
                     if s.phase == Phase::WaitMetadata
@@ -976,31 +970,31 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_err(s, b"[kafkasink] metadata timeout");
                         enter_reconnect(s);
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 Phase::Running => {
                     handle_rx(s);
                     if s.phase != Phase::Running {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     let _ = flush_tx(s);
                     handle_requests(s);
                     flush_answers(s);
                     if s.phase != Phase::Running {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     sweep_stale(s);
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 Phase::Reconnect => {
                     if dev_millis(sys) >= s.reconnect_at_ms {
                         s.phase = Phase::Connecting;
                         continue;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
                 Phase::Error => {
-                    return -1;
+                    return StepReturn::error(-1);
                 }
             }
         }

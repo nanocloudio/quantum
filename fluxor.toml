@@ -14,9 +14,9 @@ version = "0.0.1"
 # `durability`, `gateway`, …) consumed by quantum's deployment
 # graphs. Both resolve from the local OCI store (`$FLUXOR_STORE`,
 # default `~/.local/share/fluxor/store`), digest-pinned in
-# fluxor.lock; PIC modules in `modules/app/*/mod.rs` consume
-# the materialised SDK source at
-# `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
+# fluxor.lock; PIC modules in `modules/app/*/mod.rs` link the SDK
+# crates `fluxor sync` stages under `target/fluxor/` (`fluxor-abi`,
+# `fluxor-rt`, `fluxor-sdk`).
 # Live workspace mode (`~/.fluxor/workspace.toml`) resolves listed
 # members to their most recently published artefacts (`:latest`),
 # written through fluxor.lock.
@@ -51,17 +51,15 @@ max_inline_lines    = 80
 
 # Per-file exemptions live as [[ci.hygiene.exemption]] tables. None today.
 
-# Crate-root `#![allow(dead_code, unused_imports)]` on the PIC modules.
+# Crate-root `#![allow(dead_code)]` on the PIC modules.
 #
-# The cause is not in these files: the build `include!`s and `#[path]`-mounts
-# the fluxor SDK wholesale, so every module's compile sees the entire ABI
-# surface — provider, telemetry, device_access, net, storage, fmp — and a
-# given module calls a handful of it. The unused items are in
-# `target/fluxor/fluxor-abi/sdk/**`, which this project does not own and has
-# no item to attach an attribute to.
+# A module mounts the shared cores under modules/common/ whole and uses a
+# subset of each; the `[[variant]]` features likewise compile different
+# subsets of one source. That is a property of how a module is built, not
+# of any one module.
 [[ci.hygiene.allow_crate_root]]
 prefix = "modules/app/"
-reason = """PIC modules mount the fluxor SDK wholesale via include!/#[path], so each compile sees the entire ABI surface and uses a subset; the unused items live in target/fluxor/fluxor-abi/sdk/**, not here."""
+reason = """A PIC module mounts the shared cores under modules/common/ whole and uses a subset of each, and its variants compile different subsets of one source."""
 
 # The same shape one layer in: `wire.rs`, `types.rs` and `authority.rs` are
 # single definitions `#[path]`-mounted into every consumer, and each consumer

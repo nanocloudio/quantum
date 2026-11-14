@@ -11,7 +11,7 @@
 //! table owns the inbound record budget.
 
 use super::abi::SyscallTable;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::{dev_log, dev_millis, wire};
 
 /// MQTT 5 property identifier: Maximum Packet Size (four-byte integer).
 const PROP_MAXIMUM_PACKET_SIZE: u8 = 0x27;

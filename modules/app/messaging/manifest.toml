@@ -20,8 +20,6 @@ hardware_targets = ["bcm2712", "linux"]
 # module's dispatch table owns the demux and the per-component per-step
 # budgets.
 
-permissions = []
-
 # ── inputs ───────────────────────────────────────────────────
 
 # Operation bus from the session state machine. Frame types served:

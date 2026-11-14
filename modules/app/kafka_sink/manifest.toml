@@ -1,11 +1,11 @@
 version          = "0.1.0"
-type             = "Protocol"
+type             = "Transformer"
 timer_class      = "wall_clock"
 entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # kafka_sink — Kafka PRODUCER, a PROVIDER of the exchange contract
-# (`target/fluxor/fluxor-abi/sdk/contracts/exchange.rs`). Sibling of
+# (`fluxor_abi::contracts::exchange`). Sibling of
 # mqtt_sink/amqp_sink; any graph that publishes durably composes it by
 # deployment pin.
 #

@@ -65,24 +65,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other quantum modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -146,11 +140,7 @@ struct ModuleState {
     buf: [u8; READ_BUF],
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -181,9 +171,9 @@ pub unsafe extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes, and a `syscalls` table whose function
+    // `MODULE_STATE_BYTES` bytes, and a `syscalls` table whose function
     // pointers reach live kernel routines. The dereferences and syscall
     // invocations below rely on those guarantees.
     unsafe {
@@ -260,10 +250,10 @@ unsafe fn emit_metrics(sys: &SyscallTable, chan: i32, metric_id: u8, payload: &[
 /// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes, and a `syscalls` table whose function
+    // `MODULE_STATE_BYTES` bytes, and a `syscalls` table whose function
     // pointers reach live kernel routines. The dereferences and syscall
     // invocations below rely on those guarantees.
     unsafe {
@@ -398,9 +388,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if worked > 0 {
-            STEP_BURST
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }

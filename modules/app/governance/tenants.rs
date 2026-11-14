@@ -10,7 +10,7 @@
 //! sweeps the tenant table at most once per tick.
 
 use super::abi::SyscallTable;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::{dev_millis, wire};
 
 const MAX_TENANTS: usize = 256;
 

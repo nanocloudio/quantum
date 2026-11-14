@@ -18,24 +18,18 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK + shared cores are include!'d wholesale; each module consumes only a subset"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other quantum modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "shared SDK surface across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // Shared, host-tested cores — identical source to the `chronicle-bytecode` crate.
 // `resp_core` supplies `itoa`, used by `nats_pub`.
@@ -132,7 +126,7 @@ struct NatsState {
     errors: u32,
 }
 
-define_params! {
+fluxor_rt::define_params! {
     NatsState;
 
     // Tag 1 is retired.
@@ -162,11 +156,7 @@ define_params! {
     };
 }
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<NatsState>() as u32
-}
+fluxor_rt::module_facts! { state: NatsState }
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -359,7 +349,7 @@ unsafe fn feed(
 /// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut NatsState);
         let sys = &*s.syscalls;
@@ -526,9 +516,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                 );
                 s.conn_id = 0;
             }
-            return 1;
+            return StepReturn::Done;
         }
-        0
+        StepReturn::Continue
     }
 }
 

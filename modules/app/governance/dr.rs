@@ -11,7 +11,7 @@
 //! and at most one promotion transition per tick.
 
 use super::abi::SyscallTable;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::{dev_millis, wire};
 
 const STATE_IDLE: u8 = 0;
 const STATE_CHECKPOINT_EXPORTING: u8 = 1;

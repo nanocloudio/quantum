@@ -53,29 +53,23 @@
 
 #![no_std]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other quantum modules and the \
+              host harness"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/wire.rs"]
 mod wire;
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // This node's replica id, stamped into every proposal this node
@@ -779,7 +773,7 @@ struct ModuleState {
     in_assigned: i32,
     out_proposals: i32,
     /// This node's replica id (param 1). Stamped into proposals this
-    /// node originates; see the `define_params!` block.
+    /// node originates; see the `fluxor_rt::define_params!` block.
     self_id: u8,
     /// Kafka time-retention window; 0 disables it.
     kafka_retention_ms: u32,
@@ -1177,11 +1171,7 @@ struct ModuleState {
 
 impl ModuleState {}
 
-#[no_mangle]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -1923,7 +1913,7 @@ pub(crate) unsafe fn seat_step(s: &mut ModuleState, sys: &SyscallTable) {
 ///
 /// # Safety
 /// `sys` must be the live kernel syscall table.
-unsafe fn fault_drain(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
+unsafe fn fault_drain(s: &mut ModuleState, sys: &SyscallTable) -> StepReturn {
     #[cfg(feature = "kafka")]
     let wal_reply = s.in_wal_reply;
     #[cfg(not(feature = "kafka"))]
@@ -1958,9 +1948,9 @@ unsafe fn fault_drain(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
         }
     }
     if worked > 0 {
-        STEP_BURST
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 
@@ -7699,7 +7689,7 @@ unsafe fn apply_qop_publish(
 /// exclusively borrowed for the duration of the call.
 #[no_mangle]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
@@ -11255,9 +11245,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         if worked > 0 {
-            STEP_BURST
+            StepReturn::Burst
         } else {
-            0
+            StepReturn::Continue
         }
     }
 }

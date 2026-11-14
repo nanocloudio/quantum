@@ -9,7 +9,7 @@
 //! `RX_QUOTA` records off `in_raw` and `RESP_QUOTA` off `in_responses`.
 
 use super::abi::SyscallTable;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::wire;
 
 const FRAME_METHOD: u8 = 1;
 const FRAME_HEADER: u8 = 2;

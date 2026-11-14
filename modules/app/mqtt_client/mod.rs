@@ -46,12 +46,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 // ============================================================================
 // Constants
@@ -123,7 +121,7 @@ mod params_def {
     use super::MAX_TOPIC_LEN;
     use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         MqttState;
 
         // Tags 1 and 2 are retired.
@@ -932,11 +930,7 @@ unsafe fn enter_reconnect(s: &mut MqttState) {
 // Exported PIC Module Interface
 // ============================================================================
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<MqttState>() as u32
-}
+fluxor_rt::module_facts! { state: MqttState }
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -1038,14 +1032,14 @@ pub unsafe extern "C" fn module_new(
 /// exclusively borrowed for the duration of the call.
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut MqttState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         // Copy pointer to avoid borrow issues
         let sys_ptr = s.syscalls;
@@ -1067,7 +1061,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.net_out_chan < 0 {
                         log_err(s, b"[mqtt] no net_out");
                         s.phase = MqttPhase::Error;
-                        return -1;
+                        return StepReturn::error(-1);
                     }
                     // The record carries the authority; our tag (the module
                     // index) lets us claim only our own MSG_CONNECTED on an
@@ -1079,7 +1073,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if n == 0 {
                         log_err(s, b"[mqtt] authority does not fit a connect record");
                         s.phase = MqttPhase::Error;
-                        return -1;
+                        return StepReturn::error(-1);
                     }
                     let wrote = net_write_frame(
                         sys,
@@ -1091,16 +1085,16 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         NET_BUF_SIZE,
                     );
                     if wrote == 0 {
-                        return 0;
+                        return StepReturn::Continue;
                     } // channel full, retry next tick
                     s.state_start_ms = dev_millis(sys);
                     s.phase = MqttPhase::WaitConnect;
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::WaitConnect => {
                     if s.net_in_chan < 0 {
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     let poll = (sys.channel_poll)(s.net_in_chan, POLL_IN);
                     if poll > 0 && ((poll as u32) & POLL_IN) != 0 {
@@ -1116,7 +1110,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                             // the tag sits after the two-byte connection id.
                             let (id, tag) = connected_parts(pl);
                             if tag != REQUESTER_TAG_NONE && tag != dev_requester_tag(sys) {
-                                return 0; // another consumer's connection.
+                                return StepReturn::Continue; // another consumer's connection.
                             }
                             s.conn_id = id;
                             s.conn_present = 1;
@@ -1132,7 +1126,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                                 log_err(s, b"[mqtt] connect rejected");
                                 enter_reconnect(s);
                             }
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         // A MSG_CLOSED here is NOT ours: we have no conn_id yet
                         // (still awaiting MSG_CONNECTED), so any close on the
@@ -1144,7 +1138,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_err(s, b"[mqtt] connect timeout");
                         enter_reconnect(s);
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::MqttConnect => {
@@ -1153,7 +1147,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.state_start_ms = dev_millis(sys);
                     s.rx_have = 0;
                     s.phase = MqttPhase::WaitConnack;
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::WaitConnack => {
@@ -1161,7 +1155,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.tx_sent < s.tx_len {
                         flush_tx(s);
                         if s.tx_sent < s.tx_len {
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
 
@@ -1175,7 +1169,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_err(s, b"[mqtt] connack timeout");
                         enter_reconnect(s);
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::Subscribe => {
@@ -1192,7 +1186,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     start_send(s, len);
                     s.state_start_ms = dev_millis(sys);
                     s.phase = MqttPhase::WaitSuback;
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::WaitSuback => {
@@ -1200,7 +1194,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                     if s.tx_sent < s.tx_len {
                         flush_tx(s);
                         if s.tx_sent < s.tx_len {
-                            return 0;
+                            return StepReturn::Continue;
                         }
                     }
 
@@ -1214,32 +1208,32 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         log_err(s, b"[mqtt] suback timeout");
                         enter_reconnect(s);
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::Running => {
                     // 1. Keepalive
                     handle_keepalive(s);
                     if s.phase != MqttPhase::Running {
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
                     // 2. RX from broker
                     handle_rx(s);
                     if s.phase != MqttPhase::Running {
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
                     // 3. TX from channel (app -> publish)
                     handle_tx_from_channel(s);
                     if s.phase != MqttPhase::Running {
-                        return 0;
+                        return StepReturn::Continue;
                     }
 
                     // 4. Net health (MSG_CLOSED/MSG_ERROR handled in handle_rx)
                     check_net_health(s);
 
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::Reconnect => {
@@ -1250,7 +1244,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.phase = MqttPhase::Connecting;
                         continue;
                     }
-                    return 0;
+                    return StepReturn::Continue;
                 }
 
                 MqttPhase::Error => {
@@ -1267,7 +1261,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
                         );
                         s.conn_id = 0;
                     }
-                    return -1;
+                    return StepReturn::error(-1);
                 }
             }
         }
@@ -1277,4 +1271,4 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
 // Wasm entry-point wrappers — no-op on non-wasm targets. See
 // `modules/sdk/runtime/wasm_entry.rs` for the wasm32 module_init_wasm /
 // module_step_wasm definitions.
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

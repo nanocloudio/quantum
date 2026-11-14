@@ -279,7 +279,7 @@ pub struct Worker {
     pub consumed_reports: u32,
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/cores/session_handoff.rs");
+use fluxor_sdk::cores::session_handoff::*;
 pub mod anchor_core {
     include!("../../common/cores/mqtt_anchor_core.rs");
     include!("../../common/cores/anchor_continuity_core.rs");

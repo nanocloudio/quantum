@@ -18,8 +18,6 @@ hardware_targets = ["bcm2712", "linux"]
 # pure `mqtt_anchor_core`. A graph that serves MQTT alone uses this
 # module instead of `protocol`.
 
-permissions = []
-
 # Transport-anchor role: owns the client-visible attachment and moves the
 # session worker behind it. Consumed by the `continuity` validator.
 capabilities = ["transport.anchor.stream"]

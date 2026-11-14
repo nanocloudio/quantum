@@ -35,11 +35,10 @@
     reason = "shared provider; each connector uses the subset its broker's acknowledgement shape needs"
 )]
 
-// The single mount of the SDK contract for this file. A connector reaches
-// the contract through this mount (`publish_exchange::exchange`) so the
-// types it hands back here are the same types.
-#[path = "../../target/fluxor/fluxor-abi/sdk/contracts/exchange.rs"]
-pub mod exchange;
+// The exchange contract, re-exported: a connector reaches it through this
+// file (`publish_exchange::exchange`) so the types it hands back here are
+// the same types.
+pub use fluxor_abi::contracts::exchange;
 
 use exchange::{
     flag, link, parse_request, status, write_credit, write_link, write_response, Collector,

@@ -103,7 +103,7 @@ use super::{dev_log, SyscallTable};
 
 include!("../../common/cores/mqtt_anchor_core.rs");
 include!("../../common/cores/anchor_continuity_core.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/cores/session_handoff.rs");
+use fluxor_sdk::cores::session_handoff::*;
 mod identity {
     include!("../../common/cores/session_identity_core.rs");
 }

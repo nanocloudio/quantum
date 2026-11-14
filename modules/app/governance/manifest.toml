@@ -22,8 +22,6 @@ hardware_targets = ["bcm2712", "linux"]
 # bus here, so no demux is needed and no component can consume another's
 # records.
 
-permissions = []
-
 # ── inputs ───────────────────────────────────────────────────
 
 # Metric samples from every other module. Dimensional envelopes

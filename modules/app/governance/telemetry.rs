@@ -10,7 +10,7 @@
 //! rollup per `rollup_interval_ms`.
 
 use super::abi::SyscallTable;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::{dev_millis, wire};
 
 const MAX_KEYS: usize = 4096;
 

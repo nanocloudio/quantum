@@ -29,12 +29,10 @@
 
 use core::ffi::c_void;
 
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -194,7 +192,7 @@ mod params_def {
     use super::SCHEMA_MAX;
     use super::{CLIENT_ID_MAX, TOPIC_MAX};
 
-    define_params! {
+    fluxor_rt::define_params! {
         FrontState;
 
         // The topic every publish lands on, as mqtt_sink's `topic`: the
@@ -635,11 +633,7 @@ unsafe fn read_session(s: &mut FrontState, now: u64) {
 
 // ── PIC module ABI ───────────────────────────────────────────────────
 
-#[unsafe(no_mangle)]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<FrontState>() as u32
-}
+fluxor_rt::module_facts! { state: FrontState }
 
 /// # Safety
 /// `syscalls` is a kernel-owned table valid for the process lifetime.
@@ -746,14 +740,14 @@ pub unsafe extern "C" fn module_new(
 /// borrowed for the call.
 #[unsafe(no_mangle)]
 #[link_section = ".text.module_step"]
-pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
+pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let s = &mut *(state as *mut FrontState);
         if s.syscalls.is_null() {
-            return -1;
+            return StepReturn::error(-1);
         }
         let now = dev_millis(sys(s));
 
@@ -782,6 +776,6 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> i32 {
         flush_publish_answers(s);
         flush_subscription_records(s);
         tx_flush(s);
-        0
+        StepReturn::Continue
     }
 }

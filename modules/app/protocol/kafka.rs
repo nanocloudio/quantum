@@ -29,7 +29,7 @@
 
 use super::abi::SyscallTable;
 use super::kafka_order as order;
-use super::{dev_channel_port, dev_log, dev_millis, wire};
+use super::{dev_log, dev_millis, wire};
 
 /// Per-connection reassembly capacity. Bounds the largest single Kafka
 /// request we accept; a request whose `size` field exceeds this closes
