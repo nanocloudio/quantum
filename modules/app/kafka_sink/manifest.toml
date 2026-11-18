@@ -9,21 +9,21 @@ hardware_targets = ["bcm2712"]
 # mqtt_sink/amqp_sink; any graph that publishes durably composes it by
 # deployment pin.
 #
-# Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX),
+# Request: op PUBLISH, verb 0; `target` = the ordering key (up to KEY_MAX),
 # produced as the Kafka record key; body = the record, produced as the
 # record value byte for byte to the configured `topic`; flags MORE and
-# BROADCAST only. Anything else is answered 400.
+# BROADCAST only. Anything else is answered REFUSED.
 #
-# Answer: 200 with an empty body once the ProduceResponse reports every
-# named partition durable; 413 for a record past the bounds or one the
-# broker reports MESSAGE_TOO_LARGE; 502 for any other partition error;
-# 503 when every collecting slot is taken. Losing the broker connection
+# Answer: OK with an empty body once the ProduceResponse reports every
+# named partition durable; TOO_LARGE for a record past the bounds or one the
+# broker reports MESSAGE_TOO_LARGE; UNAVAILABLE for any other partition error;
+# BUSY when every collecting slot is taken. Losing the broker connection
 # (or a produce unanswered for 15 s) writes LINK DOWN; the next Metadata
 # round trip writes LINK UP, and the requester re-issues every exchange
 # it held open.
 #
 # Delivery terms (`stream.ordered_ack`):
-#   ack       — 200 is durable acceptance: Produce with acks=-1; this
+#   ack       — OK is durable acceptance: Produce with acks=-1; this
 #               broker emits the ProduceResponse only after quorum
 #               durability of every partition in the request.
 #   ordering  — per key: the ordering key selects the partition
@@ -38,7 +38,7 @@ hardware_targets = ["bcm2712"]
 #               acks it only after the SLOWEST partition is durable,
 #               which is exactly the contract's broadcast answer. A
 #               broadcast whose batches do not fit one Produce request
-#               (about 12 KiB) is refused with 413.
+#               (about 12 KiB) is answered TOO_LARGE.
 #
 # This is the partitioned-backend validation vehicle: unlike MQTT/AMQP
 # (single ordering unit), Kafka genuinely exercises the ordering-key
@@ -60,7 +60,7 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 16384
-max_record = 1600
+accepts_record = 1600
 
 [[ports]]
 name = "net_out"

@@ -87,6 +87,10 @@ content_type = "NetProto"
 # Transaction-class edges: one record per committed entry or
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
+# Any envelope a channel carries (`abi::CHANNEL_BUFFER_SIZE`, the module
+# states it too), on a ring that holds one with its length prefix.
+max_record = 8192
+buffer_size = 16384
 
 # Component-tagged samples under the dimensional metric envelope
 # `[dim_flag=1][tenant:u32][protocol:u8][prg:u16][metric_id][payload]`,

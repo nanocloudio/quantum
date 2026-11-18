@@ -12,22 +12,24 @@ hardware_targets = ["bcm2712", "linux"]
 #
 # PUBLISH front (`publish_in` / `publish_out`) — the conventions of
 # `mqtt_sink`, exactly, so a graph swaps one for the other by wiring alone.
-#   Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
-#   body = the record, published as the MQTT payload byte for byte on the
-#   configured `topic`; flags MORE and BROADCAST only. Anything else is
-#   answered 400.
-#   Answer: 200 with an empty body once the broker acknowledges the QoS 1
-#   publish, which quantum gates on Clustor durability; 413 for a record
-#   past the bounds, 503 when every collecting slot is taken. Losing the
+#   Request: op PUBLISH, verb 0; `target` = the ordering key (up to
+#   KEY_MAX); body = the record, published as the MQTT payload byte for byte
+#   on the configured `topic`; flags MORE and BROADCAST only. Anything else
+#   is answered REFUSED.
+#   Answer: outcome OK with an empty body once the broker acknowledges the
+#   QoS 1 publish, which quantum gates on Clustor durability; TOO_LARGE for
+#   a record past the bounds, BUSY when every collecting slot is taken. Losing the
 #   broker session (an acknowledgement overdue past `ack_timeout_ms`, or the
 #   broker ending it) writes LINK DOWN; the next CONNACK writes LINK UP, and
 #   the requester re-issues every exchange it held open.
 #
-# SUBSCRIPTION front (`subscribe_in` / `subscribe_out`) — held exchanges.
-#   Request: GET, no flags; `target` = an MQTT topic filter; optional header
-#   `session: <name>` names a durable session to create or resume.
+# SUBSCRIPTION front (`subscribe_in` / `subscribe_out`) — held exchanges,
+# HTTP-bound (detail = the HTTP status).
+#   Request: CALL with verb GET, no flags; `target` = an MQTT topic filter;
+#   optional meta `session: <name>` names a durable session to create or
+#   resume.
 #   Answer: once the broker has taken the subscription, a HEAD 200 flagged
-#   HOLD|MORE (content type `application/vnd.quantum.message`; a durable
+#   HOLD|MORE (meta `content-type: application/vnd.quantum.message`; a durable
 #   subscription adds `session-present: 0|1`), then one BODY per message,
 #   `[topic_len u16 BE][topic][payload_len u32 BE][payload]`, never past
 #   the response credit.
@@ -41,7 +43,7 @@ hardware_targets = ["bcm2712", "linux"]
 #   BODY carries.
 #
 # Delivery terms of the publish front (`stream.ordered_ack`), as mqtt_sink's:
-#   ack       — 200 is durable acceptance: the QoS 1 acknowledgement, gated
+#   ack       — OK is durable acceptance: the QoS 1 acknowledgement, gated
 #               on Clustor durability proofs.
 #   ordering  — one broker session, one topic, publishes written in request
 #               order: request order IS broker order.
@@ -106,6 +108,9 @@ direction = "input"
 content_type = "ExchangeRequest"
 buffer_size = 8192
 max_record = 8192
+# A subscription is an HTTP GET: the front speaks the http binding's verbs.
+[ports.facts]
+binding = ["http"]
 
 [[ports]]
 name = "subscribe_out"

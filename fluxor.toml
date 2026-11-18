@@ -33,7 +33,7 @@ wave    = "0.0.1"
 # Module targets `fluxor modules build --all` will produce artefacts for.
 # Silicon tokens only — the board (pi5) and packaging distinctions live at
 # the rig/board level (`.fluxor-rig.toml`), not in the module matrix.
-targets = ["bcm2712"]
+targets = ["bcm2712", "rp2350"]
 
 [ci.lints]
 # No exemptions: with no root workspace there is no `[lints] workspace =

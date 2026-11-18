@@ -11,7 +11,7 @@
 // Running: read `request_in` while the in-flight window has room, one
 // serialized MQTT PUBLISH per collected PUBLISH exchange, its body the
 // payload byte for byte (the packet id maps to the exchange in the
-// window); PUBACK answers 200 with an empty body on `response_out`.
+// window); PUBACK answers OK with an empty body on `response_out`.
 // A connection lost after CONNACK writes LINK DOWN and clears the
 // window — those exchanges are exactly the set the requester re-issues
 // after the LINK UP that the next CONNACK writes. The exchange
@@ -19,18 +19,18 @@
 //
 // Size is the connected broker's to bound, not this module's: the
 // largest packet is what the broker's MQTT 5 CONNACK advertises
-// (Maximum Packet Size), and a publish past it is answered 413 before
+// (Maximum Packet Size), and a publish past it is answered TOO_LARGE before
 // it is sent. A broker that advertises none is sent records up to the
 // contract's `PAYLOAD_MAX`, and one it then will not take is found by
 // what the broker does with it:
 //
 //   - MQTT 5 DISCONNECT with Packet too large (0x95): the largest
-//     publish awaiting PUBACK is answered 413.
+//     publish awaiting PUBACK is answered TOO_LARGE.
 //   - The connection closed with publishes awaiting PUBACK (all MQTT
 //     3.1.1 offers): the largest of them, if no publish as large was
 //     PUBACKed on the connection, is the suspect. The close is a LINK
 //     DOWN like any other, and the requester re-issues it; if the
-//     connection closes on that same record again, it is answered 413.
+//     connection closes on that same record again, it is answered TOO_LARGE.
 //     One close is not proof (a broker restarts), two on one record are.
 //
 // Every other publish awaiting PUBACK is invalidated by the LINK DOWN
@@ -53,7 +53,7 @@ use fluxor_rt::*;
 // The exchange contract, through the provider core's own mount of it.
 #[path = "../../common/publish_exchange.rs"]
 mod publish_exchange;
-use publish_exchange::exchange::{status, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::exchange::{outcome, PAYLOAD_MAX, RECORD_MAX};
 use publish_exchange::PublishProvider;
 
 // ── Net protocol (same vocabulary as mqtt_client) ────────────────────
@@ -69,7 +69,7 @@ const NET_CMD_CLOSE: u8 = 0x12;
 // provider resolves a name.
 use abi::contracts::net::net_proto::{
     connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    CONN_ID_LEN, REQUESTER_TAG_NONE,
+    REQUESTER_TAG_NONE,
 };
 
 #[path = "../../common/authority.rs"]
@@ -202,7 +202,7 @@ struct SinkState {
     /// The largest PUBLISH the broker PUBACKed on this connection.
     acked_max: u32,
     /// The publish a close followed, not yet PUBACKed (`suspect_len` 0 =
-    /// none): if the connection closes on its re-issue too, it is 413.
+    /// none): if the connection closes on its re-issue too, it is TOO_LARGE.
     suspect_len: u32,
     suspect_print: u32,
     /// Publishes awaiting PUBACK, by packet id.
@@ -571,7 +571,7 @@ unsafe fn handle_requests(s: &mut SinkState) {
             // Past the Maximum Packet Size the broker advertised: refused
             // here, never sent — the broker would end the connection for
             // it (MQTT 5 §3.1.2.11.4).
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             flush_answers(s);
             continue;
         }
@@ -595,7 +595,7 @@ unsafe fn handle_requests(s: &mut SinkState) {
         );
         if pkt_len == 0 {
             // Past the frame budget: refused, never truncated.
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             flush_answers(s);
             continue;
         }
@@ -665,7 +665,7 @@ unsafe fn process_rx_packet(s: &mut SinkState) -> usize {
                 if let Some(at) = largest_in_flight(s, 0) {
                     let pid = s.sent[at].packet_id;
                     forget_sent(s, pid);
-                    let _ = s.desk.settle(pid as u64, status::TOO_LARGE);
+                    let _ = s.desk.settle(pid as u64, outcome::TOO_LARGE);
                 }
                 enter_reconnect(s);
             } else {
@@ -789,8 +789,8 @@ fn prop_size(id: u8, rest: &[u8]) -> Option<usize> {
 }
 
 /// The broker's verdict on publish `pid`: an MQTT 5 reason below 0x80 is
-/// durable acceptance; Quota exceeded may be repeated (503); any other
-/// failure is the broker refusing it (502).
+/// durable acceptance; Quota exceeded may be repeated (BUSY); any other
+/// failure is the broker refusing it (UNAVAILABLE).
 unsafe fn on_puback(s: &mut SinkState, pid: u16, reason: u8) {
     if let Some(e) = s.sent.iter().find(|e| e.packet_id == pid && pid != 0) {
         if reason < 0x80 {
@@ -804,9 +804,9 @@ unsafe fn on_puback(s: &mut SinkState, pid: u16, reason: u8) {
     }
     forget_sent(s, pid);
     let answer = match reason {
-        0x00..=0x7F => status::OK,
-        RC_QUOTA_EXCEEDED => status::BUSY,
-        _ => status::BAD_GATEWAY,
+        0x00..=0x7F => outcome::OK,
+        RC_QUOTA_EXCEEDED => outcome::BUSY,
+        _ => outcome::UNAVAILABLE,
     };
     let _ = s.desk.settle(pid as u64, answer);
 }
@@ -835,7 +835,7 @@ fn forget_sent(s: &mut SinkState, pid: u16) {
 /// a close, or an MQTT 5 DISCONNECT for anything but size. The largest
 /// publish awaiting PUBACK that is larger than any the broker PUBACKed on
 /// the connection is the suspect. The second close on the same record is
-/// taken as the broker refusing it, and it is answered 413; the first is
+/// taken as the broker refusing it, and it is answered TOO_LARGE; the first is
 /// a LINK DOWN like any other, which the requester re-issues it after.
 unsafe fn broker_closed(s: &mut SinkState) {
     if let Some(at) = largest_in_flight(s, s.acked_max) {
@@ -843,11 +843,11 @@ unsafe fn broker_closed(s: &mut SinkState) {
         if s.suspect_len != 0 && e.packet_len == s.suspect_len && e.print == s.suspect_print {
             log_err(
                 s,
-                b"[mqttsink] broker closed on the same publish twice: 413",
+                b"[mqttsink] broker closed on the same publish twice: TOO_LARGE",
             );
             s.suspect_len = 0;
             forget_sent(s, e.packet_id);
-            let _ = s.desk.settle(e.packet_id as u64, status::TOO_LARGE);
+            let _ = s.desk.settle(e.packet_id as u64, outcome::TOO_LARGE);
         } else {
             s.suspect_len = e.packet_len;
             s.suspect_print = e.print;
@@ -985,7 +985,10 @@ unsafe fn enter_reconnect(s: &mut SinkState) {
 
 // ── PIC module ABI ───────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: SinkState }
+fluxor_rt::module_facts! {
+    state: SinkState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_BUF_SIZE],
+}
 
 /// # Safety
 /// `syscalls` is a kernel-owned table valid for the process lifetime.
@@ -1100,7 +1103,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     let mut payload = [0u8; CONNECT_TO_MAX];
                     let n = s
                         .authority
-                        .connect_record(&mut payload, Some(dev_requester_tag(sys)));
+                        .connect_record(&mut payload, dev_requester_tag(sys));
                     if n == 0 {
                         log_err(s, b"[mqttsink] authority does not fit a connect record");
                         s.phase = Phase::Error;
@@ -1135,20 +1138,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             nbuf.add(NET_FRAME_HDR) as *const u8,
                             payload_len,
                         );
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
-                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
-                                s.conn_id = id;
+                        if msg_type == NET_MSG_CONNECTED {
+                            if let Some(c) = connected_parts(pl).filter(|c| {
+                                c.requester_tag == dev_requester_tag(sys)
+                                    || c.requester_tag == REQUESTER_TAG_NONE
+                            }) {
+                                s.conn_id = c.conn_id;
                                 s.conn_present = 1;
                                 s.phase = Phase::MqttConnect;
                                 continue;
                             }
-                        } else if msg_type == NET_MSG_ERROR && payload_len > CONN_ID_LEN {
-                            let (_id, _errno, tag) = error_parts(pl);
-                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
-                                enter_reconnect(s);
-                                return StepReturn::Continue;
-                            }
+                        } else if msg_type == NET_MSG_ERROR
+                            && error_parts(pl).is_some_and(|(_, _, tag)| {
+                                tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE
+                            })
+                        {
+                            enter_reconnect(s);
+                            return StepReturn::Continue;
                         }
                     }
                     if dev_millis(sys).wrapping_sub(s.state_start_ms) > CONNECT_TIMEOUT_MS {

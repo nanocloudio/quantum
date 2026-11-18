@@ -38,7 +38,7 @@ use fluxor_rt::*;
 // The exchange contract, through the provider core's own mount of it.
 #[path = "../../common/publish_exchange.rs"]
 mod publish_exchange;
-use publish_exchange::exchange::{status, KEY_MAX, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::exchange::{outcome, KEY_MAX, PAYLOAD_MAX, RECORD_MAX};
 use publish_exchange::PublishProvider;
 
 #[path = "../../common/cores/kafka_core.rs"]
@@ -59,7 +59,7 @@ const NET_CMD_CLOSE: u8 = 0x12;
 // provider resolves a name.
 use abi::contracts::net::net_proto::{
     connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    CONN_ID_LEN, REQUESTER_TAG_NONE,
+    REQUESTER_TAG_NONE,
 };
 
 #[path = "../../common/authority.rs"]
@@ -100,7 +100,7 @@ const OWED_CAP: usize = INFLIGHT_CAP + 3;
 /// One Produce request naming one partition with the largest batch,
 /// plus the request header. A BROADCAST names every partition with the
 /// same batch, so its request grows by a batch per partition; one that
-/// does not fit is refused with 413, never truncated.
+/// does not fit is answered TOO_LARGE, never truncated.
 const TX_BUF_SIZE: usize = MAX_RECORDS_BYTES + 4096;
 const RX_BUF_SIZE: usize = 8192;
 const NET_BUF_SIZE: usize = 1600;
@@ -507,7 +507,7 @@ unsafe fn handle_requests(s: &mut SinkState) {
             &mut body,
         );
         let Some(blen) = produced else {
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             flush_answers(s);
             continue;
         };
@@ -524,7 +524,7 @@ unsafe fn handle_requests(s: &mut SinkState) {
             &body[..blen],
             &mut req,
         ) else {
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             flush_answers(s);
             continue;
         };
@@ -611,13 +611,13 @@ unsafe fn process_responses(s: &mut SinkState) {
         }
 
         // Produce response: the correlation id names the exchange. Every
-        // partition durable is 200; the broker's over-budget refusal is
-        // 413; any other partition error, or a response that does not
-        // parse, means the broker would not take the record: 502.
+        // partition durable is OK; the broker's over-budget refusal is
+        // TOO_LARGE; any other partition error, or a response that does not
+        // parse, means the broker would not take the record: UNAVAILABLE.
         let verdict = match produce_errors(body) {
-            Some(0) => status::OK,
-            Some(ERR_MESSAGE_TOO_LARGE) => status::TOO_LARGE,
-            _ => status::BAD_GATEWAY,
+            Some(0) => outcome::OK,
+            Some(ERR_MESSAGE_TOO_LARGE) => outcome::TOO_LARGE,
+            _ => outcome::UNAVAILABLE,
         };
         if corr > 0 {
             let _ = s.desk.settle(corr as u64, verdict);
@@ -752,7 +752,10 @@ unsafe fn enter_reconnect(s: &mut SinkState) {
 
 // ── PIC module ABI ───────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: SinkState }
+fluxor_rt::module_facts! {
+    state: SinkState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_BUF_SIZE],
+}
 
 /// # Safety
 /// `syscalls` is a kernel-owned table valid for the process lifetime.
@@ -866,7 +869,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     let mut payload = [0u8; CONNECT_TO_MAX];
                     let n = s
                         .authority
-                        .connect_record(&mut payload, Some(dev_requester_tag(sys)));
+                        .connect_record(&mut payload, dev_requester_tag(sys));
                     if n == 0 {
                         log_err(s, b"[kafkasink] authority does not fit a connect record");
                         s.phase = Phase::Error;
@@ -901,20 +904,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             nbuf.add(NET_FRAME_HDR) as *const u8,
                             payload_len,
                         );
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
-                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
-                                s.conn_id = id;
+                        if msg_type == NET_MSG_CONNECTED {
+                            if let Some(c) = connected_parts(pl).filter(|c| {
+                                c.requester_tag == dev_requester_tag(sys)
+                                    || c.requester_tag == REQUESTER_TAG_NONE
+                            }) {
+                                s.conn_id = c.conn_id;
                                 s.conn_present = 1;
                                 s.phase = Phase::Metadata;
                                 continue;
                             }
-                        } else if msg_type == NET_MSG_ERROR && payload_len > CONN_ID_LEN {
-                            let (_id, _errno, tag) = error_parts(pl);
-                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
-                                enter_reconnect(s);
-                                return StepReturn::Continue;
-                            }
+                        } else if msg_type == NET_MSG_ERROR
+                            && error_parts(pl).is_some_and(|(_, _, tag)| {
+                                tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE
+                            })
+                        {
+                            enter_reconnect(s);
+                            return StepReturn::Continue;
                         }
                     }
                     if dev_millis(sys).wrapping_sub(s.state_start_ms) > CONNECT_TIMEOUT_MS {

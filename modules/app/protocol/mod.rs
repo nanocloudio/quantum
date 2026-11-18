@@ -360,7 +360,10 @@ unsafe fn dispatch_response(s: &mut ModuleState, sys: &SyscallTable, n: usize) -
     }
 }
 
-fluxor_rt::module_facts! { state: ModuleState }
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    records: [out 1 FRAMES_OUT_MAX_RECORD = abi::CHANNEL_BUFFER_SIZE],
+}
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.

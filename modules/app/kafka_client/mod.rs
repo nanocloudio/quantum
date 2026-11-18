@@ -18,14 +18,14 @@
 //! Producer mode (`produce_topic` set) skips the group and is a PROVIDER of
 //! the exchange contract: each PUBLISH exchange on `request_in` is produced to
 //! partition 0 of the topic (acks = leader), its body the record value byte for
-//! byte, and answered on `response_out` — 200 with an empty body when the leader
-//! reports no error, 413 for MESSAGE_TOO_LARGE or a value past
-//! [`PRODUCE_VALUE_MAX`], 502 for any other partition error. One produce is in
+//! byte, and answered on `response_out` — OK with an empty body when the leader
+//! reports no error, TOO_LARGE for MESSAGE_TOO_LARGE or a value past
+//! [`PRODUCE_VALUE_MAX`], UNAVAILABLE for any other partition error. One produce is in
 //! flight at a time; a second exchange collected meanwhile waits in the
 //! channel. Losing the connection with the link up writes LINK DOWN, and the
 //! reconnect writes LINK UP. The `target` (ordering key) is not produced: one
 //! partition is one ordering unit, and BROADCAST names the same one. A consumer
-//! answers every request 400 — it has no topic to produce to.
+//! refuses every request (REFUSED) — it has no topic to produce to.
 //!
 //! Ports:  net_in/net_out (transport), request_in/response_out (PUBLISH
 //!         exchanges, producer mode), status_out (membership and produce
@@ -66,7 +66,7 @@ const NET_MSG_ERROR: u8 = 0x06;
 // provider resolves a name.
 use abi::contracts::net::net_proto::{
     connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    CONN_ID_LEN, REQUESTER_TAG_NONE,
+    REQUESTER_TAG_NONE,
 };
 
 #[path = "../../common/authority.rs"]
@@ -76,14 +76,14 @@ use authority::{Authority, PORT_KAFKA};
 // The exchange contract, through the provider core's own mount of it.
 #[path = "../../common/publish_exchange.rs"]
 mod publish_exchange;
-use publish_exchange::exchange::{status, RECORD_MAX};
+use publish_exchange::exchange::{outcome, RECORD_MAX};
 use publish_exchange::PublishProvider;
 
 /// Kafka error code for a record batch past the broker's limit.
 const ERR_MESSAGE_TOO_LARGE: i16 = 10;
 
 /// The largest record value a produce carries: what the core's one-record
-/// batch scratch holds with its framing. A larger body is refused 413.
+/// batch scratch holds with its framing. A larger body is answered TOO_LARGE.
 const PRODUCE_VALUE_MAX: usize = 480;
 /// One produce in flight; one request collected at once.
 type Desk = PublishProvider<1, PRODUCE_VALUE_MAX, 1, 4>;
@@ -214,7 +214,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: KafkaState }
+fluxor_rt::module_facts! {
+    state: KafkaState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = 1600],
+}
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -385,7 +388,7 @@ unsafe fn feed(s: &mut KafkaState, sys: &SyscallTable, ev: KEv, now: u64) {
     match action {
         KAct::Connect => {
             let mut payload = [0u8; CONNECT_TO_MAX];
-            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            let n = s.authority.connect_record(&mut payload, s.tag);
             if n > 0 {
                 net_write_frame(
                     sys,
@@ -486,9 +489,9 @@ unsafe fn on_response(s: &mut KafkaState, body: &[u8], now: u64) {
         // DOWN that follows invalidates it instead.
         if let Some((code, _)) = parsed {
             let verdict = match code {
-                0 => status::OK,
-                ERR_MESSAGE_TOO_LARGE => status::TOO_LARGE,
-                _ => status::BAD_GATEWAY,
+                0 => outcome::OK,
+                ERR_MESSAGE_TOO_LARGE => outcome::TOO_LARGE,
+                _ => outcome::UNAVAILABLE,
             };
             let _ = s.desk.settle(s.corr as u64, verdict);
         }
@@ -580,7 +583,7 @@ unsafe fn discard_requests(s: &mut KafkaState) {
 }
 
 /// Read one request record. A PUBLISH it completes is produced (producer)
-/// or refused 400 (consumer).
+/// or answered REFUSED (consumer).
 unsafe fn take_request(s: &mut KafkaState, sys: &SyscallTable, now: u64) {
     if s.request_in < 0 {
         return;
@@ -597,7 +600,7 @@ unsafe fn take_request(s: &mut KafkaState, sys: &SyscallTable, now: u64) {
         return;
     };
     if s.producing == 0 {
-        s.desk.refuse(at, status::BAD_REQUEST);
+        s.desk.refuse(at, outcome::REFUSED);
         return;
     }
     let tl = s.produce_topic_len as usize;
@@ -611,12 +614,12 @@ unsafe fn take_request(s: &mut KafkaState, sys: &SyscallTable, now: u64) {
     };
     let Some(bn) = built else {
         // Past what one produce request holds: refused, never truncated.
-        s.desk.refuse(at, status::TOO_LARGE);
+        s.desk.refuse(at, outcome::TOO_LARGE);
         return;
     };
     send_request_v(s, api::PRODUCE, 7, &body[..bn], now);
     if s.req_len == 0 {
-        s.desk.refuse(at, status::TOO_LARGE);
+        s.desk.refuse(at, outcome::TOO_LARGE);
         return;
     }
     let _ = s.desk.dispatch(at, s.corr as u64, now);
@@ -700,10 +703,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     // `[conn_id: u16 LE][requester_tag: u16 LE]`
                     NET_MSG_CONNECTED if s.phase == KPhase::Connecting => {
                         let pl = core::slice::from_raw_parts(payload, plen);
-                        if plen >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
-                            if tag == s.tag || tag == REQUESTER_TAG_NONE {
-                                s.conn_id = id;
+                        if let Some(c) = connected_parts(pl) {
+                            if c.requester_tag == s.tag || c.requester_tag == REQUESTER_TAG_NONE {
+                                s.conn_id = c.conn_id;
                                 feed(s, sys, KEv::Connected, now);
                             }
                         }
@@ -752,11 +754,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         // conn_id, so the tag is the only way to know it
                         // is ours.
                         let pl = core::slice::from_raw_parts(payload, plen);
-                        let tag = if plen > CONN_ID_LEN {
-                            error_parts(pl).2
-                        } else {
-                            REQUESTER_TAG_NONE
-                        };
+                        let tag = error_parts(pl).map_or(REQUESTER_TAG_NONE, |(_, _, tag)| tag);
                         let ours = (s.phase == KPhase::Connecting
                             && (tag == s.tag || tag == REQUESTER_TAG_NONE))
                             || (s.phase != KPhase::Disconnected
@@ -773,7 +771,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // 4. Send pump.
         if s.conn_id != 0 && s.req_sent < s.req_len {
             // -2 for the `[conn_id: u16 LE]` prefix on CMD_SEND.
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 2;
+            let max_chunk = NET_OUT_MAX_RECORD - NET_FRAME_HDR - 2;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {

@@ -9,6 +9,7 @@ name         = "net_in"
 direction    = "input"
 content_type = "NetProto"
 buffer_size  = 2048
+accepts_record = 2048
 
 # A payload to PUB to the configured subject.
 [[ports]]

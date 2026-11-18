@@ -106,7 +106,7 @@ Then `sudo systemctl restart quantum`.
 
 The runtime writes WAL segments (`wal/`), Raft metadata (`raft/`)
 and snapshot state (`data/`) under its working directory, and
-`fluxor run` regenerates the derived `config.bin`/`modules.bin`
+`fluxor run` regenerates the derived `graph.img`
 there too (`target/linux/<config>/`). The shipped unit therefore
 runs with `/var/lib/quantum` as its working directory, so everything
 written at runtime lands there; mount it on a durable volume backed

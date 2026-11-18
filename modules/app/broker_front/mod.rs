@@ -9,7 +9,7 @@
 // each subscription is a session of its own.
 //
 //   publish_in  ──PUBLISH──▶ desk ──QoS 1 PUBLISH──▶ session_out
-//   publish_out ◀──200──────  desk ◀──PUBACK──────── session_in
+//   publish_out ◀──OK───────  desk ◀──PUBACK──────── session_in
 //
 //   subscribe_in  ──GET filter──▶ CONNECT, SUBSCRIBE ──▶ session_out
 //   subscribe_out ◀──HEAD HOLD|MORE, BODY per message ◀── session_in
@@ -45,7 +45,7 @@ use front_session::Answer;
 // `subscribe_exchange` shares.
 #[path = "../../common/publish_exchange.rs"]
 mod publish_exchange;
-use publish_exchange::exchange::{status, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::exchange::{outcome, PAYLOAD_MAX, RECORD_MAX};
 use publish_exchange::PublishProvider;
 
 #[path = "../../common/subscribe_exchange.rs"]
@@ -345,7 +345,7 @@ unsafe fn take_publishes(s: &mut FrontState, now: u64) {
         let topic_len = usize::from(s.topic_len);
         if body.len() > record_room(topic_len) {
             // Past what this front carries: refused, never truncated.
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             continue;
         }
         let built = front_session::publish(
@@ -356,7 +356,7 @@ unsafe fn take_publishes(s: &mut FrontState, now: u64) {
             body,
         );
         let Some(len) = built else {
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             continue;
         };
         // Into the window BEFORE the write, so an acknowledgement can never
@@ -449,7 +449,7 @@ unsafe fn on_publish_answer(s: &mut FrontState, answer: Answer<'_>, now: u64) {
         }
         Answer::Puback { packet_id, .. } => {
             // Durable acceptance at QoS 1.
-            let _ = s.desk.settle(u64::from(packet_id), status::OK);
+            let _ = s.desk.settle(u64::from(packet_id), outcome::OK);
         }
         Answer::Disconnect { .. } => {
             if s.pub_phase == PubPhase::Running {

@@ -15,7 +15,7 @@
 // broker allows at most 8 pending publishes per connection), three
 // frames per publish (method + content header + body), delivery tags
 // sequential from 1, each mapped to its exchange in the window.
-// Basic.Ack answers 200 with an empty body; Basic.Nack answers 502.
+// Basic.Ack answers OK with an empty body; Basic.Nack answers UNAVAILABLE.
 // A connection lost after Confirm.SelectOk writes LINK DOWN and clears
 // the window — those exchanges are exactly the set the requester
 // re-issues after the LINK UP the next Confirm.SelectOk writes. The
@@ -38,7 +38,7 @@ use fluxor_rt::*;
 // The exchange contract, through the provider core's own mount of it.
 #[path = "../../common/publish_exchange.rs"]
 mod publish_exchange;
-use publish_exchange::exchange::{status, PAYLOAD_MAX, RECORD_MAX};
+use publish_exchange::exchange::{outcome, PAYLOAD_MAX, RECORD_MAX};
 use publish_exchange::PublishProvider;
 
 #[path = "../../common/cores/amqp_core.rs"]
@@ -63,7 +63,7 @@ const NET_CMD_CLOSE: u8 = 0x12;
 // provider resolves a name.
 use abi::contracts::net::net_proto::{
     connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    CONN_ID_LEN, REQUESTER_TAG_NONE,
+    REQUESTER_TAG_NONE,
 };
 
 #[path = "../../common/authority.rs"]
@@ -452,7 +452,7 @@ unsafe fn handle_requests(s: &mut SinkState) {
         let built = publish_frames(CHANNEL, topic, body, &mut s.tx_buf);
         let Some(flen) = built else {
             // Past the frame budget: refused, never truncated.
-            s.desk.refuse(at, status::TOO_LARGE);
+            s.desk.refuse(at, outcome::TOO_LARGE);
             flush_answers(s);
             continue;
         };
@@ -470,15 +470,15 @@ unsafe fn handle_requests(s: &mut SinkState) {
 
 // ── RX ───────────────────────────────────────────────────────────────
 
-/// Fold a Basic.Ack / Basic.Nack: 200 for an ack, 502 for a nack (the
+/// Fold a Basic.Ack / Basic.Nack: OK for an ack, UNAVAILABLE for a nack (the
 /// broker would not take the record). This broker always sends
 /// `multiple = 0`, but `multiple = 1` is folded correctly anyway (tags
 /// are sequential, so it covers every publish at or below `tag`).
 unsafe fn fold_confirm(s: &mut SinkState, tag: u64, multiple: bool, nack: bool) {
     let verdict = if nack {
-        status::BAD_GATEWAY
+        outcome::UNAVAILABLE
     } else {
-        status::OK
+        outcome::OK
     };
     if multiple {
         let _ = s.desk.settle_through(tag, verdict);
@@ -696,7 +696,10 @@ unsafe fn enter_reconnect(s: &mut SinkState) {
 
 // ── PIC module ABI ───────────────────────────────────────────────────
 
-fluxor_rt::module_facts! { state: SinkState }
+fluxor_rt::module_facts! {
+    state: SinkState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_BUF_SIZE],
+}
 
 /// # Safety
 /// `syscalls` is a kernel-owned table valid for the process lifetime.
@@ -809,7 +812,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     let mut payload = [0u8; CONNECT_TO_MAX];
                     let n = s
                         .authority
-                        .connect_record(&mut payload, Some(dev_requester_tag(sys)));
+                        .connect_record(&mut payload, dev_requester_tag(sys));
                     if n == 0 {
                         log_err(s, b"[amqpsink] authority does not fit a connect record");
                         s.phase = Phase::Error;
@@ -844,20 +847,23 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             nbuf.add(NET_FRAME_HDR) as *const u8,
                             payload_len,
                         );
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
-                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
-                                s.conn_id = id;
+                        if msg_type == NET_MSG_CONNECTED {
+                            if let Some(c) = connected_parts(pl).filter(|c| {
+                                c.requester_tag == dev_requester_tag(sys)
+                                    || c.requester_tag == REQUESTER_TAG_NONE
+                            }) {
+                                s.conn_id = c.conn_id;
                                 s.conn_present = 1;
                                 s.phase = Phase::Header;
                                 continue;
                             }
-                        } else if msg_type == NET_MSG_ERROR && payload_len > CONN_ID_LEN {
-                            let (_id, _errno, tag) = error_parts(pl);
-                            if tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE {
-                                enter_reconnect(s);
-                                return StepReturn::Continue;
-                            }
+                        } else if msg_type == NET_MSG_ERROR
+                            && error_parts(pl).is_some_and(|(_, _, tag)| {
+                                tag == dev_requester_tag(sys) || tag == REQUESTER_TAG_NONE
+                            })
+                        {
+                            enter_reconnect(s);
+                            return StepReturn::Continue;
                         }
                     }
                     if dev_millis(sys).wrapping_sub(s.state_start_ms) > CONNECT_TIMEOUT_MS {

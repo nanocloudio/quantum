@@ -24,13 +24,13 @@ Environment=FLUXOR_PROJECT_ROOT=/opt/quantum
 
 # The runtime writes its durable state (wal/, raft/, data/) relative
 # to the working directory, and `fluxor run` writes the derived
-# config.bin/modules.bin under target/linux/<config>/ there too, so
+# graph.img under target/linux/<config>/ there too, so
 # the working directory must be the writable state directory —
 # /opt/quantum is read-only under ProtectSystem=strict.
 WorkingDirectory=/var/lib/quantum
 
-# The fluxor `run` command rebuilds config.bin + modules.bin under
-# target/linux/<config-name>/ then exec's fluxor-linux against them.
+# The fluxor `run` command rebuilds graph.img under
+# target/linux/<config-name>/ then exec's fluxor-linux against it.
 ExecStart=/opt/quantum/bin/fluxor run ${QUANTUM_CONFIG}
 
 # Restart on crash with backoff

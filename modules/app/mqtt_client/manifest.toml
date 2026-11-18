@@ -17,6 +17,8 @@ direction = "input"
 content_type = "NetProto"
 # in[0]: net_in (from IP).
 buffer_size = 2048
+# NET_BUF_SIZE — one inbound frame is read into the 1600-byte net_buf.
+accepts_record = 1600
 
 [[ports]]
 name = "app_in"

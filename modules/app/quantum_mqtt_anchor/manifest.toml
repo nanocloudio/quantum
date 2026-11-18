@@ -105,6 +105,10 @@ name = "frames_out"
 direction = "output"
 content_type = "NetProto"
 rate_class_default = "transaction"
+# Any envelope a channel carries (`abi::CHANNEL_BUFFER_SIZE`, the module
+# states it too), on a ring that holds one with its length prefix.
+max_record = 8192
+buffer_size = 16384
 
 # Component-tagged samples under the dimensional metric envelope
 # (metric_id 0x22 = mqtt codec, 0x25 = anchor).

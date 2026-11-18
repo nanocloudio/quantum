@@ -9,20 +9,20 @@ hardware_targets = ["bcm2712"]
 # mqtt_sink/kafka_sink; any graph that publishes durably composes it by
 # deployment pin.
 #
-# Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
+# Request: op PUBLISH, verb 0; `target` = the ordering key (up to KEY_MAX);
 # body = the record, published as the message body byte for byte to the
 # default exchange with the configured `topic` as routing key; flags
-# MORE and BROADCAST only. Anything else is answered 400.
+# MORE and BROADCAST only. Anything else is answered REFUSED.
 #
-# Answer: 200 with an empty body on the broker's Basic.Ack; 502 on a
+# Answer: OK with an empty body on the broker's Basic.Ack; UNAVAILABLE on a
 # Basic.Nack (the broker would not take the record — quantum's own
-# broker nacks a body over its 1800-byte cap); 413 for a record past the
-# bounds; 503 when every collecting slot is taken. Losing the broker
+# broker nacks a body over its 1800-byte cap); TOO_LARGE for a record past the
+# bounds; BUSY when every collecting slot is taken. Losing the broker
 # connection writes LINK DOWN; the next Confirm.SelectOk writes LINK UP,
 # and the requester re-issues every exchange it held open.
 #
 # Delivery terms (`stream.ordered_ack`):
-#   ack       — 200 is durable acceptance: PUBLISHER CONFIRMS
+#   ack       — OK is durable acceptance: PUBLISHER CONFIRMS
 #               (confirm.select; basic.ack), which quantum's broker
 #               gates on Clustor quorum durability.
 #   ordering  — one channel, serialized publishes: confirm tags are
@@ -51,7 +51,7 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 16384
-max_record = 1600
+accepts_record = 1600
 
 [[ports]]
 name = "net_out"

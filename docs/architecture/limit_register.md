@@ -27,7 +27,7 @@ leaves the work in its channel for a later step.
 
 | Limit | Kind | Symbol | Source | Value | Exhaustion behaviour |
 |---|---|---|---|---:|---|
-| Publish header block | Shape | `HEADERS_MAX` | modules/common/publish_exchange.rs | 512 | A publish whose headers pass it is refused 413. A sink reads none of them. |
+| Publish meta block | Shape | `META_MAX` | modules/common/publish_exchange.rs | 512 | A publish whose meta passes it is refused TOO_LARGE. A sink reads none of it. |
 
 ## The broker's in-graph fronts
 
@@ -65,7 +65,7 @@ MAX_PAYLOAD | modules/common/wire.rs | 0xFFFF
 MAX_MSG | modules/common/wire.rs | crate::abi::CHANNEL_BUFFER_SIZE
 MAX_MSG | modules/common/wire.rs | crate::abi::CHANNEL_BUFFER_SIZE
 DELIVERY_ENVELOPE_MAX | modules/common/wire.rs | 4112
-HEADERS_MAX | modules/common/publish_exchange.rs | 512
+META_MAX | modules/common/publish_exchange.rs | 512
 WIRE_MAX | modules/common/front_session.rs | 8192
 ENVELOPE_MAX | modules/common/front_session.rs | WIRE_MAX - WIRE_HDR
 CLIENT_ID_MAX | modules/common/front_session.rs | 64
@@ -80,4 +80,13 @@ OWED_CAP | modules/app/broker_front/mod.rs | INFLIGHT_CAP + 3
 SUB_SLOTS | modules/app/broker_front/mod.rs | 8
 SUB_RECV_MAX | modules/app/broker_front/mod.rs | 1
 TX_CAP | modules/app/broker_front/mod.rs | 2 * front_session::WIRE_MAX
+```
+
+## Not ceilings
+
+One constant in the named files matches the naming convention without being
+policy, exempted below with its reason.
+
+```limit-register-exempt
+RESP_META_MAX | modules/common/subscribe_exchange.rs | the response HEAD's two fixed meta fields (content type and `session-present`) at their widths, derived from the exchange meta layout rather than chosen
 ```

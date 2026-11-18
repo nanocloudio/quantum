@@ -189,7 +189,10 @@ fn fmt_u32(out: &mut [u8], mut pos: usize, mut v: u32) -> usize {
     pos
 }
 
-fluxor_rt::module_facts! { state: ModuleState }
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    records: [out 1 FRAMES_OUT_MAX_RECORD = abi::CHANNEL_BUFFER_SIZE],
+}
 
 /// PIC module ABI entry: one-time process-wide init.
 ///

@@ -1,15 +1,15 @@
 //! The provider half of a PUBLISH exchange, for every broker connector.
 //!
 //! A sink takes records for a durable destination as exchange requests and
-//! answers each once: 200 with an empty body when the broker has durably
-//! accepted it, a contract status when it will not carry it. What differs
+//! answers each once: outcome OK with an empty body when the broker has
+//! durably accepted it, another outcome when it will not carry it. What differs
 //! between MQTT, Kafka and AMQP is how a record reaches the broker and what
 //! the broker says back; what does not differ is everything here:
 //!
 //! - collecting each request whole (`Collector`), granting the body credit it
 //!   owes and answering its refusals;
-//! - judging the request: `METHOD_PUBLISH` with `MORE` and `BROADCAST` the only
-//!   flags, anything else 400;
+//! - judging the request: op `PUBLISH` (verb 0: a sink speaks no binding)
+//!   with `MORE` and `BROADCAST` the only flags, anything else `REFUSED`;
 //! - the in-flight window, which maps the broker's own acknowledgement handle
 //!   (an MQTT packet id, a Kafka correlation id, an AMQP delivery tag) to the
 //!   exchange it answers;
@@ -41,13 +41,13 @@
 pub use fluxor_abi::contracts::exchange;
 
 use exchange::{
-    flag, link, parse_request, status, write_credit, write_link, write_response, Collector,
-    ExchangeId, Record, Request, KEY_MAX, METHOD_PUBLISH,
+    flag, link, op, outcome, parse_request, write_credit, write_link, write_response, Collector,
+    ExchangeId, Plain, Record, Request, KEY_MAX,
 };
 
-/// Largest header block a publish may carry. A sink reads none of it, so
-/// the bound is room for what a requester attaches, not a field it uses.
-pub const HEADERS_MAX: usize = 512;
+/// Largest meta a publish may carry. A sink reads none of it, so the bound
+/// is room for what a requester attaches, not a field it uses.
+pub const META_MAX: usize = 512;
 
 /// Request flags a publish may carry: a body to follow, and delivery to
 /// every ordering unit.
@@ -62,7 +62,7 @@ const LINK_RESERVE: usize = 2;
 /// One record owed on `response_out`.
 #[derive(Clone, Copy)]
 enum Owed {
-    Answer { id: ExchangeId, status: u16 },
+    Answer { id: ExchangeId, outcome: u8 },
     Credit { id: ExchangeId, bytes: u32 },
     Link(u8),
 }
@@ -119,7 +119,7 @@ pub struct PublishProvider<
     const WINDOW: usize,
     const QUEUE: usize,
 > {
-    requests: Collector<SLOTS, KEY_MAX, HEADERS_MAX, BODY>,
+    requests: Collector<Plain, SLOTS, KEY_MAX, META_MAX, BODY>,
     window: [InFlight; WINDOW],
     used: usize,
     queue: [Owed; QUEUE],
@@ -195,7 +195,7 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
         }
         // An abort ends the exchange wherever it is: collecting (the
         // collector frees it), awaiting the broker, or answered and queued.
-        if let Some(Record::Abort { id, .. }) = parse_request(record) {
+        if let Ok(Record::Abort { id, .. }) = parse_request::<Plain>(record) {
             self.abort(id);
         }
         let taken = self.requests.accept(record);
@@ -205,22 +205,22 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
         if let Some((id, why)) = self.requests.take_refusal() {
             self.push(Owed::Answer {
                 id,
-                status: why.status(),
+                outcome: why.outcome(),
             });
         }
         let at = taken.ok().flatten()?;
-        let (id, method, flags) = match self.requests.request(at) {
-            Some(r) => (r.id, r.method, r.flags),
+        let (id, asked, flags) = match self.requests.request(at) {
+            Some(r) => (r.id, r.op, r.flags),
             None => {
                 self.requests.release(at);
                 return None;
             }
         };
-        if method != METHOD_PUBLISH || flags & !FLAGS_ALLOWED != 0 {
+        if asked != op::PUBLISH || flags & !FLAGS_ALLOWED != 0 {
             self.requests.release(at);
             self.push(Owed::Answer {
                 id,
-                status: status::BAD_REQUEST,
+                outcome: outcome::REFUSED,
             });
             return None;
         }
@@ -241,12 +241,12 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
     }
 
     /// Answer the publish in slot `at` with a refusal of the module's own
-    /// (413 for a record the broker cannot take, 502 for one it will not
-    /// route) and free the slot.
-    pub fn refuse(&mut self, at: usize, status: u16) {
+    /// (`TOO_LARGE` for a record the broker cannot take, `REFUSED` for one
+    /// it will not route) and free the slot.
+    pub fn refuse(&mut self, at: usize, outcome: u8) {
         if let Some(r) = self.requests.request(at) {
             let id = r.id;
-            self.push(Owed::Answer { id, status });
+            self.push(Owed::Answer { id, outcome });
         }
         self.requests.release(at);
     }
@@ -276,16 +276,16 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
 
     // ── The broker's verdicts ────────────────────────────────────────
 
-    /// The broker answered `handle`: owe `status` to its exchange (200 for
+    /// The broker answered `handle`: owe `outcome` to its exchange (OK for
     /// durable acceptance). False when no publish awaits that handle.
-    pub fn settle(&mut self, handle: u64, status: u16) -> bool {
+    pub fn settle(&mut self, handle: u64, outcome: u8) -> bool {
         match self
             .window
             .iter()
             .position(|f| f.live && f.handle == handle)
         {
             Some(at) => {
-                self.settle_at(at, status);
+                self.settle_at(at, outcome);
                 true
             }
             None => false,
@@ -295,7 +295,7 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
     /// The broker answered every handle up to and including `handle` (an
     /// AMQP `multiple` confirm; handles there are sequential). Returns how
     /// many publishes it settled.
-    pub fn settle_through(&mut self, handle: u64, status: u16) -> usize {
+    pub fn settle_through(&mut self, handle: u64, outcome: u8) -> usize {
         let mut settled = 0;
         // Oldest first, so answers leave in the order the broker took them.
         while let Some(at) = self
@@ -306,18 +306,18 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
             .min_by_key(|(_, f)| f.handle)
             .map(|(at, _)| at)
         {
-            self.settle_at(at, status);
+            self.settle_at(at, outcome);
             settled += 1;
         }
         settled
     }
 
-    fn settle_at(&mut self, at: usize, status: u16) {
+    fn settle_at(&mut self, at: usize, outcome: u8) {
         let f = self.window[at];
         self.window[at] = InFlight::EMPTY;
         self.used -= 1;
         if !f.aborted {
-            self.push(Owed::Answer { id: f.id, status });
+            self.push(Owed::Answer { id: f.id, outcome });
         }
     }
 
@@ -393,7 +393,7 @@ impl<const SLOTS: usize, const BODY: usize, const WINDOW: usize, const QUEUE: us
         }
         let owed = self.at(0);
         let n = match owed {
-            Owed::Answer { id, status } => write_response(&id, status, &[], &[], out)?,
+            Owed::Answer { id, outcome } => write_response(&id, outcome, &[], &[], out)?,
             Owed::Credit { id, bytes } => write_credit(&id, bytes, out)?,
             Owed::Link(state) => write_link(state, out)?,
         };

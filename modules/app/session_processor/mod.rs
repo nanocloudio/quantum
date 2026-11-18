@@ -1171,7 +1171,10 @@ struct ModuleState {
 
 impl ModuleState {}
 
-fluxor_rt::module_facts! { state: ModuleState }
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    records: [in 1 COMMITTED_IN_ACCEPTS_RECORD = wire::ENVELOPE_HDR + BUF_SIZE],
+}
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.

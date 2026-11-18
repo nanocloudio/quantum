@@ -1,7 +1,8 @@
 //! The provider half of a SUBSCRIPTION: a held exchange per subscriber.
 //!
-//! A subscription is a request — `GET`, `target` = an MQTT topic filter —
-//! answered by one response HEAD flagged `HOLD | MORE` once the broker has
+//! A subscription is an HTTP-bound request — a `CALL` with verb `GET`,
+//! `target` = an MQTT topic filter — answered by one response HEAD (status
+//! 200) flagged `HOLD | MORE` once the broker has
 //! taken the subscription, then one BODY record per message, never past the
 //! response credit the requester has granted (the credit IS the subscriber's
 //! backpressure). The exchange ends with an ABORT from the requester, or with
@@ -35,25 +36,29 @@
 pub use super::publish_exchange::exchange;
 
 use exchange::{
-    abort, flag, header, parse_request, status, write_abort, write_body, write_refusal,
-    write_response_head, ExchangeId, Record, ResponseHead, BODY_MAX, METHOD_GET,
+    abort, flag, kind, meta_field_len, meta_get, op, parse_request, record_id, record_kind,
+    write_abort, write_body, write_response_head, ExchangeId, MetaWriter, Record, BODY_MAX,
+    META_CONTENT_TYPE,
 };
+use fluxor_abi::contracts::exchange_http::{self as http, method, status, Http};
 
 /// The longest topic filter a subscription names.
 pub const FILTER_MAX: usize = 256;
-/// The longest session name the `session` header carries; it is the MQTT
-/// client id of the durable session, so it holds to the same bound.
+/// The longest session name the `session` meta field carries; it is the
+/// MQTT client id of the durable session, so it holds to the same bound.
 pub const SESSION_MAX: usize = 64;
-/// Request header naming a durable session to create or resume.
-pub const SESSION_HEADER: &[u8] = b"session";
+/// Request meta key naming a durable session to create or resume.
+pub const SESSION_META: &[u8] = b"session";
 /// The content type of a subscription's response.
 pub const CONTENT_TYPE: &[u8] = b"application/vnd.quantum.message";
 /// Refusal: a durable session already has a live subscription.
-pub const CONFLICT: u16 = 409;
+pub const CONFLICT: u16 = status::CONFLICT;
 
-/// Response HEAD header block: whether the broker held the session.
-const PRESENT_YES: &[u8] = b"session-present: 1\r\n";
-const PRESENT_NO: &[u8] = b"session-present: 0\r\n";
+/// Response HEAD meta key: whether the broker held the session (`0`/`1`).
+const PRESENT_META: &[u8] = b"session-present";
+/// The response HEAD's meta: the content type and `session-present`.
+const RESP_META_MAX: usize = meta_field_len(META_CONTENT_TYPE.len(), CONTENT_TYPE.len())
+    + meta_field_len(PRESENT_META.len(), 1);
 
 /// Held-message entry header: `[framed_len u16 LE][qos u8][packet_id u16 LE]`.
 const ENTRY_HDR: usize = 5;
@@ -244,9 +249,9 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
 
     /// Take one request record.
     pub fn accept(&mut self, record: &[u8], now_ms: u64) -> Taken {
-        match parse_request(record) {
-            Some(Record::Head(h)) => {
-                let refusal = self.judge(h.method, h.flags, h.target, h.headers);
+        match parse_request::<Http>(record) {
+            Ok(Record::Head(h)) => {
+                let refusal = self.judge(h.op, h.verb, h.flags, h.target, h.meta);
                 if let Some(code) = refusal {
                     self.refuse(h.id, code);
                     return Taken::Nothing;
@@ -255,13 +260,13 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
                     self.refuse(h.id, status::BAD_REQUEST);
                     return Taken::Nothing;
                 }
-                let session = header(h.headers, SESSION_HEADER).unwrap_or(&[]);
+                let session = meta_get(h.meta, SESSION_META).unwrap_or(&[]);
                 if !session.is_empty() && self.find_session(session).is_some() {
                     self.refuse(h.id, CONFLICT);
                     return Taken::Nothing;
                 }
                 let Some(at) = self.subs.iter().position(|s| s.phase == Phase::Free) else {
-                    self.refuse(h.id, status::BUSY);
+                    self.refuse(h.id, status::SERVICE_UNAVAILABLE);
                     return Taken::Nothing;
                 };
                 let conn = self.next_conn();
@@ -278,14 +283,14 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
                 s.session_len = session.len() as u8;
                 Taken::Open(at)
             }
-            Some(Record::Credit { id, bytes }) => {
+            Ok(Record::Credit { id, bytes }) => {
                 if let Some(at) = self.find_id(&id) {
                     let s = &mut self.subs[at];
                     s.credit = s.credit.saturating_add(bytes);
                 }
                 Taken::Nothing
             }
-            Some(Record::Abort { id, .. }) => {
+            Ok(Record::Abort { id, .. }) => {
                 // Nothing further is written for an aborted exchange: its
                 // owed refusal goes, and so does an ended subscription's
                 // last record (its session was closed when it ended).
@@ -304,6 +309,15 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
                     Taken::Close(s.conn)
                 }
             }
+            // A HEAD that breaks the binding's rules (a verb HTTP does not
+            // name, an op its verb does not fit) still names its exchange,
+            // and is owed an answer.
+            Err(_) => {
+                if let (Some(kind::HEAD), Some(id)) = (record_kind(record), record_id(record)) {
+                    self.refuse(id, status::BAD_REQUEST);
+                }
+                Taken::Nothing
+            }
             // A subscription carries no request body, and the rest names
             // nothing this provider holds.
             _ => Taken::Nothing,
@@ -311,19 +325,19 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
     }
 
     /// The refusal a subscription request is owed, or `None` to take it.
-    fn judge(&self, method: u8, flags: u8, target: &[u8], headers: &[u8]) -> Option<u16> {
-        if method != METHOD_GET || flags != 0 {
+    fn judge(&self, asked: u8, verb: u8, flags: u8, target: &[u8], meta: &[u8]) -> Option<u16> {
+        if asked != op::CALL || verb != method::GET || flags != 0 {
             return Some(status::BAD_REQUEST);
         }
         if target.len() > FILTER_MAX {
-            return Some(status::TOO_LARGE);
+            return Some(status::PAYLOAD_TOO_LARGE);
         }
         if !valid_filter(target) {
             return Some(status::BAD_REQUEST);
         }
-        if let Some(session) = header(headers, SESSION_HEADER) {
+        if let Some(session) = meta_get(meta, SESSION_META) {
             if session.len() > SESSION_MAX {
-                return Some(status::TOO_LARGE);
+                return Some(status::PAYLOAD_TOO_LARGE);
             }
             if session.is_empty() || !session.iter().all(|c| (0x21..=0x7E).contains(c)) {
                 return Some(status::BAD_REQUEST);
@@ -485,7 +499,7 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
         let s = self.subs.iter_mut().find(|s| {
             matches!(s.phase, Phase::Connecting | Phase::Subscribing) && now_ms >= s.deadline_ms
         })?;
-        s.end(status::TIMEOUT, 0);
+        s.end(status::GATEWAY_TIMEOUT, 0);
         Some(s.conn)
     }
 
@@ -497,7 +511,7 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
     pub fn next_record(&mut self, out: &mut [u8], may_ack: bool) -> Option<Emitted> {
         if self.refusals_len > 0 {
             let r = self.refusals[0];
-            let len = write_refusal(&r.id, r.status, out)?;
+            let len = http::write_refusal(&r.id, r.status, out)?;
             self.refusals.copy_within(1..self.refusals_len, 0);
             self.refusals_len -= 1;
             return Some(Emitted { len, ack: None });
@@ -517,7 +531,7 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
         match s.phase {
             Phase::Ending => {
                 let len = if s.end_status >= 100 {
-                    write_refusal(&s.id, s.end_status, out)?
+                    http::write_refusal(&s.id, s.end_status, out)?
                 } else {
                     write_abort(&s.id, s.end_status as u8, out)?
                 };
@@ -525,22 +539,16 @@ impl<const SLOTS: usize, const HOLD: usize> Subscriptions<SLOTS, HOLD> {
                 Some(Emitted { len, ack: None })
             }
             Phase::Live if s.head_owed => {
-                let headers = match s.session_len {
-                    0 => &[][..],
-                    _ if s.present => PRESENT_YES,
-                    _ => PRESENT_NO,
-                };
-                let len = write_response_head(
-                    &ResponseHead {
-                        id: s.id,
-                        flags: flag::HOLD | flag::MORE,
-                        status: status::OK,
-                        content_type: CONTENT_TYPE,
-                        headers,
-                        body: &[],
-                    },
-                    out,
-                )?;
+                let mut meta = [0u8; RESP_META_MAX];
+                let mut w = MetaWriter::new(&mut meta);
+                w.put(META_CONTENT_TYPE, CONTENT_TYPE);
+                if s.session_len > 0 {
+                    w.put(PRESENT_META, if s.present { b"1" } else { b"0" });
+                }
+                let meta_len = w.finish()?;
+                let mut head = http::head(s.id, status::OK, &meta[..meta_len], &[])?;
+                head.flags = flag::HOLD | flag::MORE;
+                let len = write_response_head::<Http>(&head, out)?;
                 s.head_owed = false;
                 Some(Emitted { len, ack: None })
             }

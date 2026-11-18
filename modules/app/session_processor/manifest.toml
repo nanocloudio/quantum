@@ -98,6 +98,8 @@ content_type = "NetProto"
 # Transaction-class edges: one record per committed entry or
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
+# One envelope header plus the 8192-byte `in_buf` an entry is read into.
+accepts_record = 8195
 
 [[ports]]
 name = "flow_in"

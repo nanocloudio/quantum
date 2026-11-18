@@ -69,7 +69,7 @@ const NET_CMD_CLOSE: u8 = 0x12;
 // provider resolves a name.
 use abi::contracts::net::net_proto::{
     connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    CONN_ID_LEN, REQUESTER_TAG_NONE,
+    REQUESTER_TAG_NONE,
 };
 
 #[path = "../../common/authority.rs"]
@@ -930,7 +930,10 @@ unsafe fn enter_reconnect(s: &mut MqttState) {
 // Exported PIC Module Interface
 // ============================================================================
 
-fluxor_rt::module_facts! { state: MqttState }
+fluxor_rt::module_facts! {
+    state: MqttState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF_SIZE, out 0 NET_OUT_MAX_RECORD = NET_BUF_SIZE],
+}
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -1069,7 +1072,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     let mut payload = [0u8; CONNECT_TO_MAX];
                     let n = s
                         .authority
-                        .connect_record(&mut payload, Some(dev_requester_tag(sys)));
+                        .connect_record(&mut payload, dev_requester_tag(sys));
                     if n == 0 {
                         log_err(s, b"[mqtt] authority does not fit a connect record");
                         s.phase = MqttPhase::Error;
@@ -1105,24 +1108,28 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                             nbuf.add(NET_FRAME_HDR) as *const u8,
                             payload_len,
                         );
-                        if msg_type == NET_MSG_CONNECTED && payload_len >= CONN_ID_LEN {
-                            // Claim only our own outbound connection by tag:
-                            // the tag sits after the two-byte connection id.
-                            let (id, tag) = connected_parts(pl);
-                            if tag != REQUESTER_TAG_NONE && tag != dev_requester_tag(sys) {
+                        if msg_type == NET_MSG_CONNECTED {
+                            // Claim only our own outbound connection by tag.
+                            let Some(c) = connected_parts(pl) else {
+                                return StepReturn::Continue;
+                            };
+                            if c.requester_tag != REQUESTER_TAG_NONE
+                                && c.requester_tag != dev_requester_tag(sys)
+                            {
                                 return StepReturn::Continue; // another consumer's connection.
                             }
-                            s.conn_id = id;
+                            s.conn_id = c.conn_id;
                             s.conn_present = 1;
                             log_msg(s, b"[mqtt] tcp connected");
                             s.phase = MqttPhase::MqttConnect;
                             continue;
                         }
-                        if msg_type == NET_MSG_ERROR && payload_len > CONN_ID_LEN {
-                            // A connect failure names its requester after the
-                            // errno; ignore another consumer's.
-                            let (_id, _errno, etag) = error_parts(pl);
-                            if etag == REQUESTER_TAG_NONE || etag == dev_requester_tag(sys) {
+                        if msg_type == NET_MSG_ERROR {
+                            // A connect failure names its requester; ignore
+                            // another consumer's.
+                            if error_parts(pl).is_some_and(|(_, _, etag)| {
+                                etag == REQUESTER_TAG_NONE || etag == dev_requester_tag(sys)
+                            }) {
                                 log_err(s, b"[mqtt] connect rejected");
                                 enter_reconnect(s);
                             }

@@ -11,18 +11,18 @@ hardware_targets = ["bcm2712", "linux"]
 # about who publishes. The broker is any MQTT broker: quantum's own, or a
 # foreign one (mosquitto, …).
 #
-# Request: METHOD_PUBLISH; `target` = the ordering key (up to KEY_MAX);
+# Request: op PUBLISH, verb 0; `target` = the ordering key (up to KEY_MAX);
 # body = the record, published as the MQTT payload byte for byte on the
 # configured `topic`; flags MORE and BROADCAST only. Anything else is
-# answered 400.
+# answered REFUSED.
 #
-# Answer: 200 with an empty body once the broker PUBACKs (QoS 1); 503
+# Answer: OK with an empty body once the broker PUBACKs (QoS 1); BUSY
 # when every collecting slot is taken, or when an MQTT 5 broker's PUBACK
-# says Quota exceeded; 502 for any other MQTT 5 PUBACK failure reason.
+# says Quota exceeded; UNAVAILABLE for any other MQTT 5 PUBACK failure reason.
 # Losing the broker connection writes LINK DOWN; the next CONNACK writes
 # LINK UP, and the requester re-issues every exchange it held open.
 #
-# Size is bounded by the broker connected to, not by this module. 413
+# Size is bounded by the broker connected to, not by this module. TOO_LARGE
 # answers a record
 #   - past `max_payload`, what the contract collects;
 #   - whose PUBLISH would pass the Maximum Packet Size the broker
@@ -39,7 +39,7 @@ hardware_targets = ["bcm2712", "linux"]
 # sent records up to `max_payload`.
 #
 # Delivery terms (`stream.ordered_ack`):
-#   ack       — 200 is durable acceptance: PUBACK at QoS 1, which
+#   ack       — OK is durable acceptance: PUBACK at QoS 1, which
 #               quantum's broker gates on Clustor durability proofs.
 #   ordering  — one TCP connection, one topic, serialized sends:
 #               request order IS broker order.
@@ -67,7 +67,7 @@ name = "net_in"
 direction = "input"
 content_type = "NetProto"
 buffer_size = 16384
-max_record = 1600
+accepts_record = 1600
 
 [[ports]]
 name = "net_out"

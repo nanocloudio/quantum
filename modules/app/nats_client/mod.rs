@@ -47,7 +47,7 @@ const NET_MSG_ERROR: u8 = 0x06;
 // provider resolves a name.
 use abi::contracts::net::net_proto::{
     connected_parts, error_parts, CMD_CONNECT_TO as NET_CMD_CONNECT_TO, CONNECT_TO_MAX,
-    CONN_ID_LEN, REQUESTER_TAG_NONE,
+    REQUESTER_TAG_NONE,
 };
 
 #[path = "../../common/authority.rs"]
@@ -156,7 +156,10 @@ fluxor_rt::define_params! {
     };
 }
 
-fluxor_rt::module_facts! { state: NatsState }
+fluxor_rt::module_facts! {
+    state: NatsState,
+    records: [in 0 NET_IN_ACCEPTS_RECORD = NET_BUF, out 0 NET_OUT_MAX_RECORD = 1600],
+}
 
 /// PIC module ABI entry: one-time process-wide init, before any instance
 /// exists.
@@ -262,7 +265,7 @@ unsafe fn feed(
     match action {
         NAct::Connect => {
             let mut payload = [0u8; CONNECT_TO_MAX];
-            let n = s.authority.connect_record(&mut payload, Some(s.tag));
+            let n = s.authority.connect_record(&mut payload, s.tag);
             if n > 0 {
                 net_write_frame(
                     sys,
@@ -406,10 +409,9 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     // `[conn_id: u16 LE][requester_tag: u16 LE]`
                     NET_MSG_CONNECTED if s.phase == NPhase::Connecting => {
                         let pl = core::slice::from_raw_parts(payload, plen);
-                        if plen >= CONN_ID_LEN {
-                            let (id, tag) = connected_parts(pl);
-                            if tag == s.tag || tag == REQUESTER_TAG_NONE {
-                                s.conn_id = id;
+                        if let Some(c) = connected_parts(pl) {
+                            if c.requester_tag == s.tag || c.requester_tag == REQUESTER_TAG_NONE {
+                                s.conn_id = c.conn_id;
                                 feed(s, sys, NEv::Connected, now, None);
                             }
                         }
@@ -441,11 +443,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         // conn_id, so the tag is the only way to know it
                         // is ours.
                         let pl = core::slice::from_raw_parts(payload, plen);
-                        let tag = if plen > CONN_ID_LEN {
-                            error_parts(pl).2
-                        } else {
-                            REQUESTER_TAG_NONE
-                        };
+                        let tag = error_parts(pl).map_or(REQUESTER_TAG_NONE, |(_, _, tag)| tag);
                         let ours = (s.phase == NPhase::Connecting
                             && (tag == s.tag || tag == REQUESTER_TAG_NONE))
                             || (s.phase != NPhase::Disconnected
@@ -462,7 +460,7 @@ pub unsafe extern "C" fn module_step(state: *mut u8) -> StepReturn {
         // 4. Send pump.
         if s.conn_id != 0 && s.req_sent < s.req_len {
             // -2 for the `[conn_id: u16 LE]` prefix on CMD_SEND.
-            let max_chunk = NET_BUF - NET_FRAME_HDR - 2;
+            let max_chunk = NET_OUT_MAX_RECORD - NET_FRAME_HDR - 2;
             while s.req_sent < s.req_len {
                 let poll = (sys.channel_poll)(s.net_out, 0x02);
                 if poll <= 0 || (poll as u32 & 0x02) == 0 {
