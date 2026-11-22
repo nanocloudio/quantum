@@ -107,7 +107,7 @@ derivable:
   by correlation id, not by session.
 
 Until then, tenants are separated by deployment: the
-`quantum-tenant-broker` bundle runs one broker per tenant and admits only
+`quantum-tenant-broker` package runs one broker per tenant and admits only
 certificates under that tenant's SPIFFE prefix
 ([tenant_broker.md](tenant_broker.md)), so tenant 0 inside each broker is
 the one tenant it serves.

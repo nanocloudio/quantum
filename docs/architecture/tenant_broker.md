@@ -1,6 +1,6 @@
 # One tenant's broker
 
-`quantum-tenant-broker` is a service bundle
+`quantum-tenant-broker` is a service package
 (`packaging/service/quantum-tenant-broker/`): one tenant's single-node MQTT
 broker, reached only over mutual TLS by that tenant's devices. A platform that
 hosts tenants deploys one per tenant. Nanocloud deploys it as a graph pod in a
@@ -69,7 +69,7 @@ fluxor run quantum-tenant-broker \
   --param device_uri=spiffe://cell.example/device/a/
 ```
 
-`tests/integration/tenant_broker.sh` builds the bundle's graph with its params
+`tests/integration/tenant_broker.sh` builds the package's graph with its params
 against a PKI it generates with `openssl`, then drives it end to end. Two
 devices of namespace `a` connect, publish at QoS 1 and receive each other's
 exact bytes. A device of namespace `b`, one under `a-evil/`, one signed by

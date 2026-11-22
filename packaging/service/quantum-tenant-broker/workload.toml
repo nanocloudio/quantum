@@ -2,7 +2,7 @@
 # by that tenant's devices.
 #
 #   fluxor publish                           # in this project
-#   # in the consumer: [dependencies] quantum = "…", [uses] bundles = ["quantum-tenant-broker"]
+#   # in the consumer: [dependencies] quantum = "…", [uses] packages = ["quantum-tenant-broker"]
 #   fluxor update && fluxor sync
 #   fluxor run quantum-tenant-broker --params tenant.toml
 #

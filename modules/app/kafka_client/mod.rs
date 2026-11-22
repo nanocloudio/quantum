@@ -200,8 +200,8 @@ fluxor_rt::define_params! {
         s.heartbeat_ms = p_u32(d, len, 0, 3000);
     };
     6, produce_topic, str, 0 => |s, d, len| {
-        // Gate on len>0: set_defaults() fires every closure, so an absent
-        // param must not flip the module into producer mode.
+        // Gate on len>0: an empty value names no topic, so it must not
+        // flip the module into producer mode.
         if len > 0 {
             let mut i = 0usize;
             while i < len && (s.produce_topic_len as usize) < NAME_BUF {

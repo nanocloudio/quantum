@@ -11,7 +11,7 @@ audit — with no optional authentication methods.
   fluxor `tls` foundation module in front of `peer_router`. The Linux
   development graphs serve cleartext.
 - **Client certificates, per deployment.** The `quantum-tenant-broker`
-  bundle admits a client only when its certificate chains to the
+  package admits a client only when its certificate chains to the
   tenant's CA and carries a URI SAN under the tenant's SPIFFE prefix,
   refusing everything else in `tls` before the broker sees a byte
   ([tenant_broker.md](tenant_broker.md)). The broker itself still reads
