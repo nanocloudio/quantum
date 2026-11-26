@@ -97,10 +97,6 @@ scripts = ["tools/ci/shadow_guard.sh", "tools/ci/host_crates.sh"]
 # empty tree.
 dir = "examples"
 
-[[ci.examples.exemption]]
-path = "examples/paired_anchor/quantum_host.yaml"
-reason = """An ingress host for Wormhole's paired-anchor rig: Wormhole's paired_anchor and transport_mirror beside Quantum's anchor. Quantum cannot pin Wormhole's modules, since Wormhole depends on Quantum, so the graph is built and run by Wormhole's rig (tests/host/paired_anchor_move.sh) against Wormhole's own modules. quantum_worker.yaml, all Quantum's and Fluxor's, is checked here."""
-
 [required]
 # Wire-ABI pin enforced by `fluxor ci`'s version-skew phase. Bumps
 # only when fluxor's `modules/sdk/wire/wire.rs::ABI_VERSION` changes

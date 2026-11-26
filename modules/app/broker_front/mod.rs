@@ -189,7 +189,6 @@ struct FrontState {
 mod params_def {
     use super::p_u32;
     use super::FrontState;
-    use super::SCHEMA_MAX;
     use super::{CLIENT_ID_MAX, TOPIC_MAX};
 
     fluxor_rt::define_params! {

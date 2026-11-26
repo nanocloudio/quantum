@@ -80,6 +80,11 @@ modules:
     key_file: "${param:server_key}"
     alpn: mqtt
 
+  # The key vault: the broker's identity key lives in its heap and none
+  # outlives the instance (no block source), so it seals nothing.
+  - name: key_vault
+    seal: none
+
 wiring:
   - from: linux_net.net_out
     to: tls.cipher_in

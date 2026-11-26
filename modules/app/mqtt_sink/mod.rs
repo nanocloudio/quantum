@@ -241,7 +241,6 @@ mod params_def {
     use super::SinkState;
     use super::MAX_CLIENT_ID_LEN;
     use super::MAX_TOPIC_LEN;
-    use super::SCHEMA_MAX;
 
     fluxor_rt::define_params! {
         SinkState;

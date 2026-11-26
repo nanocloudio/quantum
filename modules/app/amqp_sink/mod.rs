@@ -180,7 +180,6 @@ mod params_def {
     use super::ptr_copy;
     use super::SinkState;
     use super::MAX_TOPIC_LEN;
-    use super::SCHEMA_MAX;
 
     fluxor_rt::define_params! {
         SinkState;

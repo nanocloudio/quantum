@@ -504,14 +504,16 @@ pongheld= siteout= siteref= consumed=`.
   takeovers over these cores, and its `site_loss` suite resumes sessions
   at the surviving region with `site_admit`.
 
-`examples/paired_anchor/quantum_host.yaml` (each ingress host: Fluxor's
-`ip` and `tls` with `write_horizon` and `delivery_ack` under the
-paired-anchor controller's anchor and mirror, Clustor's `peer_router` with `forward_peer`,
-the anchor with `continuity: 1`, its records on the mirror and its seam
-on a `remote_channel` to the worker host) and
-`examples/paired_anchor/quantum_worker.yaml` (one `session_processor`
-over a single-node substrate, an anchor seam per ingress host) compose
-the modules end to end; `tests/host/mqtt_peer.py` is the MQTT-over-TLS
-client that counts what the broker owes it — every acknowledgement and
-delivery once, in order — for the paired-anchor controller's rig to drive
-through planned and crash takeovers.
+Acorn composes the modules end to end: `graphs/mqtt-anchor-host.yaml`
+(each ingress host: Fluxor's `ip` and `tls` with `write_horizon` and
+`delivery_ack` under the paired-anchor controller's anchor and mirror,
+Clustor's `peer_router` with `forward_peer`, the anchor with
+`continuity: 1`, its records on the mirror and its seam on a
+`remote_channel` to the worker host) and
+`graphs/mqtt-anchor-worker.yaml` (one `session_processor` over a
+single-node substrate, an anchor seam per ingress host). They live there
+because the host graph composes Wormhole's modules with Quantum's, and
+Acorn depends on both. `scripts/support/mqtt_anchor/mqtt_peer.py` there
+is the MQTT-over-TLS client that counts what the broker owes it — every
+acknowledgement and delivery once, in order — for the paired-anchor
+controller's rig to drive through planned and crash takeovers.
